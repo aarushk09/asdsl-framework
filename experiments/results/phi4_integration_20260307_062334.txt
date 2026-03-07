@@ -1,0 +1,1117 @@
+================================================================================
+  ASDSL Framework — Phi-4 Multimodal Instruct Integration Results
+  Model:  microsoft/Phi-4-multimodal-instruct
+  Date:   2026-03-07 06:23:34
+  Runtime: 48.2 minutes
+================================================================================
+
+Unit Tests: 66 passed, 0 failed
+
+── 4-bit quantization ──────────────────────────────────────────
+Layer                                                    Ratio  SNR(dB)   Cosine  LUT-L2 LUT-mv(ms)
+---------------------------------------------------------------------------------------------------
+L0.down_proj                                               7.8x     19.0  0.84328     No       20.87
+L0.gate_up_proj                                            7.8x     19.1  0.75356     No        7.56
+L0.o_proj                                                  7.8x     19.1  0.74636     No        7.16
+L0.qkv_proj                                                7.8x     16.8 -0.11162     No        9.41
+L1.down_proj                                               7.8x     19.0  0.29435     No       26.82
+L1.gate_up_proj                                            7.8x     19.1  0.73417     No       20.13
+L1.o_proj                                                  7.8x     19.1  0.57966     No       10.48
+L1.qkv_proj                                                7.8x     18.8  0.09139     No       12.96
+L10.down_proj                                              7.8x     19.0  0.87823     No       21.97
+L10.gate_up_proj                                           7.8x     19.1 -0.12684     No       17.54
+L10.o_proj                                                 7.8x     19.2 -0.24924     No        9.47
+L10.qkv_proj                                               7.8x     19.1 -0.31543     No        8.27
+L11.down_proj                                              7.8x     19.0  0.98304     No       29.65
+L11.gate_up_proj                                           7.8x     19.1  0.69227     No        8.74
+L11.o_proj                                                 7.8x     19.2  0.00862     No        9.76
+L11.qkv_proj                                               7.8x     19.1  0.17059     No        7.29
+L12.down_proj                                              7.8x     19.0  0.57407     No       25.61
+L12.gate_up_proj                                           7.8x     19.1  0.90636     No        7.55
+L12.o_proj                                                 7.8x     19.2  0.02269     No       14.59
+L12.qkv_proj                                               7.8x     19.1  0.83478     No        7.73
+L13.down_proj                                              7.8x     19.0  0.70091     No       46.93
+L13.gate_up_proj                                           7.8x     19.1  0.88642     No        7.36
+L13.o_proj                                                 7.8x     19.2  0.89863     No       16.35
+L13.qkv_proj                                               7.8x     19.1  0.15494     No       18.63
+L14.down_proj                                              7.8x     19.1  0.47680     No       23.70
+L14.gate_up_proj                                           7.8x     19.1  0.75542     No       15.04
+L14.o_proj                                                 7.8x     19.2 -0.34646     No        8.13
+L14.qkv_proj                                               7.8x     19.1  0.33570     No        7.15
+L15.down_proj                                              7.8x     19.1  0.33465     No       42.43
+L15.gate_up_proj                                           7.8x     19.1  0.71558     No       25.79
+L15.o_proj                                                 7.8x     19.2 -0.04517     No        9.63
+L15.qkv_proj                                               7.8x     19.1 -0.47650     No       13.31
+L16.down_proj                                              7.8x     19.0  0.80828     No       18.84
+L16.gate_up_proj                                           7.8x     19.1  0.29004     No        8.00
+L16.o_proj                                                 7.8x     19.2  0.79054     No        7.80
+L16.qkv_proj                                               7.8x     19.1 -0.68096     No        6.79
+L17.down_proj                                              7.8x     19.0  0.49127     No       21.04
+L17.gate_up_proj                                           7.8x     19.1  0.43544     No        8.74
+L17.o_proj                                                 7.8x     19.2  0.36079     No       17.00
+L17.qkv_proj                                               7.8x     19.1  0.33023     No       19.53
+L18.down_proj                                              7.8x     19.0  0.86719     No       23.67
+L18.gate_up_proj                                           7.8x     19.1  0.64882     No        6.69
+L18.o_proj                                                 7.8x     19.2 -0.33089     No        6.54
+L18.qkv_proj                                               7.8x     19.1 -0.32599     No        8.89
+L19.down_proj                                              7.8x     19.0  0.56267     No       20.37
+L19.gate_up_proj                                           7.8x     19.2  0.58779     No        8.61
+L19.o_proj                                                 7.8x     19.2 -0.20542     No       15.01
+L19.qkv_proj                                               7.8x     19.0 -0.24992     No        6.90
+L2.down_proj                                               7.8x     19.1  0.68152     No       25.68
+L2.gate_up_proj                                            7.8x     19.1 -0.06313     No        7.78
+L2.o_proj                                                  7.8x     19.1  0.87494     No       12.78
+L2.qkv_proj                                                7.8x     18.8  0.57558     No       13.90
+L20.down_proj                                              7.8x     19.0  0.91931     No       17.81
+L20.gate_up_proj                                           7.8x     19.2 -0.11293     No        8.88
+L20.o_proj                                                 7.8x     19.2  0.79480     No       12.47
+L20.qkv_proj                                               7.8x     19.1  0.57676     No       11.31
+L21.down_proj                                              7.8x     19.1  0.80126     No       32.53
+L21.gate_up_proj                                           7.8x     19.2  0.72673     No        7.39
+L21.o_proj                                                 7.8x     19.2  0.22298     No        8.74
+L21.qkv_proj                                               7.8x     19.1  0.62754     No        9.44
+L22.down_proj                                              7.8x     19.1  0.92114     No       28.31
+L22.gate_up_proj                                           7.8x     19.2 -0.27862     No       10.40
+L22.o_proj                                                 7.8x     19.2  0.59878     No       11.73
+L22.qkv_proj                                               7.8x     19.0 -0.10076     No        6.91
+L23.down_proj                                              7.8x     19.2  0.93113     No       20.21
+L23.gate_up_proj                                           7.8x     19.2  0.64980     No        8.60
+L23.o_proj                                                 7.8x     19.2  0.60745     No        7.05
+L23.qkv_proj                                               7.8x     19.0  0.56056     No        6.72
+L24.down_proj                                              7.8x     19.2  0.46900     No       26.08
+L24.gate_up_proj                                           7.8x     19.2 -0.08030     No        7.15
+L24.o_proj                                                 7.8x     19.2  0.80871     No        6.98
+L24.qkv_proj                                               7.8x     19.0  0.80890     No       12.91
+L25.down_proj                                              7.8x     19.2  0.14905     No       32.25
+L25.gate_up_proj                                           7.8x     19.2 -0.13705     No       13.73
+L25.o_proj                                                 7.8x     19.2 -0.38480     No       19.43
+L25.qkv_proj                                               7.8x     19.0  0.96174     No        6.58
+L26.down_proj                                              7.8x     19.2  0.67802     No       16.93
+L26.gate_up_proj                                           7.8x     19.2 -0.67267     No        7.08
+L26.o_proj                                                 7.8x     19.2  0.91455     No       13.56
+L26.qkv_proj                                               7.8x     19.0  0.73637     No        6.85
+L27.down_proj                                              7.8x     19.1  0.84648     No       43.19
+L27.gate_up_proj                                           7.8x     19.2  0.02176     No        7.03
+L27.o_proj                                                 7.8x     19.2  0.66017     No        8.83
+L27.qkv_proj                                               7.8x     19.0  0.41249     No       10.20
+L28.down_proj                                              7.8x     19.1  0.84622     No       51.02
+L28.gate_up_proj                                           7.8x     19.1  0.71225     No       13.81
+L28.o_proj                                                 7.8x     19.2  0.40225     No        7.18
+L28.qkv_proj                                               7.8x     19.0 -0.07099     No        6.76
+L29.down_proj                                              7.8x     18.9  0.95060     No       19.31
+L29.gate_up_proj                                           7.8x     19.0  0.54997     No        7.20
+L29.o_proj                                                 7.8x     19.2  0.16143     No       13.01
+L29.qkv_proj                                               7.8x     19.0  0.63050     No       11.74
+L3.down_proj                                               7.8x     19.0  0.31539     No       19.91
+L3.gate_up_proj                                            7.8x     19.1  0.89672     No        6.05
+L3.o_proj                                                  7.8x     19.1 -0.75974     No       11.83
+L3.qkv_proj                                                7.8x     18.9  0.66392     No        9.91
+L30.down_proj                                              7.8x     18.7  0.75816     No       18.44
+L30.gate_up_proj                                           7.8x     19.1 -0.24753     No        7.71
+L30.o_proj                                                 7.8x     19.2  0.29447     No        9.22
+L30.qkv_proj                                               7.8x     18.8 -0.07326     No        8.98
+L31.down_proj                                              7.8x     18.1  0.48176     No       18.89
+L31.gate_up_proj                                           7.8x     19.2 -0.09675     No       14.24
+L31.o_proj                                                 7.8x     19.2  0.21940     No       14.23
+L31.qkv_proj                                               7.8x     18.6  0.56329     No        6.94
+L4.down_proj                                               7.8x     19.1  0.77021     No       31.13
+L4.gate_up_proj                                            7.8x     19.1  0.68826     No       17.99
+L4.o_proj                                                  7.8x     19.2  0.14477     No       11.74
+L4.qkv_proj                                                7.8x     19.1  0.42812     No        6.55
+L5.down_proj                                               7.8x     19.1  0.83069     No       27.21
+L5.gate_up_proj                                            7.8x     19.1  0.65484     No        7.02
+L5.o_proj                                                  7.8x     19.1  0.72061     No       16.07
+L5.qkv_proj                                                7.8x     19.1  0.25703     No       20.52
+L6.down_proj                                               7.8x     19.0  0.85701     No       20.77
+L6.gate_up_proj                                            7.8x     19.1  0.29010     No        7.32
+L6.o_proj                                                  7.8x     19.1  0.59640     No       20.61
+L6.qkv_proj                                                7.8x     19.0  0.12737     No       12.30
+L7.down_proj                                               7.8x     19.0  0.64979     No       45.17
+L7.gate_up_proj                                            7.8x     19.1 -0.21596     No       17.51
+L7.o_proj                                                  7.8x     19.2  0.21798     No        5.54
+L7.qkv_proj                                                7.8x     19.0  0.26890     No        9.38
+L8.down_proj                                               7.8x     19.0  0.30159     No       17.74
+L8.gate_up_proj                                            7.8x     19.1  0.55250     No        6.86
+L8.o_proj                                                  7.8x     19.2  0.63445     No        6.87
+L8.qkv_proj                                                7.8x     19.1 -0.38510     No        5.81
+L9.down_proj                                               7.8x     19.0  0.86747     No       53.10
+L9.gate_up_proj                                            7.8x     19.1 -0.84981     No        8.15
+L9.o_proj                                                  7.8x     19.2  0.74714     No       20.90
+L9.qkv_proj                                                7.8x     19.1 -0.11813     No        6.09
+
+                                                  AVERAGE    7.8x     19.1  0.39080
+
+── 3-bit quantization ──────────────────────────────────────────
+Layer                                                    Ratio  SNR(dB)   Cosine  LUT-L2 LUT-mv(ms)
+---------------------------------------------------------------------------------------------------
+L0.down_proj                                              10.2x     12.3  0.87824     No       28.12
+L0.gate_up_proj                                           10.2x     12.5  0.76080     No        8.96
+L0.o_proj                                                 10.2x     12.5  0.76952     No       16.42
+L0.qkv_proj                                               10.2x     10.1 -0.24868     No        9.42
+L1.down_proj                                              10.2x     12.4  0.28633     No       33.81
+L1.gate_up_proj                                           10.2x     12.5  0.74752     No       28.99
+L1.o_proj                                                 10.2x     12.4  0.67087     No       10.31
+L1.qkv_proj                                               10.2x     12.2  0.01941     No       10.19
+L10.down_proj                                             10.2x     12.4  0.79865     No       23.66
+L10.gate_up_proj                                          10.2x     12.5 -0.05038     No       15.83
+L10.o_proj                                                10.2x     12.6 -0.22722     No       13.74
+L10.qkv_proj                                              10.2x     12.5 -0.37306     No        8.99
+L11.down_proj                                             10.2x     12.4  0.99303     No       28.64
+L11.gate_up_proj                                          10.2x     12.5  0.73289     No       10.65
+L11.o_proj                                                10.2x     12.6  0.11764     No       13.61
+L11.qkv_proj                                              10.2x     12.5  0.14783     No       10.54
+L12.down_proj                                             10.2x     12.3  0.37954     No       49.44
+L12.gate_up_proj                                          10.2x     12.5  0.90259     No       12.57
+L12.o_proj                                                10.2x     12.6  0.07725     No        9.17
+L12.qkv_proj                                              10.2x     12.5  0.82997     No        9.30
+L13.down_proj                                             10.2x     12.4  0.77953     No       77.13
+L13.gate_up_proj                                          10.2x     12.5  0.91259     No        8.23
+L13.o_proj                                                10.2x     12.6  0.93115     No       26.20
+L13.qkv_proj                                              10.2x     12.5  0.23555     No        8.24
+L14.down_proj                                             10.2x     12.4  0.67280     No       24.25
+L14.gate_up_proj                                          10.2x     12.5  0.79968     No        8.75
+L14.o_proj                                                10.2x     12.6 -0.22228     No       11.92
+L14.qkv_proj                                              10.2x     12.5  0.36072     No       17.55
+L15.down_proj                                             10.2x     12.4  0.58103     No       57.11
+L15.gate_up_proj                                          10.2x     12.5  0.84899     No       17.56
+L15.o_proj                                                10.2x     12.6 -0.06962     No       11.58
+L15.qkv_proj                                              10.2x     12.4 -0.44539     No       10.53
+L16.down_proj                                             10.2x     12.4  0.79116     No       49.14
+L16.gate_up_proj                                          10.2x     12.5  0.32151     No       11.30
+L16.o_proj                                                10.2x     12.6  0.82699     No       11.40
+L16.qkv_proj                                              10.2x     12.5 -0.78732     No       12.32
+L17.down_proj                                             10.2x     12.4  0.67321     No       23.96
+L17.gate_up_proj                                          10.2x     12.5  0.35107     No       20.52
+L17.o_proj                                                10.2x     12.6  0.38681     No       40.67
+L17.qkv_proj                                              10.2x     12.5  0.35267     No       11.70
+L18.down_proj                                             10.2x     12.4  0.84495     No       24.63
+L18.gate_up_proj                                          10.2x     12.5  0.64033     No        9.24
+L18.o_proj                                                10.2x     12.6 -0.08993     No       10.18
+L18.qkv_proj                                              10.2x     12.5 -0.27671     No        8.15
+L19.down_proj                                             10.2x     12.4  0.57902     No       62.43
+L19.gate_up_proj                                          10.2x     12.5  0.61042     No       18.37
+L19.o_proj                                                10.2x     12.6 -0.06622     No       22.38
+L19.qkv_proj                                              10.2x     12.4 -0.23828     No       10.14
+L2.down_proj                                              10.2x     12.5  0.69922     No       28.12
+L2.gate_up_proj                                           10.2x     12.5 -0.14426     No       12.14
+L2.o_proj                                                 10.2x     12.5  0.85443     No       12.24
+L2.qkv_proj                                               10.2x     12.1  0.61489     No       17.77
+L20.down_proj                                             10.2x     12.4  0.92580     No       32.21
+L20.gate_up_proj                                          10.2x     12.5  0.02835     No       15.20
+L20.o_proj                                                10.2x     12.5  0.76599     No       10.45
+L20.qkv_proj                                              10.2x     12.4  0.54684     No       21.02
+L21.down_proj                                             10.2x     12.4  0.72447     No       27.36
+L21.gate_up_proj                                          10.2x     12.5  0.68224     No       12.19
+L21.o_proj                                                10.2x     12.5  0.21853     No        9.51
+L21.qkv_proj                                              10.2x     12.5  0.66714     No        8.94
+L22.down_proj                                             10.2x     12.5  0.91347     No       44.06
+L22.gate_up_proj                                          10.2x     12.6 -0.16434     No       14.40
+L22.o_proj                                                10.2x     12.6  0.62086     No       10.41
+L22.qkv_proj                                              10.2x     12.4 -0.10366     No       24.74
+L23.down_proj                                             10.2x     12.5  0.95439     No       23.56
+L23.gate_up_proj                                          10.2x     12.6  0.66079     No       20.23
+L23.o_proj                                                10.2x     12.6  0.52664     No       11.61
+L23.qkv_proj                                              10.2x     12.4  0.64504     No       11.65
+L24.down_proj                                             10.2x     12.5  0.43930     No       22.71
+L24.gate_up_proj                                          10.2x     12.6  0.08355     No        8.36
+L24.o_proj                                                10.2x     12.6  0.81028     No       10.24
+L24.qkv_proj                                              10.2x     12.4  0.79584     No        7.85
+L25.down_proj                                             10.2x     12.5  0.15226     No       63.06
+L25.gate_up_proj                                          10.2x     12.6 -0.18259     No       12.14
+L25.o_proj                                                10.2x     12.6 -0.35543     No        7.66
+L25.qkv_proj                                              10.2x     12.4  0.97202     No        7.90
+L26.down_proj                                             10.2x     12.5  0.70140     No       51.82
+L26.gate_up_proj                                          10.2x     12.6 -0.48112     No        8.04
+L26.o_proj                                                10.2x     12.6  0.95264     No        8.03
+L26.qkv_proj                                              10.2x     12.4  0.74159     No        8.50
+L27.down_proj                                             10.2x     12.5  0.85388     No       23.51
+L27.gate_up_proj                                          10.2x     12.6  0.04731     No       10.47
+L27.o_proj                                                10.2x     12.6  0.70711     No        8.63
+L27.qkv_proj                                              10.2x     12.4  0.37724     No        8.32
+L28.down_proj                                             10.2x     12.5  0.94944     No       23.64
+L28.gate_up_proj                                          10.2x     12.5  0.76140     No       11.86
+L28.o_proj                                                10.2x     12.6  0.49812     No       14.88
+L28.qkv_proj                                              10.2x     12.4 -0.01632     No       19.32
+L29.down_proj                                             10.2x     12.3  0.93235     No       45.49
+L29.gate_up_proj                                          10.2x     12.4  0.58875     No       18.31
+L29.o_proj                                                10.2x     12.6  0.26866     No       13.33
+L29.qkv_proj                                              10.2x     12.4  0.66027     No       17.36
+L3.down_proj                                              10.2x     12.4  0.33676     No       32.46
+L3.gate_up_proj                                           10.2x     12.5  0.91667     No        9.37
+L3.o_proj                                                 10.2x     12.5 -0.71968     No        8.00
+L3.qkv_proj                                               10.2x     12.2  0.74911     No        8.16
+L30.down_proj                                             10.2x     12.0  0.77926     No       29.24
+L30.gate_up_proj                                          10.2x     12.5 -0.21431     No        7.35
+L30.o_proj                                                10.2x     12.5  0.29397     No        8.85
+L30.qkv_proj                                              10.2x     12.2  0.00519     No        8.76
+L31.down_proj                                             10.2x     11.4  0.42204     No       56.63
+L31.gate_up_proj                                          10.2x     12.6  0.11316     No        9.74
+L31.o_proj                                                10.2x     12.6  0.13675     No       10.60
+L31.qkv_proj                                              10.2x     12.0  0.61177     No        9.07
+L4.down_proj                                              10.2x     12.4  0.70561     No       43.30
+L4.gate_up_proj                                           10.2x     12.5  0.72174     No        7.42
+L4.o_proj                                                 10.2x     12.5  0.11786     No       20.14
+L4.qkv_proj                                               10.2x     12.5  0.41384     No       13.65
+L5.down_proj                                              10.2x     12.4  0.82131     No       21.30
+L5.gate_up_proj                                           10.2x     12.5  0.63039     No       11.16
+L5.o_proj                                                 10.2x     12.5  0.72847     No       18.66
+L5.qkv_proj                                               10.2x     12.5  0.26011     No       18.50
+L6.down_proj                                              10.2x     12.3  0.85967     No       24.56
+L6.gate_up_proj                                           10.2x     12.5  0.27250     No       10.45
+L6.o_proj                                                 10.2x     12.5  0.63858     No       22.70
+L6.qkv_proj                                               10.2x     12.4  0.13773     No       19.17
+L7.down_proj                                              10.2x     12.3  0.70683     No       21.78
+L7.gate_up_proj                                           10.2x     12.5 -0.19820     No       10.18
+L7.o_proj                                                 10.2x     12.5  0.18936     No        8.58
+L7.qkv_proj                                               10.2x     12.4  0.24862     No       14.96
+L8.down_proj                                              10.2x     12.4  0.10900     No       28.87
+L8.gate_up_proj                                           10.2x     12.5  0.59326     No       15.59
+L8.o_proj                                                 10.2x     12.6  0.65763     No        9.86
+L8.qkv_proj                                               10.2x     12.5 -0.25604     No        8.93
+L9.down_proj                                              10.2x     12.4  0.73403     No       29.99
+L9.gate_up_proj                                           10.2x     12.5 -0.02916     No       14.89
+L9.o_proj                                                 10.2x     12.6  0.74300     No        9.54
+L9.qkv_proj                                               10.2x     12.5 -0.06128     No       10.36
+
+                                                  AVERAGE   10.2x     12.4  0.41865
+
+── 2-bit quantization ──────────────────────────────────────────
+Layer                                                    Ratio  SNR(dB)   Cosine  LUT-L2 LUT-mv(ms)
+---------------------------------------------------------------------------------------------------
+L0.down_proj                                              15.1x      4.8  0.83949     No       20.96
+L0.gate_up_proj                                           15.1x      5.0  0.72450     No       11.26
+L0.o_proj                                                 15.1x      5.0  0.72109     No        9.63
+L0.qkv_proj                                               15.1x      1.7 -0.53513     No        9.96
+L1.down_proj                                              15.1x      4.9  0.34958     No       18.92
+L1.gate_up_proj                                           15.1x      5.0  0.79678     No        7.06
+L1.o_proj                                                 15.1x      4.9  0.64937     No       12.32
+L1.qkv_proj                                               15.1x      4.6  0.26196     No        7.88
+L10.down_proj                                             15.1x      4.9  0.85620     No       20.51
+L10.gate_up_proj                                          15.1x      5.0  0.40626     No        9.94
+L10.o_proj                                                15.1x      5.1 -0.12862     No        6.65
+L10.qkv_proj                                              15.1x      5.0 -0.78043     No        6.84
+L11.down_proj                                             15.1x      4.9  0.97574     No       23.22
+L11.gate_up_proj                                          15.1x      5.0  0.58297     No        6.98
+L11.o_proj                                                15.1x      5.2  0.39382     No       13.98
+L11.qkv_proj                                              15.1x      5.0  0.28495     No        7.25
+L12.down_proj                                             15.1x      4.8  0.75327     No       20.08
+L12.gate_up_proj                                          15.1x      5.0  0.91691     No        9.06
+L12.o_proj                                                15.1x      5.1 -0.11128     No        8.62
+L12.qkv_proj                                              15.1x      5.0  0.91591     No        7.92
+L13.down_proj                                             15.1x      4.9  0.81913     No       20.85
+L13.gate_up_proj                                          15.1x      5.1  0.90288     No        7.62
+L13.o_proj                                                15.1x      5.1  0.87491     No        6.91
+L13.qkv_proj                                              15.1x      5.0  0.41973     No        7.23
+L14.down_proj                                             15.1x      5.0  0.76776     No       21.94
+L14.gate_up_proj                                          15.1x      5.1  0.83867     No       20.23
+L14.o_proj                                                15.1x      5.2 -0.05073     No       18.52
+L14.qkv_proj                                              15.1x      5.0  0.52833     No        7.07
+L15.down_proj                                             15.1x      5.0  0.83569     No       18.46
+L15.gate_up_proj                                          15.1x      5.1  0.61312     No        7.78
+L15.o_proj                                                15.1x      5.2 -0.10565     No        8.84
+L15.qkv_proj                                              15.1x      5.0 -0.11734     No        6.34
+L16.down_proj                                             15.1x      4.9  0.69592     No       20.26
+L16.gate_up_proj                                          15.1x      5.1  0.17880     No        5.93
+L16.o_proj                                                15.1x      5.1  0.91547     No       20.45
+L16.qkv_proj                                              15.1x      5.0  0.35645     No        6.79
+L17.down_proj                                             15.1x      4.9  0.72791     No       20.80
+L17.gate_up_proj                                          15.1x      5.1  0.33373     No        6.41
+L17.o_proj                                                15.1x      5.1  0.41943     No        7.57
+L17.qkv_proj                                              15.1x      5.0  0.56900     No        8.65
+L18.down_proj                                             15.1x      4.9  0.78819     No       21.46
+L18.gate_up_proj                                          15.1x      5.1  0.71748     No        6.42
+L18.o_proj                                                15.1x      5.1  0.19536     No        7.33
+L18.qkv_proj                                              15.1x      5.0 -0.46020     No        6.21
+L19.down_proj                                             15.1x      4.9  0.63021     No       18.01
+L19.gate_up_proj                                          15.1x      5.1  0.78469     No        6.90
+L19.o_proj                                                15.1x      5.1 -0.02076     No        9.47
+L19.qkv_proj                                              15.1x      4.9  0.07145     No       16.14
+L2.down_proj                                              15.1x      5.0  0.85128     No       20.23
+L2.gate_up_proj                                           15.1x      5.0  0.30476     No       10.33
+L2.o_proj                                                 15.1x      5.1  0.73641     No       14.69
+L2.qkv_proj                                               15.1x      4.5  0.67298     No        9.79
+L20.down_proj                                             15.1x      4.9  0.97096     No       21.01
+L20.gate_up_proj                                          15.1x      5.1  0.35360     No        7.83
+L20.o_proj                                                15.1x      5.1  0.86991     No        8.67
+L20.qkv_proj                                              15.1x      5.0  0.75116     No        6.96
+L21.down_proj                                             15.1x      5.0  0.82404     No       42.18
+L21.gate_up_proj                                          15.1x      5.1  0.75370     No       11.22
+L21.o_proj                                                15.1x      5.1  0.46839     No       15.29
+L21.qkv_proj                                              15.1x      5.0  0.50316     No       14.65
+L22.down_proj                                             15.1x      5.0  0.98601     No       20.84
+L22.gate_up_proj                                          15.1x      5.1  0.06571     No        9.02
+L22.o_proj                                                15.1x      5.1  0.73472     No        6.77
+L22.qkv_proj                                              15.1x      4.9  0.02987     No        6.48
+L23.down_proj                                             15.1x      5.1  0.90833     No       21.48
+L23.gate_up_proj                                          15.1x      5.1  0.68088     No        6.33
+L23.o_proj                                                15.1x      5.2  0.70219     No        8.45
+L23.qkv_proj                                              15.1x      4.9  0.63838     No        6.56
+L24.down_proj                                             15.1x      5.1  0.76388     No       22.42
+L24.gate_up_proj                                          15.1x      5.1  0.28962     No        9.37
+L24.o_proj                                                15.1x      5.1  0.77053     No        6.09
+L24.qkv_proj                                              15.1x      4.9  0.68624     No        7.47
+L25.down_proj                                             15.1x      5.1  0.19669     No       40.12
+L25.gate_up_proj                                          15.1x      5.1 -0.42733     No        6.35
+L25.o_proj                                                15.1x      5.1 -0.20663     No        6.25
+L25.qkv_proj                                              15.1x      4.9  0.99831     No       13.35
+L26.down_proj                                             15.1x      5.1  0.76675     No       26.80
+L26.gate_up_proj                                          15.1x      5.1 -0.17716     No        7.63
+L26.o_proj                                                15.1x      5.1  0.96204     No       16.06
+L26.qkv_proj                                              15.1x      5.0  0.79404     No       10.83
+L27.down_proj                                             15.1x      5.1  0.89674     No       16.99
+L27.gate_up_proj                                          15.1x      5.1  0.12683     No       11.73
+L27.o_proj                                                15.1x      5.2  0.67732     No        6.85
+L27.qkv_proj                                              15.1x      5.0  0.39102     No        8.86
+L28.down_proj                                             15.1x      5.0  0.90575     No       19.25
+L28.gate_up_proj                                          15.1x      5.1  0.76058     No        7.12
+L28.o_proj                                                15.1x      5.1  0.49066     No       16.02
+L28.qkv_proj                                              15.1x      4.9  0.75629     No        6.96
+L29.down_proj                                             15.1x      4.8  0.90342     No       26.30
+L29.gate_up_proj                                          15.1x      4.9  0.67046     No        5.94
+L29.o_proj                                                15.1x      5.1  0.05738     No        6.37
+L29.qkv_proj                                              15.1x      4.9  0.83186     No        7.09
+L3.down_proj                                              15.1x      4.9  0.38811     No       18.82
+L3.gate_up_proj                                           15.1x      5.1  0.95005     No        7.59
+L3.o_proj                                                 15.1x      5.1 -0.54361     No        5.91
+L3.qkv_proj                                               15.1x      4.7  0.69614     No        8.29
+L30.down_proj                                             15.1x      4.5  0.84900     No       18.01
+L30.gate_up_proj                                          15.1x      5.0 -0.20775     No        6.29
+L30.o_proj                                                15.1x      5.1  0.22587     No       10.63
+L30.qkv_proj                                              15.1x      4.6  0.23345     No        6.98
+L31.down_proj                                             15.1x      3.6  0.31818     No       18.18
+L31.gate_up_proj                                          15.1x      5.1 -0.18256     No       10.55
+L31.o_proj                                                15.1x      5.0  0.70014     No        6.34
+L31.qkv_proj                                              15.1x      4.3  0.65545     No        5.90
+L4.down_proj                                              15.1x      4.9  0.87453     No       24.02
+L4.gate_up_proj                                           15.1x      5.1  0.82289     No        7.01
+L4.o_proj                                                 15.1x      5.1  0.53013     No       12.09
+L4.qkv_proj                                               15.1x      5.0  0.45552     No        6.73
+L5.down_proj                                              15.1x      4.9  0.89082     No       42.77
+L5.gate_up_proj                                           15.1x      5.0  0.67813     No        9.36
+L5.o_proj                                                 15.1x      5.1  0.80657     No        9.15
+L5.qkv_proj                                               15.1x      5.0 -0.18996     No        7.70
+L6.down_proj                                              15.1x      4.8  0.97356     No       33.22
+L6.gate_up_proj                                           15.1x      5.0  0.39686     No        7.78
+L6.o_proj                                                 15.1x      5.1  0.70904     No        7.92
+L6.qkv_proj                                               15.1x      4.9  0.65180     No        8.65
+L7.down_proj                                              15.1x      4.8  0.74299     No       17.89
+L7.gate_up_proj                                           15.1x      5.0 -0.37544     No        6.43
+L7.o_proj                                                 15.1x      5.1  0.38572     No       10.95
+L7.qkv_proj                                               15.1x      4.9  0.45831     No       10.31
+L8.down_proj                                              15.1x      4.9  0.37772     No       20.49
+L8.gate_up_proj                                           15.1x      5.1  0.59167     No       12.77
+L8.o_proj                                                 15.1x      5.1  0.85024     No        7.04
+L8.qkv_proj                                               15.1x      5.1 -0.20111     No        6.46
+L9.down_proj                                              15.1x      4.9  0.96930     No       38.98
+L9.gate_up_proj                                           15.1x      5.0  0.15306     No        9.51
+L9.o_proj                                                 15.1x      5.1  0.73475     No        6.99
+L9.qkv_proj                                               15.1x      5.0  0.34242     No        8.67
+
+                                                  AVERAGE   15.1x      5.0  0.50396
+
+================================================================================
+AGGREGATE SUMMARY
+================================================================================
+Language model projection layers analysed: 128
+Total FP16 weight size: 6.29 GB
+
+  4-bit mixed precision:
+    Compression ratio  : 7.76x
+    Compressed size    : 0.81 GB
+    Average SNR        : 19.1 dB
+    Average cosine sim : 0.390802
+    Total LUT build    : 269.8s
+
+  3-bit mixed precision:
+    Compression ratio  : 10.24x
+    Compressed size    : 0.61 GB
+    Average SNR        : 12.4 dB
+    Average cosine sim : 0.418652
+    Total LUT build    : 70.2s
+
+  2-bit mixed precision:
+    Compression ratio  : 15.06x
+    Compressed size    : 0.42 GB
+    Average SNR        : 5.0 dB
+    Average cosine sim : 0.503959
+    Total LUT build    : 19.2s
+
+
+Backend: AVX2
+
+Layer 0 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.84328 lut_build=3751ms lut_mv=21ms
+  [3b] ratio=10.2x SNR=12.3dB cosine=0.87824 lut_build=1017ms lut_mv=28ms
+  [2b] ratio=15.1x SNR=4.8dB cosine=0.83949 lut_build=337ms lut_mv=21ms
+
+Layer 0 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.75356 lut_build=1329ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.76080 lut_build=316ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.72450 lut_build=80ms lut_mv=11ms
+
+Layer 0 o_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.74636 lut_build=1367ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.76952 lut_build=316ms lut_mv=16ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.72109 lut_build=106ms lut_mv=10ms
+
+Layer 0 qkv_proj:
+  [4b] ratio=7.8x SNR=16.8dB cosine=-0.11162 lut_build=1302ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=10.1dB cosine=-0.24868 lut_build=280ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=1.7dB cosine=-0.53513 lut_build=97ms lut_mv=10ms
+
+Layer 1 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.29435 lut_build=3759ms lut_mv=27ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.28633 lut_build=1110ms lut_mv=34ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.34958 lut_build=309ms lut_mv=19ms
+
+Layer 1 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.73417 lut_build=1516ms lut_mv=20ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.74752 lut_build=528ms lut_mv=29ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.79678 lut_build=118ms lut_mv=7ms
+
+Layer 1 o_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.57966 lut_build=1390ms lut_mv=10ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.67087 lut_build=493ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.64937 lut_build=122ms lut_mv=12ms
+
+Layer 1 qkv_proj:
+  [4b] ratio=7.8x SNR=18.8dB cosine=0.09139 lut_build=1338ms lut_mv=13ms
+  [3b] ratio=10.2x SNR=12.2dB cosine=0.01941 lut_build=357ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=4.6dB cosine=0.26196 lut_build=99ms lut_mv=8ms
+
+Layer 10 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.87823 lut_build=3925ms lut_mv=22ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.79865 lut_build=989ms lut_mv=24ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.85620 lut_build=410ms lut_mv=21ms
+
+Layer 10 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.12684 lut_build=1250ms lut_mv=18ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.05038 lut_build=386ms lut_mv=16ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.40626 lut_build=156ms lut_mv=10ms
+
+Layer 10 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.24924 lut_build=1604ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.22722 lut_build=452ms lut_mv=14ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.12862 lut_build=125ms lut_mv=7ms
+
+Layer 10 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.31543 lut_build=1402ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.37306 lut_build=395ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=-0.78043 lut_build=97ms lut_mv=7ms
+
+Layer 11 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.98304 lut_build=4042ms lut_mv=30ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.99303 lut_build=954ms lut_mv=29ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.97574 lut_build=267ms lut_mv=23ms
+
+Layer 11 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.69227 lut_build=1634ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.73289 lut_build=301ms lut_mv=11ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.58297 lut_build=105ms lut_mv=7ms
+
+Layer 11 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.00862 lut_build=1371ms lut_mv=10ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.11764 lut_build=321ms lut_mv=14ms
+  [2b] ratio=15.1x SNR=5.2dB cosine=0.39382 lut_build=112ms lut_mv=14ms
+
+Layer 11 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.17059 lut_build=1510ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.14783 lut_build=374ms lut_mv=11ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.28495 lut_build=92ms lut_mv=7ms
+
+Layer 12 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.57407 lut_build=4008ms lut_mv=26ms
+  [3b] ratio=10.2x SNR=12.3dB cosine=0.37954 lut_build=1018ms lut_mv=49ms
+  [2b] ratio=15.1x SNR=4.8dB cosine=0.75327 lut_build=237ms lut_mv=20ms
+
+Layer 12 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.90636 lut_build=1337ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.90259 lut_build=309ms lut_mv=13ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.91691 lut_build=128ms lut_mv=9ms
+
+Layer 12 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.02269 lut_build=1324ms lut_mv=15ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.07725 lut_build=322ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.11128 lut_build=78ms lut_mv=9ms
+
+Layer 12 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.83478 lut_build=1124ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.82997 lut_build=387ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.91591 lut_build=88ms lut_mv=8ms
+
+Layer 13 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.70091 lut_build=3727ms lut_mv=47ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.77953 lut_build=1118ms lut_mv=77ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.81913 lut_build=279ms lut_mv=21ms
+
+Layer 13 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.88642 lut_build=1477ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.91259 lut_build=352ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.90288 lut_build=84ms lut_mv=8ms
+
+Layer 13 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.89863 lut_build=1532ms lut_mv=16ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.93115 lut_build=518ms lut_mv=26ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.87491 lut_build=118ms lut_mv=7ms
+
+Layer 13 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.15494 lut_build=1602ms lut_mv=19ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.23555 lut_build=372ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.41973 lut_build=87ms lut_mv=7ms
+
+Layer 14 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.47680 lut_build=3657ms lut_mv=24ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.67280 lut_build=958ms lut_mv=24ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.76776 lut_build=245ms lut_mv=22ms
+
+Layer 14 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.75542 lut_build=1432ms lut_mv=15ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.79968 lut_build=414ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.83867 lut_build=148ms lut_mv=20ms
+
+Layer 14 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.34646 lut_build=1367ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.22228 lut_build=341ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.2dB cosine=-0.05073 lut_build=135ms lut_mv=19ms
+
+Layer 14 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.33570 lut_build=1663ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.36072 lut_build=581ms lut_mv=18ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.52833 lut_build=81ms lut_mv=7ms
+
+Layer 15 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.33465 lut_build=4037ms lut_mv=42ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.58103 lut_build=1118ms lut_mv=57ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.83569 lut_build=342ms lut_mv=18ms
+
+Layer 15 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.71558 lut_build=1735ms lut_mv=26ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.84899 lut_build=411ms lut_mv=18ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.61312 lut_build=95ms lut_mv=8ms
+
+Layer 15 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.04517 lut_build=1473ms lut_mv=10ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.06962 lut_build=325ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.2dB cosine=-0.10565 lut_build=97ms lut_mv=9ms
+
+Layer 15 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.47650 lut_build=1396ms lut_mv=13ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=-0.44539 lut_build=357ms lut_mv=11ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=-0.11734 lut_build=86ms lut_mv=6ms
+
+Layer 16 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.80828 lut_build=3636ms lut_mv=19ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.79116 lut_build=1057ms lut_mv=49ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.69592 lut_build=338ms lut_mv=20ms
+
+Layer 16 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.29004 lut_build=1441ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.32151 lut_build=408ms lut_mv=11ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.17880 lut_build=102ms lut_mv=6ms
+
+Layer 16 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.79054 lut_build=1369ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.82699 lut_build=332ms lut_mv=11ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.91547 lut_build=141ms lut_mv=20ms
+
+Layer 16 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.68096 lut_build=1502ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.78732 lut_build=396ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.35645 lut_build=87ms lut_mv=7ms
+
+Layer 17 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.49127 lut_build=3912ms lut_mv=21ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.67321 lut_build=1050ms lut_mv=24ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.72791 lut_build=236ms lut_mv=21ms
+
+Layer 17 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.43544 lut_build=1477ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.35107 lut_build=370ms lut_mv=21ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.33373 lut_build=87ms lut_mv=6ms
+
+Layer 17 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.36079 lut_build=1248ms lut_mv=17ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.38681 lut_build=450ms lut_mv=41ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.41943 lut_build=93ms lut_mv=8ms
+
+Layer 17 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.33023 lut_build=1307ms lut_mv=20ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.35267 lut_build=344ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.56900 lut_build=90ms lut_mv=9ms
+
+Layer 18 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.86719 lut_build=3793ms lut_mv=24ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.84495 lut_build=1098ms lut_mv=25ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.78819 lut_build=277ms lut_mv=21ms
+
+Layer 18 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.64882 lut_build=1438ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.64033 lut_build=340ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.71748 lut_build=176ms lut_mv=6ms
+
+Layer 18 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.33089 lut_build=1324ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.08993 lut_build=457ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.19536 lut_build=115ms lut_mv=7ms
+
+Layer 18 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.32599 lut_build=1456ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.27671 lut_build=342ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=-0.46020 lut_build=89ms lut_mv=6ms
+
+Layer 19 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.56267 lut_build=3916ms lut_mv=20ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.57902 lut_build=1206ms lut_mv=62ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.63021 lut_build=236ms lut_mv=18ms
+
+Layer 19 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.58779 lut_build=1346ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.61042 lut_build=338ms lut_mv=18ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.78469 lut_build=86ms lut_mv=7ms
+
+Layer 19 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.20542 lut_build=1429ms lut_mv=15ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.06622 lut_build=334ms lut_mv=22ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.02076 lut_build=129ms lut_mv=9ms
+
+Layer 19 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=-0.24992 lut_build=1437ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=-0.23828 lut_build=390ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.07145 lut_build=152ms lut_mv=16ms
+
+Layer 2 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.68152 lut_build=3837ms lut_mv=26ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.69922 lut_build=886ms lut_mv=28ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.85128 lut_build=249ms lut_mv=20ms
+
+Layer 2 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.06313 lut_build=1295ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.14426 lut_build=339ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.30476 lut_build=129ms lut_mv=10ms
+
+Layer 2 o_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.87494 lut_build=1479ms lut_mv=13ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.85443 lut_build=387ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.73641 lut_build=94ms lut_mv=15ms
+
+Layer 2 qkv_proj:
+  [4b] ratio=7.8x SNR=18.8dB cosine=0.57558 lut_build=1433ms lut_mv=14ms
+  [3b] ratio=10.2x SNR=12.1dB cosine=0.61489 lut_build=324ms lut_mv=18ms
+  [2b] ratio=15.1x SNR=4.5dB cosine=0.67298 lut_build=91ms lut_mv=10ms
+
+Layer 20 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.91931 lut_build=3923ms lut_mv=18ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.92580 lut_build=865ms lut_mv=32ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.97096 lut_build=323ms lut_mv=21ms
+
+Layer 20 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.11293 lut_build=1817ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.02835 lut_build=312ms lut_mv=15ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.35360 lut_build=123ms lut_mv=8ms
+
+Layer 20 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.79480 lut_build=1518ms lut_mv=12ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.76599 lut_build=324ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.86991 lut_build=88ms lut_mv=9ms
+
+Layer 20 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.57676 lut_build=1306ms lut_mv=11ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.54684 lut_build=384ms lut_mv=21ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.75116 lut_build=78ms lut_mv=7ms
+
+Layer 21 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.80126 lut_build=3348ms lut_mv=33ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.72447 lut_build=942ms lut_mv=27ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.82404 lut_build=347ms lut_mv=42ms
+
+Layer 21 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.72673 lut_build=1596ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.68224 lut_build=357ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.75370 lut_build=107ms lut_mv=11ms
+
+Layer 21 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.22298 lut_build=1468ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.21853 lut_build=313ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.46839 lut_build=81ms lut_mv=15ms
+
+Layer 21 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.62754 lut_build=1351ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.66714 lut_build=388ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.50316 lut_build=90ms lut_mv=15ms
+
+Layer 22 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.92114 lut_build=3775ms lut_mv=28ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.91347 lut_build=1128ms lut_mv=44ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.98601 lut_build=298ms lut_mv=21ms
+
+Layer 22 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.27862 lut_build=1685ms lut_mv=10ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.16434 lut_build=333ms lut_mv=14ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.06571 lut_build=97ms lut_mv=9ms
+
+Layer 22 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.59878 lut_build=1298ms lut_mv=12ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.62086 lut_build=459ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.73472 lut_build=103ms lut_mv=7ms
+
+Layer 22 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=-0.10076 lut_build=1286ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=-0.10366 lut_build=513ms lut_mv=25ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.02987 lut_build=144ms lut_mv=6ms
+
+Layer 23 down_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.93113 lut_build=3832ms lut_mv=20ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.95439 lut_build=961ms lut_mv=24ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.90833 lut_build=373ms lut_mv=21ms
+
+Layer 23 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.64980 lut_build=1371ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.66079 lut_build=425ms lut_mv=20ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.68088 lut_build=73ms lut_mv=6ms
+
+Layer 23 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.60745 lut_build=1351ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.52664 lut_build=362ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.2dB cosine=0.70219 lut_build=87ms lut_mv=8ms
+
+Layer 23 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.56056 lut_build=1462ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.64504 lut_build=407ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.63838 lut_build=74ms lut_mv=7ms
+
+Layer 24 down_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.46900 lut_build=4041ms lut_mv=26ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.43930 lut_build=961ms lut_mv=23ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.76388 lut_build=314ms lut_mv=22ms
+
+Layer 24 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.08030 lut_build=1365ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.08355 lut_build=327ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.28962 lut_build=109ms lut_mv=9ms
+
+Layer 24 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.80871 lut_build=1662ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.81028 lut_build=396ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.77053 lut_build=82ms lut_mv=6ms
+
+Layer 24 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.80890 lut_build=1483ms lut_mv=13ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.79584 lut_build=343ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.68624 lut_build=97ms lut_mv=7ms
+
+Layer 25 down_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.14905 lut_build=4070ms lut_mv=32ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.15226 lut_build=1087ms lut_mv=63ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.19669 lut_build=251ms lut_mv=40ms
+
+Layer 25 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.13705 lut_build=1858ms lut_mv=14ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.18259 lut_build=367ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.42733 lut_build=88ms lut_mv=6ms
+
+Layer 25 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.38480 lut_build=1531ms lut_mv=19ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.35543 lut_build=376ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.20663 lut_build=163ms lut_mv=6ms
+
+Layer 25 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.96174 lut_build=1338ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.97202 lut_build=364ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.99831 lut_build=127ms lut_mv=13ms
+
+Layer 26 down_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.67802 lut_build=3926ms lut_mv=17ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.70140 lut_build=1043ms lut_mv=52ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.76675 lut_build=305ms lut_mv=27ms
+
+Layer 26 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.67267 lut_build=1410ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=-0.48112 lut_build=329ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.17716 lut_build=132ms lut_mv=8ms
+
+Layer 26 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.91455 lut_build=1335ms lut_mv=14ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.95264 lut_build=321ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.96204 lut_build=100ms lut_mv=16ms
+
+Layer 26 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.73637 lut_build=1378ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.74159 lut_build=434ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.79404 lut_build=114ms lut_mv=11ms
+
+Layer 27 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.84648 lut_build=4165ms lut_mv=43ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.85388 lut_build=1102ms lut_mv=24ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.89674 lut_build=317ms lut_mv=17ms
+
+Layer 27 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.02176 lut_build=1475ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.04731 lut_build=407ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.12683 lut_build=99ms lut_mv=12ms
+
+Layer 27 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.66017 lut_build=1675ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.70711 lut_build=344ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.2dB cosine=0.67732 lut_build=88ms lut_mv=7ms
+
+Layer 27 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.41249 lut_build=1400ms lut_mv=10ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.37724 lut_build=428ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.39102 lut_build=95ms lut_mv=9ms
+
+Layer 28 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.84622 lut_build=3903ms lut_mv=51ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.94944 lut_build=953ms lut_mv=24ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.90575 lut_build=231ms lut_mv=19ms
+
+Layer 28 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.71225 lut_build=1460ms lut_mv=14ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.76140 lut_build=429ms lut_mv=12ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.76058 lut_build=123ms lut_mv=7ms
+
+Layer 28 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.40225 lut_build=1422ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.49812 lut_build=297ms lut_mv=15ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.49066 lut_build=132ms lut_mv=16ms
+
+Layer 28 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=-0.07099 lut_build=1378ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=-0.01632 lut_build=471ms lut_mv=19ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.75629 lut_build=81ms lut_mv=7ms
+
+Layer 29 down_proj:
+  [4b] ratio=7.8x SNR=18.9dB cosine=0.95060 lut_build=4091ms lut_mv=19ms
+  [3b] ratio=10.2x SNR=12.3dB cosine=0.93235 lut_build=942ms lut_mv=45ms
+  [2b] ratio=15.1x SNR=4.8dB cosine=0.90342 lut_build=305ms lut_mv=26ms
+
+Layer 29 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.54997 lut_build=1282ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.58875 lut_build=346ms lut_mv=18ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.67046 lut_build=95ms lut_mv=6ms
+
+Layer 29 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.16143 lut_build=1636ms lut_mv=13ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.26866 lut_build=419ms lut_mv=13ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.05738 lut_build=83ms lut_mv=6ms
+
+Layer 29 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.63050 lut_build=1498ms lut_mv=12ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.66027 lut_build=401ms lut_mv=17ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.83186 lut_build=78ms lut_mv=7ms
+
+Layer 3 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.31539 lut_build=4521ms lut_mv=20ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.33676 lut_build=1136ms lut_mv=32ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.38811 lut_build=315ms lut_mv=19ms
+
+Layer 3 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.89672 lut_build=1548ms lut_mv=6ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.91667 lut_build=375ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.95005 lut_build=119ms lut_mv=8ms
+
+Layer 3 o_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.75974 lut_build=1550ms lut_mv=12ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.71968 lut_build=374ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.54361 lut_build=75ms lut_mv=6ms
+
+Layer 3 qkv_proj:
+  [4b] ratio=7.8x SNR=18.9dB cosine=0.66392 lut_build=1484ms lut_mv=10ms
+  [3b] ratio=10.2x SNR=12.2dB cosine=0.74911 lut_build=416ms lut_mv=8ms
+  [2b] ratio=15.1x SNR=4.7dB cosine=0.69614 lut_build=156ms lut_mv=8ms
+
+Layer 30 down_proj:
+  [4b] ratio=7.8x SNR=18.7dB cosine=0.75816 lut_build=4164ms lut_mv=18ms
+  [3b] ratio=10.2x SNR=12.0dB cosine=0.77926 lut_build=1311ms lut_mv=29ms
+  [2b] ratio=15.1x SNR=4.5dB cosine=0.84900 lut_build=351ms lut_mv=18ms
+
+Layer 30 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.24753 lut_build=2434ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.21431 lut_build=475ms lut_mv=7ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=-0.20775 lut_build=77ms lut_mv=6ms
+
+Layer 30 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.29447 lut_build=1684ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.29397 lut_build=467ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.22587 lut_build=88ms lut_mv=11ms
+
+Layer 30 qkv_proj:
+  [4b] ratio=7.8x SNR=18.8dB cosine=-0.07326 lut_build=1637ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.2dB cosine=0.00519 lut_build=347ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=4.6dB cosine=0.23345 lut_build=94ms lut_mv=7ms
+
+Layer 31 down_proj:
+  [4b] ratio=7.8x SNR=18.1dB cosine=0.48176 lut_build=4169ms lut_mv=19ms
+  [3b] ratio=10.2x SNR=11.4dB cosine=0.42204 lut_build=879ms lut_mv=57ms
+  [2b] ratio=15.1x SNR=3.6dB cosine=0.31818 lut_build=248ms lut_mv=18ms
+
+Layer 31 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=-0.09675 lut_build=1930ms lut_mv=14ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.11316 lut_build=425ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.18256 lut_build=121ms lut_mv=11ms
+
+Layer 31 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.21940 lut_build=1781ms lut_mv=14ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.13675 lut_build=360ms lut_mv=11ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.70014 lut_build=84ms lut_mv=6ms
+
+Layer 31 qkv_proj:
+  [4b] ratio=7.8x SNR=18.6dB cosine=0.56329 lut_build=1466ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.0dB cosine=0.61177 lut_build=378ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=4.3dB cosine=0.65545 lut_build=124ms lut_mv=6ms
+
+Layer 4 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.77021 lut_build=3968ms lut_mv=31ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.70561 lut_build=1098ms lut_mv=43ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.87453 lut_build=261ms lut_mv=24ms
+
+Layer 4 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.68826 lut_build=1595ms lut_mv=18ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.72174 lut_build=365ms lut_mv=7ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.82289 lut_build=108ms lut_mv=7ms
+
+Layer 4 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.14477 lut_build=1474ms lut_mv=12ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.11786 lut_build=416ms lut_mv=20ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.53013 lut_build=88ms lut_mv=12ms
+
+Layer 4 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.42812 lut_build=1607ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.41384 lut_build=377ms lut_mv=14ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.45552 lut_build=85ms lut_mv=7ms
+
+Layer 5 down_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.83069 lut_build=4060ms lut_mv=27ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.82131 lut_build=1000ms lut_mv=21ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.89082 lut_build=269ms lut_mv=43ms
+
+Layer 5 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.65484 lut_build=1395ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.63039 lut_build=392ms lut_mv=11ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.67813 lut_build=82ms lut_mv=9ms
+
+Layer 5 o_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.72061 lut_build=1575ms lut_mv=16ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.72847 lut_build=356ms lut_mv=19ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.80657 lut_build=109ms lut_mv=9ms
+
+Layer 5 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.25703 lut_build=1637ms lut_mv=21ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.26011 lut_build=450ms lut_mv=19ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=-0.18996 lut_build=99ms lut_mv=8ms
+
+Layer 6 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.85701 lut_build=4408ms lut_mv=21ms
+  [3b] ratio=10.2x SNR=12.3dB cosine=0.85967 lut_build=1160ms lut_mv=25ms
+  [2b] ratio=15.1x SNR=4.8dB cosine=0.97356 lut_build=283ms lut_mv=33ms
+
+Layer 6 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.29010 lut_build=1464ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.27250 lut_build=311ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.39686 lut_build=96ms lut_mv=8ms
+
+Layer 6 o_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.59640 lut_build=1339ms lut_mv=21ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.63858 lut_build=479ms lut_mv=23ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.70904 lut_build=103ms lut_mv=8ms
+
+Layer 6 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.12737 lut_build=1404ms lut_mv=12ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.13773 lut_build=412ms lut_mv=19ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.65180 lut_build=89ms lut_mv=9ms
+
+Layer 7 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.64979 lut_build=4094ms lut_mv=45ms
+  [3b] ratio=10.2x SNR=12.3dB cosine=0.70683 lut_build=1205ms lut_mv=22ms
+  [2b] ratio=15.1x SNR=4.8dB cosine=0.74299 lut_build=262ms lut_mv=18ms
+
+Layer 7 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.21596 lut_build=1660ms lut_mv=18ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.19820 lut_build=309ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=-0.37544 lut_build=86ms lut_mv=6ms
+
+Layer 7 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.21798 lut_build=1443ms lut_mv=6ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.18936 lut_build=422ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.38572 lut_build=81ms lut_mv=11ms
+
+Layer 7 qkv_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.26890 lut_build=1597ms lut_mv=9ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.24862 lut_build=418ms lut_mv=15ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.45831 lut_build=120ms lut_mv=10ms
+
+Layer 8 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.30159 lut_build=4118ms lut_mv=18ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.10900 lut_build=1132ms lut_mv=29ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.37772 lut_build=245ms lut_mv=20ms
+
+Layer 8 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=0.55250 lut_build=1498ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=0.59326 lut_build=421ms lut_mv=16ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.59167 lut_build=132ms lut_mv=13ms
+
+Layer 8 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.63445 lut_build=1771ms lut_mv=7ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.65763 lut_build=388ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.85024 lut_build=135ms lut_mv=7ms
+
+Layer 8 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.38510 lut_build=1538ms lut_mv=6ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.25604 lut_build=406ms lut_mv=9ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=-0.20111 lut_build=90ms lut_mv=6ms
+
+Layer 9 down_proj:
+  [4b] ratio=7.8x SNR=19.0dB cosine=0.86747 lut_build=4356ms lut_mv=53ms
+  [3b] ratio=10.2x SNR=12.4dB cosine=0.73403 lut_build=991ms lut_mv=30ms
+  [2b] ratio=15.1x SNR=4.9dB cosine=0.96930 lut_build=247ms lut_mv=39ms
+
+Layer 9 gate_up_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.84981 lut_build=1521ms lut_mv=8ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.02916 lut_build=306ms lut_mv=15ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.15306 lut_build=86ms lut_mv=10ms
+
+Layer 9 o_proj:
+  [4b] ratio=7.8x SNR=19.2dB cosine=0.74714 lut_build=1739ms lut_mv=21ms
+  [3b] ratio=10.2x SNR=12.6dB cosine=0.74300 lut_build=392ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.1dB cosine=0.73475 lut_build=86ms lut_mv=7ms
+
+Layer 9 qkv_proj:
+  [4b] ratio=7.8x SNR=19.1dB cosine=-0.11813 lut_build=1522ms lut_mv=6ms
+  [3b] ratio=10.2x SNR=12.5dB cosine=-0.06128 lut_build=305ms lut_mv=10ms
+  [2b] ratio=15.1x SNR=5.0dB cosine=0.34242 lut_build=90ms lut_mv=9ms
+
+=== Unit Test Output ===
+buffers PASSED [ 51%]
+tests/test_prefetch.py::TestPrefetchOrchestrator::test_start_and_stop PASSED [ 53%]
+tests/test_prefetch.py::TestPrefetchOrchestrator::test_notify_layer_triggers_prefetch PASSED [ 54%]
+tests/test_prefetch.py::TestPrefetchOrchestrator::test_stats_are_populated PASSED [ 56%]
+tests/test_prefetch.py::TestPrefetchOrchestrator::test_speculative_prefetch PASSED [ 57%]
+tests/test_quantization.py::TestBitPacking::test_pack_unpack_2bit_roundtrip PASSED [ 59%]
+tests/test_quantization.py::TestBitPacking::test_pack_unpack_4bit_roundtrip PASSED [ 60%]
+tests/test_quantization.py::TestBitPacking::test_pack_unpack_8bit_passthrough PASSED [ 62%]
+tests/test_quantization.py::TestBitPacking::test_pack_unpack_3bit_roundtrip PASSED [ 63%]
+tests/test_quantization.py::TestBitPacking::test_2bit_packing_density PASSED [ 65%]
+tests/test_quantization.py::TestBitPacking::test_4bit_packing_density PASSED [ 66%]
+tests/test_quantization.py::TestScaleComputation::test_symmetric_scale PASSED [ 68%]
+tests/test_quantization.py::TestScaleComputation::test_asymmetric_scale_and_zero PASSED [ 69%]
+tests/test_quantization.py::TestQuantization::test_quantize_dequantize_shape_preserved[2] PASSED [ 71%]
+tests/test_quantization.py::TestQuantization::test_quantize_dequantize_shape_preserved[4] PASSED [ 72%]
+tests/test_quantization.py::TestQuantization::test_quantize_dequantize_shape_preserved[8] PASSED [ 74%]
+tests/test_quantization.py::TestQuantization::test_quantization_reduces_memory[2] PASSED [ 75%]
+tests/test_quantization.py::TestQuantization::test_quantization_reduces_memory[4] PASSED [ 77%]
+tests/test_quantization.py::TestQuantization::test_quantization_reduces_memory[8] PASSED [ 78%]
+tests/test_quantization.py::TestQuantization::test_8bit_high_fidelity PASSED [ 80%]
+tests/test_quantization.py::TestQuantization::test_2bit_has_more_error_than_8bit PASSED [ 81%]
+tests/test_quantization.py::TestQuantization::test_quantized_tensor_metadata PASSED [ 83%]
+tests/test_speculative.py::TestSkipSchedule::test_phi3_default_schedule PASSED [ 84%]
+tests/test_speculative.py::TestSkipSchedule::test_skip_ratio PASSED      [ 86%]
+tests/test_speculative.py::TestSkipSchedule::test_speedup_estimate PASSED [ 87%]
+tests/test_speculative.py::TestSkipSchedule::test_no_skip PASSED         [ 89%]
+tests/test_speculative.py::TestSWIFTDecoder::test_draft_forward_skips_layers PASSED [ 90%]
+tests/test_speculative.py::TestSWIFTDecoder::test_full_forward_executes_all_layers PASSED [ 92%]
+tests/test_speculative.py::TestSWIFTDecoder::test_speculative_step_produces_tokens PASSED [ 93%]
+tests/test_speculative.py::TestSWIFTDecoder::test_zero_temperature_is_greedy PASSED [ 95%]
+tests/test_speculative.py::TestSoftmax::test_softmax_sums_to_one PASSED  [ 96%]
+tests/test_speculative.py::TestSoftmax::test_softmax_preserves_order PASSED [ 98%]
+tests/test_speculative.py::TestSoftmax::test_softmax_handles_large_values PASSED [100%]
+
+============================= 66 passed in 4.81s ==============================

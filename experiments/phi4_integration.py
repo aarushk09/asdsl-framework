@@ -122,68 +122,101 @@ class PerLayerStats:
         self.quant_results[bits] = {**metrics, **lut_metrics}
 
 
+# LUT demo uses a small sample to keep Python-loop runtime under ~3 min total.
+# The LUT engine is designed for compiled kernels; Python loops here prove
+# correctness, not speed.
+_LUT_DEMO_ROWS = 4   # Number of output rows tested with LUT (full quant uses all rows)
+_LUT_GW = 2          # LUT group_width=2 (4^2=16 entries per table, fast to build)
+
+
 def process_tensor(
     key: str,
     shard_path: Path,
     stats_list: list[PerLayerStats],
     log: list[str],
 ) -> None:
-    """Quantize one backbone weight tensor and append stats."""
+    """Quantize one backbone weight tensor and append stats.
+
+    Uses PyTorch to load bfloat16 tensors and casts to float32 before
+    passing to ASDSL. LUT demo runs on _LUT_DEMO_ROWS rows to keep
+    Python-loop time manageable; full quantization metrics use all rows.
+    """
+    import torch
     from safetensors import safe_open
 
-    with safe_open(str(shard_path), framework="np") as f:
-        w_f16 = f.get_tensor(key)   # float16
+    # Load using PyTorch framework (handles bfloat16 natively)
+    with safe_open(str(shard_path), framework="pt") as f:
+        w_tensor = f.get_tensor(key)   # bfloat16 on disk
+    w_f32 = w_tensor.to(torch.float32).numpy()
+    del w_tensor
 
-    # Convert to float32 for ASDSL processing
-    w_f32 = w_f16.astype(np.float32)
     rows, cols = w_f32.shape
     stat = PerLayerStats(key, (rows, cols))
 
-    # Random input vector for matvec comparison
     rng = np.random.default_rng(seed=42)
     x = rng.standard_normal(cols).astype(np.float32)
-    # Reference output in fp16 precision
-    y_ref = (w_f16.astype(np.float64) @ x.astype(np.float64)).astype(np.float32)
+
+    # FP32 reference matvec for the sample rows we'll test with LUT
+    n_demo = min(_LUT_DEMO_ROWS, rows)
+    y_ref_sample = (w_f32[:n_demo].astype(np.float64) @ x.astype(np.float64)).astype(np.float32)
 
     for bits in BITS_TO_TEST:
-        # ── Quantization ──────────────────────────────────────────────────────
+        # ── Full-matrix quantization (real compression/SNR metrics) ───────────
         t0 = time.perf_counter()
         qt = quantize_weights(w_f32, bits=bits, group_size=GROUP_SIZE)
         quant_time = time.perf_counter() - t0
 
         errors = compute_quantization_error(w_f32, qt)
 
-        # ── LUT build ─────────────────────────────────────────────────────────
+        # ── LUT demo: quantize n_demo-row sub-matrix, build tables, matvec ───
+        sub_w = w_f32[:n_demo].copy()
+        sub_gs = min(GROUP_SIZE, cols)   # group_size must be ≤ cols
+        sub_qt = quantize_weights(sub_w, bits=bits, group_size=sub_gs)
+
         t0 = time.perf_counter()
-        tables = build_lut_tables_for_layer(qt)
+        tables = build_lut_tables_for_layer(
+            packed_weights=sub_qt.data,
+            scales=sub_qt.scales.astype(np.float32),
+            activation=x,
+            bits=bits,
+            group_size=sub_gs,
+            group_width=_LUT_GW,
+        )
         lut_build_time = time.perf_counter() - t0
 
-        # ── LUT matvec ────────────────────────────────────────────────────────
         t0 = time.perf_counter()
-        y_lut = lut_matvec(tables, x, out_features=rows, group_size=GROUP_SIZE)
+        y_lut = lut_matvec(
+            tables=tables,
+            packed_weights=sub_qt.data,
+            bits=bits,
+            output_size=n_demo,
+            input_size=cols,
+        )
         lut_matvec_time = time.perf_counter() - t0
 
-        # ── Float32 reference matvec ──────────────────────────────────────────
+        # ── FP32 reference matvec (same sub-matrix) ────────────────────────
         t0 = time.perf_counter()
-        y_fp32 = w_f32 @ x
+        y_fp32 = sub_w @ x
         fp32_time = time.perf_counter() - t0
 
-        # ── Error vs FP16 reference ────────────────────────────────────────────
-        mse_vs_ref = float(np.mean((y_lut - y_ref) ** 2))
-        cosine = float(
-            np.dot(y_lut, y_ref) / (np.linalg.norm(y_lut) * np.linalg.norm(y_ref) + 1e-10)
-        )
-        mem_est = estimate_lut_memory(rows, cols, bits, GROUP_SIZE)
+        # ── Error vs FP32 reference (n_demo rows) ─────────────────────────────
+        norm_y = np.linalg.norm(y_lut) * np.linalg.norm(y_ref_sample) + 1e-10
+        cosine = float(np.dot(y_lut, y_ref_sample) / norm_y)
+        mse_vs_ref = float(np.mean((y_lut - y_ref_sample) ** 2))
+
+        # LUT memory estimate for the full matrix
+        num_groups = (rows * cols) // max(_LUT_GW, 1)
+        mem_est = estimate_lut_memory(bits, _LUT_GW, num_groups)
 
         stat.add_quant(bits, errors, {
             "quant_time_ms": quant_time * 1000,
             "lut_build_time_ms": lut_build_time * 1000,
             "lut_matvec_time_ms": lut_matvec_time * 1000,
             "fp32_matvec_time_ms": fp32_time * 1000,
-            "mse_vs_fp16_ref": mse_vs_ref,
-            "cosine_vs_fp16_ref": cosine,
-            "lut_memory_kb": mem_est["total_bytes"] / 1024,
-            "lut_fits_l2": mem_est["fits_l2"],
+            "mse_vs_fp32_ref": mse_vs_ref,
+            "cosine_vs_fp32_ref": cosine,
+            "lut_memory_kb": mem_est["total_kb"],
+            "lut_fits_l2": mem_est["fits_l2_cache"],
         })
 
         msg = (
@@ -196,10 +229,10 @@ def process_tensor(
         print(msg)
         log.append(msg)
 
-        del qt, tables
+        del qt, sub_qt, tables
         gc.collect()
 
-    del w_f16, w_f32, y_ref, y_fp32, y_lut
+    del w_f32, y_ref_sample, y_fp32, y_lut
     gc.collect()
     stats_list.append(stat)
 
@@ -212,7 +245,7 @@ def run_unit_tests(log: list[str]) -> tuple[int, int]:
     """Run the ASDSL unit tests via pytest and return (passed, failed)."""
     import subprocess
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=short", "-q"],
+        [sys.executable, "-m", "pytest", "tests/", "--tb=short"],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -221,19 +254,16 @@ def run_unit_tests(log: list[str]) -> tuple[int, int]:
     log.append("\n=== Unit Test Output ===")
     log.append(output[-3000:] if len(output) > 3000 else output)
 
-    # Parse passed/failed
+    # Parse passed/failed from pytest summary line: "66 passed in 2.79s"
+    import re
     passed = failed = 0
     for line in output.splitlines():
-        if " passed" in line:
-            try:
-                passed = int(line.strip().split()[0])
-            except Exception:
-                pass
-        if " failed" in line:
-            try:
-                failed = int(line.strip().split()[0])
-            except Exception:
-                pass
+        m = re.search(r"(\d+) passed", line)
+        if m:
+            passed = int(m.group(1))
+        m = re.search(r"(\d+) failed", line)
+        if m:
+            failed = int(m.group(1))
     return passed, failed
 
 
@@ -281,12 +311,12 @@ def write_report(
             lines.append(
                 f"{short:<55s} {r['compression_ratio']:>6.1f}x "
                 f"{r['snr_db']:>8.1f} "
-                f"{r['cosine_vs_fp16_ref']:>8.5f} "
+                f"{r['cosine_vs_fp32_ref']:>8.5f} "
                 f"{'Yes' if r['lut_fits_l2'] else 'No ':>7s} "
                 f"{r['lut_matvec_time_ms']:>10.2f}"
             )
             snr_vals.append(r["snr_db"])
-            cos_vals.append(r["cosine_vs_fp16_ref"])
+            cos_vals.append(r["cosine_vs_fp32_ref"])
             ratio_vals.append(r["compression_ratio"])
 
         if snr_vals:
@@ -311,7 +341,7 @@ def write_report(
         avg_ratio = np.mean([r["compression_ratio"] for r in layer_results])
         compressed_mb = total_fp16_mb / avg_ratio
         avg_snr = np.mean([r["snr_db"] for r in layer_results])
-        avg_cos = np.mean([r["cosine_vs_fp16_ref"] for r in layer_results])
+        avg_cos = np.mean([r["cosine_vs_fp32_ref"] for r in layer_results])
         total_lut_build = sum(r["lut_build_time_ms"] for r in layer_results)
         lines.append(
             f"\n  {bits}-bit mixed precision:"

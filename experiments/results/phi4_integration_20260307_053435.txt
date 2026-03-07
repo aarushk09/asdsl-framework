@@ -1,0 +1,450 @@
+================================================================================
+  ASDSL Framework — Phi-4 Multimodal Instruct Integration Results
+  Model:  microsoft/Phi-4-multimodal-instruct
+  Date:   2026-03-07 05:34:35
+  Runtime: 6.6 minutes
+================================================================================
+
+Unit Tests: 0 passed, 0 failed
+
+── 4-bit quantization ──────────────────────────────────────────
+Layer                                                    Ratio  SNR(dB)   Cosine  LUT-L2 LUT-mv(ms)
+---------------------------------------------------------------------------------------------------
+
+── 3-bit quantization ──────────────────────────────────────────
+Layer                                                    Ratio  SNR(dB)   Cosine  LUT-L2 LUT-mv(ms)
+---------------------------------------------------------------------------------------------------
+
+── 2-bit quantization ──────────────────────────────────────────
+Layer                                                    Ratio  SNR(dB)   Cosine  LUT-L2 LUT-mv(ms)
+---------------------------------------------------------------------------------------------------
+
+================================================================================
+AGGREGATE SUMMARY
+================================================================================
+Language model projection layers analysed: 0
+Total FP16 weight size: 0.00 GB
+
+
+Backend: AVX2
+
+Layer 0 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 0 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 0 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 0 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 1 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 1 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 1 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 1 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 10 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 10 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 10 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 10 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 11 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 11 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 11 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 11 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 12 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 12 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 12 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 12 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 13 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 13 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 13 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 13 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 14 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 14 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 14 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 14 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 15 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 15 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 15 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 15 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 16 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 16 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 16 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 16 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 17 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 17 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 17 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 17 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 18 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 18 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 18 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 18 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 19 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 19 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 19 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 19 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 2 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 2 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 2 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 2 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 20 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 20 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 20 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 20 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 21 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 21 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 21 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 21 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 22 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 22 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 22 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 22 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 23 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 23 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 23 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 23 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 24 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 24 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 24 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 24 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 25 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 25 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 25 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 25 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 26 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 26 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 26 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 26 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 27 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 27 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 27 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 27 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 28 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 28 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 28 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 28 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 29 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 29 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 29 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 29 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 3 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 3 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 3 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 3 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 30 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 30 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 30 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 30 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 31 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 31 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 31 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 31 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 4 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 4 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 4 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 4 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 5 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 5 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 5 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 5 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 6 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 6 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 6 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 6 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 7 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 7 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 7 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 7 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 8 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 8 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 8 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 8 qkv_proj:
+    ERROR: 'fits_l2'
+
+Layer 9 down_proj:
+    ERROR: 'fits_l2'
+
+Layer 9 gate_up_proj:
+    ERROR: 'fits_l2'
+
+Layer 9 o_proj:
+    ERROR: 'fits_l2'
+
+Layer 9 qkv_proj:
+    ERROR: 'fits_l2'
+
+=== Unit Test Output ===
+buffers PASSED [ 51%]
+tests/test_prefetch.py::TestPrefetchOrchestrator::test_start_and_stop PASSED [ 53%]
+tests/test_prefetch.py::TestPrefetchOrchestrator::test_notify_layer_triggers_prefetch PASSED [ 54%]
+tests/test_prefetch.py::TestPrefetchOrchestrator::test_stats_are_populated PASSED [ 56%]
+tests/test_prefetch.py::TestPrefetchOrchestrator::test_speculative_prefetch PASSED [ 57%]
+tests/test_quantization.py::TestBitPacking::test_pack_unpack_2bit_roundtrip PASSED [ 59%]
+tests/test_quantization.py::TestBitPacking::test_pack_unpack_4bit_roundtrip PASSED [ 60%]
+tests/test_quantization.py::TestBitPacking::test_pack_unpack_8bit_passthrough PASSED [ 62%]
+tests/test_quantization.py::TestBitPacking::test_pack_unpack_3bit_roundtrip PASSED [ 63%]
+tests/test_quantization.py::TestBitPacking::test_2bit_packing_density PASSED [ 65%]
+tests/test_quantization.py::TestBitPacking::test_4bit_packing_density PASSED [ 66%]
+tests/test_quantization.py::TestScaleComputation::test_symmetric_scale PASSED [ 68%]
+tests/test_quantization.py::TestScaleComputation::test_asymmetric_scale_and_zero PASSED [ 69%]
+tests/test_quantization.py::TestQuantization::test_quantize_dequantize_shape_preserved[2] PASSED [ 71%]
+tests/test_quantization.py::TestQuantization::test_quantize_dequantize_shape_preserved[4] PASSED [ 72%]
+tests/test_quantization.py::TestQuantization::test_quantize_dequantize_shape_preserved[8] PASSED [ 74%]
+tests/test_quantization.py::TestQuantization::test_quantization_reduces_memory[2] PASSED [ 75%]
+tests/test_quantization.py::TestQuantization::test_quantization_reduces_memory[4] PASSED [ 77%]
+tests/test_quantization.py::TestQuantization::test_quantization_reduces_memory[8] PASSED [ 78%]
+tests/test_quantization.py::TestQuantization::test_8bit_high_fidelity PASSED [ 80%]
+tests/test_quantization.py::TestQuantization::test_2bit_has_more_error_than_8bit PASSED [ 81%]
+tests/test_quantization.py::TestQuantization::test_quantized_tensor_metadata PASSED [ 83%]
+tests/test_speculative.py::TestSkipSchedule::test_phi3_default_schedule PASSED [ 84%]
+tests/test_speculative.py::TestSkipSchedule::test_skip_ratio PASSED      [ 86%]
+tests/test_speculative.py::TestSkipSchedule::test_speedup_estimate PASSED [ 87%]
+tests/test_speculative.py::TestSkipSchedule::test_no_skip PASSED         [ 89%]
+tests/test_speculative.py::TestSWIFTDecoder::test_draft_forward_skips_layers PASSED [ 90%]
+tests/test_speculative.py::TestSWIFTDecoder::test_full_forward_executes_all_layers PASSED [ 92%]
+tests/test_speculative.py::TestSWIFTDecoder::test_speculative_step_produces_tokens PASSED [ 93%]
+tests/test_speculative.py::TestSWIFTDecoder::test_zero_temperature_is_greedy PASSED [ 95%]
+tests/test_speculative.py::TestSoftmax::test_softmax_sums_to_one PASSED  [ 96%]
+tests/test_speculative.py::TestSoftmax::test_softmax_preserves_order PASSED [ 98%]
+tests/test_speculative.py::TestSoftmax::test_softmax_handles_large_values PASSED [100%]
+
+============================= 66 passed in 3.62s ==============================
