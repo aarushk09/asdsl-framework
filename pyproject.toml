@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asdsl"
+version = "0.1.0"
+description = "Asynchronous Salience-Driven Speculative Lookup Framework for CPU inference of Small Language Models"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "ASDSL Contributors"},
+]
+keywords = [
+    "llm", "inference", "cpu", "quantization", "speculative-decoding",
+    "lookup-table", "small-language-models", "phi-3", "edge-ai",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "torch>=2.1.0",
+    "safetensors>=0.4.0",
+    "transformers>=4.36.0",
+    "tqdm>=4.65.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-benchmark>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+]
+
+[project.scripts]
+asdsl = "asdsl.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aarushk09/asdsl-framework"
+Repository = "https://github.com/aarushk09/asdsl-framework"
+Issues = "https://github.com/aarushk09/asdsl-framework/issues"
+
+[tool.setuptools.packages.find]
+include = ["asdsl*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
