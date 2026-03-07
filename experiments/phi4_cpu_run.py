@@ -59,9 +59,13 @@ INTER = 8192                            # gate/up each; combined weight is 2*INT
 VOCAB = 200064
 RMS_EPS = 1e-5
 ROPE_THETA = 10000.0
+# Phi-4 uses partial RoPE: only 75% of head_dim is rotated (config: partial_rotary_factor=0.75)
+ROTARY_DIM = int(0.75 * HEAD_DIM)      # 96 — only these dims get RoPE applied
 
 # Special token IDs
-EOS_TOKEN_IDS = {200020, 200019}   # <|end|>, </s>
+# 200020 = <|end|> (end of turn),  199999 = <|endoftext|> / </s> (end of text)
+# 200019 = <|assistant|> (start of assistant turn — NOT an EOS token)
+EOS_TOKEN_IDS = {200020, 199999}
 
 
 # ---------------------------------------------------------------------------
@@ -86,13 +90,24 @@ def build_rope_cache(seq_len: int, head_dim: int, theta: float = ROPE_THETA,
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Rotate-half RoPE.  x: (seq, heads, head_dim); cos/sin: (seq, head_dim//2)."""
-    d = x.shape[-1] // 2
-    x1 = x[..., :d]               # (seq, heads, d)
-    x2 = x[..., d:]               # (seq, heads, d)
-    c  = cos.unsqueeze(-2)        # (seq, 1, d) — broadcasts over heads
+    """Partial rotate-half RoPE.
+
+    x: (seq, heads, head_dim)  — full head vector
+    cos/sin: (seq, ROTARY_DIM//2)  — tables for the rotated portion only
+
+    Phi-4 sets partial_rotary_factor=0.75, so only the first ROTARY_DIM=96 dims
+    of each head are rotated; the remaining 32 dims pass through unchanged.
+    """
+    d = cos.shape[-1]              # = ROTARY_DIM // 2 = 48
+    rotary_dim = 2 * d             # = ROTARY_DIM = 96
+    x_rot  = x[..., :rotary_dim]   # (seq, heads, 96) — will be rotated
+    x_pass = x[..., rotary_dim:]   # (seq, heads, 32) — untouched
+    x1 = x_rot[..., :d]            # first half:  dims 0..47
+    x2 = x_rot[..., d:]            # second half: dims 48..95
+    c  = cos.unsqueeze(-2)         # (seq, 1, 48) — broadcasts over heads
     s  = sin.unsqueeze(-2)
-    return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)
+    rotated = torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)
+    return torch.cat([rotated, x_pass], dim=-1)
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:
@@ -155,7 +170,10 @@ class WeightStore:
         total_proj = NUM_LAYERS * 4
         done = 0
 
-        print(f"  Loading & quantizing {total_proj} projection weights to {self.bits}-bit …")
+        if self.bits == 16:
+            print(f"  Loading {total_proj} projection weights directly as float16 (no quantization) …")
+        else:
+            print(f"  Loading & quantizing {total_proj} projection weights to {self.bits}-bit …")
         print(f"  (embedding + norms loaded as bfloat16)")
 
         for shard_name, keys in sorted(shard_keys.items()):
@@ -179,12 +197,7 @@ class WeightStore:
                             tensor.to(torch.float32)
                         continue
 
-                    # Projection weight – quantize with ASDSL
-                    w_f32 = tensor.to(torch.float32).numpy()
-                    qt = self._quantize(w_f32, bits=self.bits, group_size=self.group_size)
-
-                    proj_name = parts[-1]   # e.g. "weight"
-                    # Derive a friendly key like "qkv_proj" / "o_proj" etc.
+                    # Derive friendly key like "qkv_proj" / "o_proj" etc.
                     if "qkv_proj" in key:
                         friendly = "qkv_proj"
                     elif "o_proj" in key:
@@ -194,9 +207,19 @@ class WeightStore:
                     elif "down_proj" in key:
                         friendly = "down_proj"
                     else:
-                        friendly = proj_name
+                        friendly = key.split(".")[-1]
 
-                    self.layers.setdefault(layer_idx, {})[friendly] = qt
+                    if self.bits == 16:
+                        # Skip ASDSL quantization — store directly in float16 cache.
+                        # All forward-pass matmuls use float16→float32 scratch buffers
+                        # anyway, so bits=16 gives best quality at no extra memory cost.
+                        self._weight_cache[(layer_idx, friendly)] = tensor.to(torch.float16)
+                    else:
+                        # ASDSL N-bit quantization
+                        w_f32 = tensor.to(torch.float32).numpy()
+                        qt = self._quantize(w_f32, bits=self.bits, group_size=self.group_size)
+                        self.layers.setdefault(layer_idx, {})[friendly] = qt
+
                     done += 1
                     if done % 16 == 0 or done == total_proj:
                         pct = done / total_proj * 100
@@ -232,28 +255,33 @@ class WeightStore:
         return buf         # (out, in) float32, contiguous, reused each call
 
     def warm_cache(self) -> None:
-        """Dequantize all weights to float16, allocate float32 scratch buffers,
-        then free the 4-bit quantized data.
+        """Populate float16 weight cache, allocate float32 scratch buffers,
+        then free quantized and raw data.
+
+        When bits=16: weights are already in the cache from load().
+        When bits=2/3/4/8: dequantize ASDSL quantized tensors → float16.
 
         Memory layout after this call:
-          float16 weight cache : ~6.4 GB   (128 tensors, one per layer×proj)
+          float16 weight cache : ~6.4 GB   (128 tensors, always float16 regardless of bits)
           float32 buffers × 4  : ~0.4 GB   (reused in-place, never re-allocated)
           embed_f32            : ~2.4 GB
           Total                : ~9.2 GB   -- fits in 16 GB RAM with headroom
         """
         total = NUM_LAYERS * 4
-        done = 0
-        print(f"  Warming weight cache ({total} tensors) … ", end="", flush=True)
-        for i in range(NUM_LAYERS):
-            for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
-                _ = self.get_weight(i, name)
-                done += 1
-        self.layers.clear()   # free 4-bit data (~1.7 GB)
-        print(f"done ({done}/{total})  |  4-bit buffers freed")
+        if self.bits == 16:
+            print(f"  Float16 weight cache already populated ({total} tensors)")
+        else:
+            done = 0
+            print(f"  Warming weight cache ({total} tensors) … ", end="", flush=True)
+            for i in range(NUM_LAYERS):
+                for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
+                    _ = self.get_weight(i, name)
+                    done += 1
+            self.layers.clear()   # free quantized data
+            print(f"done ({done}/{total})  |  {self.bits}-bit buffers freed")
 
-        # Pre-allocate float32 scratch buffers (one per projection shape)
-        # These are reused in-place via get_weight_f32(), so there are no
-        # per-token allocations for weight data.
+        # Pre-allocate float32 scratch buffers (one per projection shape).
+        # Reused in-place via get_weight_f32() — zero per-token allocations.
         print("  Allocating float32 scratch buffers (4 × ~100 MB) … ", end="", flush=True)
         self._f32_bufs = {
             "qkv_proj":    torch.empty(QKV_DIM, HIDDEN, dtype=torch.float32),
@@ -421,6 +449,7 @@ def generate(
     store: WeightStore,
     tokenizer,
     max_new_tokens: int = 50,
+    system_prompt: str = "You are a helpful AI assistant.",
 ) -> str:
     print("\n" + "=" * 66)
     print("ASDSL × Phi-4 — CPU Inference")
@@ -428,13 +457,21 @@ def generate(
     print(f"Prompt : {prompt!r}")
     print("-" * 66)
 
-    # Format prompt for Phi-4 chat
-    chat_prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>\n"
-    input_ids = tokenizer.encode(chat_prompt)
+    # Format prompt using the tokenizer's built-in chat template.
+    # Phi-4 was fine-tuned with a system turn; including one markedly
+    # improves instruction-following quality.
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
 
-    # Pre-compute RoPE tables (generous max length)
+    # Pre-compute RoPE tables (generous max length).
+    # Pass ROTARY_DIM (96) — only the rotated portion of each head needs tables.
     max_seq = len(input_ids) + max_new_tokens + 64
-    rope_cos, rope_sin = build_rope_cache(max_seq, HEAD_DIM)
+    rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
 
     # Per-layer KV history (used during forward pass)
     kv_hist = KVHistory()
@@ -514,20 +551,120 @@ def generate(
 
     kv_stats = asdsl_tracker.stats()
     backbone_gb = (
-        NUM_LAYERS * 4
+        NUM_LAYERS
         * (QKV_DIM * HIDDEN + HIDDEN * HIDDEN + 2 * INTER * HIDDEN + HIDDEN * INTER)
-        * store.bits // 8
+        * 2   # float16 = 2 bytes per element; inference always uses float16 cache
         / 1e9
     )
-    print(f"\n\n{'-' * 66}")
+    quant_label = "float16 (no quant)" if store.bits == 16 else f"{store.bits}-bit ASDSL"
     print(f"Generated : {n_tokens} tokens  |  {tps:.2f} tok/s  |  decode {t_decode:.1f}s")
     print(f"ASDSL KV  : {kv_stats['tokens']} tokens tracked  "
           f"| {kv_stats['blocks_used']}/{kv_stats['blocks_capacity']} blocks  "
           f"| {kv_stats['memory_mb']:.1f} MB")
-    print(f"Quantized : {store.bits}-bit weights  |  backbone ≈ {backbone_gb:.2f} GB")
+    print(f"Weights   : {quant_label}  |  backbone f16 cache ≈ {backbone_gb:.2f} GB")
     print("=" * 66)
 
     return response_text
+
+
+# ---------------------------------------------------------------------------
+# Interactive chat session
+# ---------------------------------------------------------------------------
+
+def chat(
+    store: WeightStore,
+    tokenizer,
+    max_new_tokens: int = 200,
+    system_prompt: str = "You are a helpful AI assistant.",
+) -> None:
+    """Interactive multi-turn chat loop.
+
+    The KV cache (kv_hist) and position counter are kept alive across turns,
+    so the model only processes NEW tokens each round — previous context is
+    already materialised in the K/V tensors.
+    """
+    print("\n" + "=" * 66)
+    print("ASDSL × Phi-4 — Interactive Chat  (type 'quit' to exit)")
+    print("=" * 66)
+
+    # Persistent state across all turns
+    kv_hist = KVHistory()
+    asdsl_tracker = ASDSLKVTracker()
+    max_seq = 4096
+    rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
+    pos = 0  # global position counter
+
+    def run_forward(token_id: int, need_logits: bool = True):
+        nonlocal pos
+        hidden = store.embed_f32[token_id].unsqueeze(0)
+        k_new, v_new = [], []
+        for i in range(NUM_LAYERS):
+            hidden = forward_layer(hidden, i, store, kv_hist, rope_cos, rope_sin, pos)
+            k_new.append(kv_hist.k[i][-1])
+            v_new.append(kv_hist.v[i][-1])
+        asdsl_tracker.record_token(k_new, v_new)
+        pos += 1
+        if not need_logits:
+            return None
+        hidden = rms_norm(hidden, store.final_norm)
+        return (hidden @ store.lm_head.t()).squeeze(0)
+
+    # Feed system prompt first
+    system_tokens = tokenizer.encode(f"<|system|>\n{system_prompt}<|end|>\n")
+    print(f"Feeding system prompt ({len(system_tokens)} tokens) … ", end="", flush=True)
+    for tid in system_tokens:
+        run_forward(tid, need_logits=False)
+    print("done\n")
+
+    turn = 0
+    while True:
+        turn += 1
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[Session ended]")
+            break
+
+        if user_input.lower() in ("quit", "exit", "q"):
+            print("[Goodbye]")
+            break
+        if not user_input:
+            continue
+
+        # Tokenize this user turn (without re-feeding history)
+        turn_text = f"<|user|>\n{user_input}<|end|>\n<|assistant|>\n"
+        turn_ids = tokenizer.encode(turn_text)
+
+        # Prefill new tokens (skip LM head for all but the last)
+        t_pre = time.perf_counter()
+        logits = None
+        for idx, tid in enumerate(turn_ids):
+            is_last = (idx == len(turn_ids) - 1)
+            logits = run_forward(tid, need_logits=is_last)
+        t_pre = time.perf_counter() - t_pre
+
+        # Decode
+        print(f"Assistant: ", end="", flush=True)
+        generated = []
+        t_dec = time.perf_counter()
+
+        for _ in range(max_new_tokens):
+            next_token = int(logits.argmax())
+            generated.append(next_token)
+            tok_text = tokenizer.convert_tokens_to_string(
+                tokenizer.convert_ids_to_tokens([next_token])
+            )
+            print(tok_text, end="", flush=True)
+            if next_token in EOS_TOKEN_IDS:
+                break
+            logits = run_forward(next_token, need_logits=True)
+
+        t_dec = time.perf_counter() - t_dec
+        n = len(generated)
+        tps = n / t_dec if t_dec > 0 else 0
+        kv_stats = asdsl_tracker.stats()
+        print(f"\n  [{n} tok | {tps:.2f} tok/s | KV: {kv_stats['tokens']} tokens "
+              f"| {kv_stats['blocks_used']}/{kv_stats['blocks_capacity']} blocks]\n")
 
 
 # ---------------------------------------------------------------------------
@@ -536,10 +673,14 @@ def generate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phi-4 CPU inference via ASDSL")
-    parser.add_argument("--prompt", default="What is 2+2?")
+    parser.add_argument("--prompt", default="What is 2+2?",
+                        help="Single-turn prompt (ignored when --chat is used)")
+    parser.add_argument("--chat", action="store_true",
+                        help="Start an interactive multi-turn chat session")
     parser.add_argument("--max-new-tokens", type=int, default=80)
-    parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4],
-                        help="Quantization bit-width for projection weights")
+    parser.add_argument("--bits", type=int, default=16, choices=[2, 3, 4, 8, 16],
+                        help="Weight precision: 16=float16 (best quality, default), "
+                             "8/4/3/2=ASDSL N-bit quantization (demo, lower quality)")
     parser.add_argument("--group-size", type=int, default=128)
     args = parser.parse_args()
 
@@ -562,24 +703,36 @@ def main() -> None:
     print(f"  Vocabulary size: {tokenizer.vocab_size:,}")
 
     # ── Weights ────────────────────────────────────────────────────────────
-    print(f"\nLoading weights (quantizing to {args.bits}-bit with ASDSL) …")
+    if args.bits == 16:
+        print(f"Loading weights as float16 (no quantization) …")
+    else:
+        print(f"\nLoading weights (ASDSL {args.bits}-bit quantization) …")
     t0 = time.perf_counter()
     store = WeightStore(bits=args.bits, group_size=args.group_size)
     store.load()
     t_load = time.perf_counter() - t0
-    print(f"  Load + quantize complete in {t_load / 60:.1f} minutes")
-    print(f"  Layers ready: {len(store.layers)}/32  "
-          f"| Norms ready: {len(store.layer_norms)}/32")
-    store.warm_cache()    # dequantize all 128 weights — forward pass pays no dequant cost
-    print(f"  Note: f16 cache (~6.4 GB) + f32 scratch bufs (~0.4 GB) + embed_f32 (~2.4 GB) = ~9.2 GB total")
+    verb = "Load" if args.bits == 16 else "Load + quantize"
+    print(f"  {verb} complete in {t_load / 60:.1f} minutes")
+    if args.bits != 16:
+        print(f"  Layers ready: {len(store.layers)}/32  "
+              f"| Norms ready: {len(store.layer_norms)}/32")
+    store.warm_cache()
+    print(f"  Memory: f16 weight cache (~6.4 GB) + f32 scratch (~0.4 GB) + embed_f32 (~2.4 GB) ≈ 9.2 GB")
 
-    # ── Generate ───────────────────────────────────────────────────────────
-    generate(
-        prompt=args.prompt,
-        store=store,
-        tokenizer=tokenizer,
-        max_new_tokens=args.max_new_tokens,
-    )
+    # ── Chat or single-turn generate ───────────────────────────────────────
+    if args.chat:
+        chat(
+            store=store,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+        )
+    else:
+        generate(
+            prompt=args.prompt,
+            store=store,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+        )
 
 
 if __name__ == "__main__":
