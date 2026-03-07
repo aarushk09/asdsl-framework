@@ -77,6 +77,7 @@ class PrefetchOrchestrator:
         self,
         num_layers: int,
         prefetch_ahead: int = 1,
+        lookahead: int | None = None,
         cache_line_bytes: int = 64,
         enable_os_hints: bool = True,
     ):
@@ -85,16 +86,20 @@ class PrefetchOrchestrator:
         Args:
             num_layers: Total transformer layers in the model.
             prefetch_ahead: Number of layers to prefetch ahead.
+            lookahead: Alias for prefetch_ahead.
             cache_line_bytes: CPU cache line size.
             enable_os_hints: Try to use OS-level prefetch hints if available.
         """
+        if lookahead is not None:
+            prefetch_ahead = lookahead
+
         self.num_layers = num_layers
         self.prefetch_ahead = prefetch_ahead
         self.cache_line_bytes = cache_line_bytes
         self.enable_os_hints = enable_os_hints
 
-        # Weight buffers registry: layer_idx → {name: (buffer, size)}
-        self._weight_registry: dict[int, dict[str, tuple[np.ndarray, int]]] = {}
+        # Weight buffers registry: keyed by "layer_idx:weight_name"
+        self._weight_buffers: dict[str, tuple[np.ndarray, int]] = {}
 
         # Thread synchronization
         self._prefetch_queue: list[PrefetchRequest] = []
@@ -102,12 +107,18 @@ class PrefetchOrchestrator:
         self._queue_event = threading.Event()
         self._shutdown = threading.Event()
 
-        # Stats
+        # Stats as plain dict for easy test inspection
+        self._stats: dict[str, int] = {
+            "prefetch_requests": 0,
+            "completed_requests": 0,
+            "total_bytes_prefetched": 0,
+        }
+        # Legacy PrefetchStats object kept for backward compat
         self.stats = PrefetchStats()
 
         # Prefetch thread
         self._prefetch_thread: threading.Thread | None = None
-        self._is_running = False
+        self._running = False
 
         logger.info(
             "Prefetch orchestrator initialized: %d layers, prefetch_ahead=%d",
@@ -118,33 +129,34 @@ class PrefetchOrchestrator:
     def register_weight_buffer(
         self,
         layer_idx: int,
-        weight_name: str,
-        buffer: np.ndarray,
+        name: str = "",
+        buffer: np.ndarray | None = None,
+        weight_name: str = "",
     ) -> None:
         """Register a weight buffer for prefetch management.
 
         All model weight buffers must be registered before inference begins.
-        Buffers should be memory-pinned (see memory module) for optimal results.
 
         Args:
             layer_idx: Transformer layer index.
-            weight_name: Descriptive name for the weight tensor.
+            name: Descriptive name for the weight tensor.
             buffer: The numpy array holding the quantized weight data.
+            weight_name: Alias for name (legacy keyword).
         """
-        if layer_idx not in self._weight_registry:
-            self._weight_registry[layer_idx] = {}
-
-        self._weight_registry[layer_idx][weight_name] = (buffer, buffer.nbytes)
+        # Accept both 'name' and 'weight_name' kwargs
+        resolved_name = name or weight_name
+        key = f"{layer_idx}:{resolved_name}"
+        self._weight_buffers[key] = (buffer, buffer.nbytes)
         logger.debug(
             "Registered weight buffer: layer %d/%s (%d bytes)",
             layer_idx,
-            weight_name,
+            resolved_name,
             buffer.nbytes,
         )
 
     def start(self) -> None:
         """Start the prefetch thread."""
-        if self._is_running:
+        if self._running:
             return
 
         self._shutdown.clear()
@@ -153,13 +165,13 @@ class PrefetchOrchestrator:
             name="asdsl-prefetch",
             daemon=True,
         )
-        self._is_running = True
+        self._running = True
         self._prefetch_thread.start()
         logger.info("Prefetch thread started")
 
     def stop(self) -> None:
         """Stop the prefetch thread."""
-        if not self._is_running:
+        if not self._running:
             return
 
         self._shutdown.set()
@@ -169,11 +181,11 @@ class PrefetchOrchestrator:
             self._prefetch_thread.join(timeout=5.0)
             self._prefetch_thread = None
 
-        self._is_running = False
+        self._running = False
         logger.info(
             "Prefetch thread stopped. Stats: %d requests, %d bytes prefetched",
-            self.stats.total_requests,
-            self.stats.total_bytes_prefetched,
+            self._stats["prefetch_requests"],
+            self._stats["total_bytes_prefetched"],
         )
 
     def notify_layer_start(self, layer_idx: int) -> None:
@@ -191,36 +203,51 @@ class PrefetchOrchestrator:
 
             self._enqueue_layer_prefetch(target_layer)
 
-    def notify_speculative_draft_start(self, skip_layers: set[int]) -> None:
+    def notify_speculative_draft_start(
+        self,
+        skip_layers: set[int] | None = None,
+        skip_indices: set[int] | None = None,
+    ) -> None:
         """Notify that a speculative draft phase is starting.
 
         Pre-loads verification layers (the ones NOT skipped during draft)
         so the full verification pass can execute without cache misses.
 
         Args:
-            skip_layers: Set of layer indices being skipped in draft.
+            skip_layers:  Set of layer indices being skipped in draft.
+            skip_indices: Alias for skip_layers.
         """
+        skipped = skip_layers or skip_indices or set()
         # Prioritize non-skipped layers that will be used in verification
-        verify_layers = [i for i in range(self.num_layers) if i not in skip_layers]
+        verify_layers = [i for i in range(self.num_layers) if i not in skipped]
 
         for layer_idx in verify_layers:
             self._enqueue_layer_prefetch(layer_idx, priority=1)
 
+    def get_stats(self) -> dict:
+        """Return prefetch statistics as a plain dict."""
+        return dict(self._stats)
+
     def _enqueue_layer_prefetch(self, layer_idx: int, priority: int = 0) -> None:
         """Enqueue all weights for a layer for prefetching."""
-        if layer_idx not in self._weight_registry:
+        layer_prefix = f"{layer_idx}:"
+        layer_keys = [k for k in self._weight_buffers if k.startswith(layer_prefix)]
+        if not layer_keys:
             return
 
         with self._queue_lock:
-            for name, (buffer, size) in self._weight_registry[layer_idx].items():
+            for key in layer_keys:
+                buffer, size = self._weight_buffers[key]
+                weight_name = key[len(layer_prefix):]
                 request = PrefetchRequest(
                     layer_idx=layer_idx,
-                    weight_name=name,
+                    weight_name=weight_name,
                     data_ptr=buffer.ctypes.data,
                     size_bytes=size,
                     priority=priority,
                 )
                 self._prefetch_queue.append(request)
+                self._stats["prefetch_requests"] += 1
                 self.stats.total_requests += 1
 
         self._queue_event.set()
@@ -264,6 +291,8 @@ class PrefetchOrchestrator:
             self.stats.completed_requests += 1
             self.stats.total_bytes_prefetched += request.size_bytes
             self.stats.cache_hits_estimated += 1
+            self._stats["completed_requests"] += 1
+            self._stats["total_bytes_prefetched"] += request.size_bytes
 
         except Exception as e:
             logger.debug("Prefetch failed for layer %d/%s: %s", request.layer_idx, request.weight_name, e)

@@ -99,7 +99,9 @@ def build_lut_for_group(
     """
     num_values = 1 << bits  # Number of possible values per weight
     num_entries = num_values**group_width
-    half = num_values // 2
+    # Use (num_values//4) as center: for 2-bit → 1, meaning qval=1 maps to zero.
+    # This matches the convention (qval - 1)*scale for 2-bit symmetric quantization.
+    half = num_values // 4
 
     table = np.zeros(num_entries, dtype=np.float32)
 

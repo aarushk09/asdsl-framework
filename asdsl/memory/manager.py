@@ -25,6 +25,7 @@ class MemoryRegion:
     """A managed memory region with pinning and allocation metadata.
 
     Attributes:
+        name: Logical name used as key in the MemoryManager registry.
         buffer: The numpy array backed by this memory.
         size_bytes: Total allocation size.
         is_pinned: Whether the memory is locked in physical RAM.
@@ -33,6 +34,7 @@ class MemoryRegion:
         base_address: Virtual memory base address.
     """
 
+    name: str
     buffer: np.ndarray
     size_bytes: int
     is_pinned: bool = False
@@ -60,13 +62,23 @@ class MemoryManager:
         use_huge_pages: bool = True,
         pin_memory: bool = True,
         numa_aware: bool = True,
+        # Test-friendly aliases
+        enable_huge_pages: bool | None = None,
+        enable_pinning: bool | None = None,
     ):
+        # Accept both naming conventions
+        if enable_huge_pages is not None:
+            use_huge_pages = enable_huge_pages
+        if enable_pinning is not None:
+            pin_memory = enable_pinning
+
         self.use_huge_pages = use_huge_pages
         self.pin_memory = pin_memory
         self.numa_aware = numa_aware
 
         self._system = platform.system()
-        self._regions: list[MemoryRegion] = []
+        # Named region registry (dict keyed by name)
+        self._regions: dict[str, MemoryRegion] = {}
         self._total_pinned_bytes = 0
 
         # Detect capabilities
@@ -98,7 +110,7 @@ class MemoryManager:
             numa_node: Preferred NUMA node (-1 = auto-select).
 
         Returns:
-            MemoryRegion with the allocated buffer.
+            MemoryRegion with the allocated buffer (name="").
         """
         num_elements = size_bytes // dtype.itemsize
         if size_bytes % dtype.itemsize:
@@ -124,13 +136,13 @@ class MemoryManager:
                 self._total_pinned_bytes += buffer.nbytes
 
         region = MemoryRegion(
+            name="",
             buffer=buffer,
             size_bytes=buffer.nbytes,
             is_pinned=is_pinned,
             is_huge_page=is_huge,
             numa_node=numa_node,
         )
-        self._regions.append(region)
 
         logger.debug(
             "Allocated region: %.2f MB (pinned=%s, huge=%s, numa=%d)",
@@ -144,29 +156,78 @@ class MemoryManager:
 
     def allocate_for_weights(
         self,
-        packed_data: np.ndarray,
+        name_or_data,
+        shape: tuple | None = None,
+        dtype: np.dtype | type = np.float32,
+        numa_node: int = -1,
     ) -> MemoryRegion:
-        """Allocate a pinned region and copy weight data into it.
+        """Allocate a named region for model weights.
 
-        This is the main entry point for loading quantized weights
-        into inference-ready memory.
+        Accepts two calling conventions:
+
+        * ``allocate_for_weights(name, shape=..., dtype=...)`` — allocates a
+          fresh buffer with the given shape and dtype.
+        * ``allocate_for_weights(packed_data)`` — copies existing ndarray data
+          into a new pinned region (legacy API).
 
         Args:
-            packed_data: Packed quantized weight data to copy.
+            name_or_data: Either a string name or a packed numpy ndarray.
+            shape: Required when name_or_data is a string.
+            dtype: Numpy dtype (default float32).
+            numa_node: Preferred NUMA node.
 
         Returns:
-            MemoryRegion containing the weight data.
+            MemoryRegion registered under *name*.
         """
-        region = self.allocate(
-            size_bytes=packed_data.nbytes,
-            dtype=packed_data.dtype,
-        )
-        np.copyto(region.buffer[: len(packed_data)], packed_data)
+        if isinstance(name_or_data, str):
+            # New-style: allocate_for_weights("layer0_q", shape=(64,), dtype=np.float16)
+            name = name_or_data
+            dtype = np.dtype(dtype)
+            buffer = np.empty(shape, dtype=dtype)
+
+            is_pinned = False
+            if self.pin_memory and self._can_pin:
+                if self._pin_buffer(buffer):
+                    is_pinned = True
+                    self._total_pinned_bytes += buffer.nbytes
+
+            region = MemoryRegion(
+                name=name,
+                buffer=buffer,
+                size_bytes=buffer.nbytes,
+                is_pinned=is_pinned,
+                numa_node=numa_node,
+            )
+        else:
+            # Legacy: allocate_for_weights(packed_data)
+            packed_data: np.ndarray = name_or_data
+            name = ""
+            region = self.allocate(
+                size_bytes=packed_data.nbytes,
+                dtype=packed_data.dtype,
+                numa_node=numa_node,
+            )
+            region.name = name
+            np.copyto(region.buffer[: len(packed_data)], packed_data)
+
+        self._regions[name] = region
+        logger.debug("Registered weight region '%s': %.2f KB", name, region.size_bytes / 1024)
         return region
+
+    def release(self, name: str) -> None:
+        """Release a named memory region."""
+        region = self._regions.pop(name, None)
+        if region is None:
+            logger.warning("release('%s'): no such region", name)
+            return
+        if region.is_pinned:
+            self._unpin_buffer(region.buffer)
+            self._total_pinned_bytes = max(0, self._total_pinned_bytes - region.size_bytes)
+        logger.debug("Released region '%s'", name)
 
     def release_all(self) -> None:
         """Release all managed memory regions."""
-        for region in self._regions:
+        for region in self._regions.values():
             if region.is_pinned:
                 self._unpin_buffer(region.buffer)
 
@@ -174,9 +235,27 @@ class MemoryManager:
         self._total_pinned_bytes = 0
         logger.info("All memory regions released")
 
+    def get_stats(self) -> dict:
+        """Return a summary of current allocation statistics."""
+        total = sum(r.size_bytes for r in self._regions.values())
+        pinned = sum(r.size_bytes for r in self._regions.values() if r.is_pinned)
+        return {
+            "total_allocated_bytes": total,
+            "total_pinned_bytes": pinned,
+            "num_regions": len(self._regions),
+            "total_allocated_mb": total / (1024 * 1024),
+        }
+
+    def get_numa_info(self) -> dict:
+        """Return information about detected NUMA topology."""
+        return {
+            "numa_nodes": list(self._numa_nodes),
+            "num_nodes": len(self._numa_nodes),
+        }
+
     @property
     def total_allocated_mb(self) -> float:
-        return sum(r.size_bytes for r in self._regions) / (1024 * 1024)
+        return sum(r.size_bytes for r in self._regions.values()) / (1024 * 1024)
 
     @property
     def total_pinned_mb(self) -> float:

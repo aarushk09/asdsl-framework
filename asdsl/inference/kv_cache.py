@@ -19,12 +19,23 @@ logger = logging.getLogger(__name__)
 class KVCacheConfig:
     """Configuration for the block-sparse KV cache."""
 
-    max_context_length: int = 4096
-    block_size: int = 64
-    max_kv_blocks: int = 32
+    num_layers: int = 1
     num_kv_heads: int = 8
-    head_dim: int = 96  # hidden_dim / num_attention_heads
-    streaming_heads: int = 2  # Heads that always attend to all tokens
+    head_dim: int = 96
+    max_blocks: int = 32
+    block_size: int = 64
+
+    def memory_budget_bytes(self) -> int:
+        """Upper bound on memory: all layers * heads * blocks * block_size * K+V * float32."""
+        return (
+            self.num_layers
+            * self.num_kv_heads
+            * self.head_dim
+            * self.max_blocks
+            * self.block_size
+            * 2   # keys + values
+            * 4   # float32 bytes
+        )
 
 
 @dataclass
@@ -51,164 +62,113 @@ class KVBlock:
 class BlockSparseKVCache:
     """Block-wise sparse KV cache with dynamic eviction.
 
-    Instead of maintaining KV entries for all tokens (which scales
-    linearly with context length), this cache maintains a fixed number
-    of KV blocks and dynamically evicts the least important blocks
-    based on query-centric similarity scores.
+    Stores per-token KV states for all layers. When the cache exceeds
+    max_blocks * block_size tokens, the least-important token is evicted.
 
-    Key features:
-    - Fixed memory footprint regardless of context length
-    - Pivot token blocks are pinned and never evicted
-    - Streaming heads always attend to recent tokens
-    - Query-centric importance scoring for smart eviction
+    ``append(k, v)`` takes a single-token snapshot where k/v have shape
+    ``(num_layers, num_kv_heads, head_dim)``.
+
+    ``get_attention_keys_values(layer_idx)`` returns all stored tokens
+    for that layer as ``(seq_len, num_kv_heads, head_dim)`` arrays.
     """
 
     def __init__(self, config: KVCacheConfig):
         self.config = config
-        self.blocks: dict[int, KVBlock] = {}
-        self._next_block_id = 0
-        self._current_position = 0
+        self._max_tokens: int = config.max_blocks * config.block_size
+        # Per-token storage: each slot holds (num_layers, num_kv_heads, head_dim)
+        self._keys: list[np.ndarray] = []
+        self._values: list[np.ndarray] = []
+        self._importance: list[float] = []
 
     @property
-    def num_blocks(self) -> int:
-        return len(self.blocks)
+    def length(self) -> int:
+        """Number of tokens currently stored."""
+        return len(self._keys)
 
     @property
     def memory_bytes(self) -> int:
-        """Current memory usage of the KV cache."""
-        if not self.blocks:
+        """Approximate memory used by stored KV tensors."""
+        if not self._keys:
             return 0
-        bytes_per_block = (
-            self.config.block_size
-            * self.config.head_dim
-            * 2  # keys + values
-            * 2  # float16
-        )
-        return self.num_blocks * bytes_per_block
+        return sum(k.nbytes + v.nbytes for k, v in zip(self._keys, self._values))
 
     def append(
         self,
         keys: np.ndarray,
         values: np.ndarray,
-        token_positions: list[int],
         is_pivot: bool = False,
-    ) -> int:
-        """Add a new KV block to the cache.
-
-        If the cache is full, evicts the least important non-pinned block.
+    ) -> None:
+        """Append a single token's KV state for all layers.
 
         Args:
-            keys: Key tensor for this block.
-            values: Value tensor for this block.
-            token_positions: Token positions represented by this block.
-            is_pivot: If True, pin this block (pivot tokens).
-
-        Returns:
-            Block ID of the newly added block.
+            keys:   Shape (num_layers, num_kv_heads, head_dim), float32.
+            values: Shape (num_layers, num_kv_heads, head_dim), float32.
+            is_pivot: Pinned tokens are never evicted.
         """
-        # Evict if at capacity
-        if self.num_blocks >= self.config.max_kv_blocks:
-            self._evict_least_important()
+        # Evict lowest-importance entry when at capacity
+        if len(self._keys) >= self._max_tokens:
+            evict_idx = int(np.argmin(self._importance))
+            del self._keys[evict_idx]
+            del self._values[evict_idx]
+            del self._importance[evict_idx]
 
-        block = KVBlock(
-            block_id=self._next_block_id,
-            keys=keys.astype(np.float16),
-            values=values.astype(np.float16),
-            token_positions=token_positions,
-            is_pinned=is_pivot,
-            importance_score=1.0 if is_pivot else 0.5,
-        )
-        self.blocks[block.block_id] = block
-        self._next_block_id += 1
-        self._current_position += len(token_positions)
-
-        return block.block_id
-
-    def update_importance(self, query: np.ndarray) -> None:
-        """Update block importance scores based on the current query.
-
-        Uses cosine similarity between query and block keys as a
-        proxy for attention importance. Higher similarity = more
-        likely to receive high attention = more important to keep.
-
-        Args:
-            query: Current query vector, shape (head_dim,).
-        """
-        query_norm = np.linalg.norm(query)
-        if query_norm == 0:
-            return
-
-        for block in self.blocks.values():
-            if block.is_pinned:
-                continue  # Pinned blocks always have max importance
-
-            # Average key similarity
-            key_norms = np.linalg.norm(block.keys.astype(np.float32), axis=-1)
-            valid = key_norms > 0
-            if not np.any(valid):
-                block.importance_score = 0.0
-                continue
-
-            similarities = (
-                block.keys[valid].astype(np.float32) @ query.astype(np.float32)
-            ) / (key_norms[valid] * query_norm)
-
-            block.importance_score = float(np.mean(similarities))
+        self._keys.append(keys.astype(np.float32).copy())
+        self._values.append(values.astype(np.float32).copy())
+        # Pivot tokens get max importance so they survive eviction sweeps
+        self._importance.append(float("inf") if is_pivot else 0.0)
 
     def get_attention_keys_values(
         self,
-        head_idx: int,
+        layer_idx: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Retrieve aggregated keys and values for attention computation.
-
-        For streaming heads, returns all blocks.
-        For other heads, returns only the top-importance blocks.
-
-        Args:
-            head_idx: Attention head index.
+        """Return all stored keys/values for a specific layer.
 
         Returns:
-            Tuple of (keys, values) concatenated from selected blocks.
+            (keys, values) each shaped (seq_len, num_kv_heads, head_dim).
         """
-        is_streaming = head_idx < self.config.streaming_heads
+        if not self._keys:
+            shape = (0, self.config.num_kv_heads, self.config.head_dim)
+            empty = np.empty(shape, dtype=np.float32)
+            return empty, empty.copy()
 
-        if is_streaming:
-            selected = sorted(self.blocks.values(), key=lambda b: b.block_id)
-        else:
-            # Select top blocks by importance
-            sorted_blocks = sorted(
-                self.blocks.values(),
-                key=lambda b: (b.is_pinned, b.importance_score),
-                reverse=True,
-            )
-            max_blocks = self.config.max_kv_blocks // 2  # Non-streaming uses fewer
-            selected = sorted_blocks[:max_blocks]
+        # Stack token snapshots and extract the requested layer
+        k_stack = np.stack([k[layer_idx] for k in self._keys], axis=0)
+        v_stack = np.stack([v[layer_idx] for v in self._values], axis=0)
+        return k_stack, v_stack
 
-        if not selected:
-            head_dim = self.config.head_dim
-            return np.empty((0, head_dim), dtype=np.float16), np.empty(
-                (0, head_dim), dtype=np.float16
-            )
+    def update_importance(
+        self,
+        layer_idx: int,
+        query_state: np.ndarray,
+    ) -> None:
+        """Update importance scores via query-key cosine similarity.
 
-        all_keys = np.concatenate([b.keys for b in selected], axis=0)
-        all_values = np.concatenate([b.values for b in selected], axis=0)
-
-        return all_keys, all_values
-
-    def _evict_least_important(self) -> None:
-        """Evict the least important non-pinned block."""
-        candidates = [
-            b for b in self.blocks.values() if not b.is_pinned
-        ]
-        if not candidates:
-            logger.warning("All KV blocks are pinned, cannot evict")
+        Args:
+            layer_idx:   Layer to compute similarity for.
+            query_state: Query vector, shape (num_kv_heads, head_dim) or (head_dim,).
+        """
+        if not self._keys:
             return
 
-        victim = min(candidates, key=lambda b: b.importance_score)
-        del self.blocks[victim.block_id]
-        logger.debug("Evicted KV block %d (importance=%.3f)", victim.block_id, victim.importance_score)
+        q = query_state.reshape(-1).astype(np.float32)
+        q_norm = float(np.linalg.norm(q))
+        if q_norm == 0:
+            return
+
+        for i, k in enumerate(self._keys):
+            if self._importance[i] == float("inf"):
+                continue  # Pinned
+            k_flat = k[layer_idx].reshape(-1).astype(np.float32)
+            k_norm = float(np.linalg.norm(k_flat))
+            if k_norm == 0:
+                continue
+            score = float(np.dot(q, k_flat) / (q_norm * k_norm))
+            self._importance[i] = max(self._importance[i], score)
 
     def clear(self) -> None:
-        """Clear all cached KV blocks."""
-        self.blocks.clear()
-        self._current_position = 0
+        """Clear all cached KV states."""
+        self._keys.clear()
+        self._values.clear()
+        self._importance.clear()
+        logger.debug("KV cache cleared")
+

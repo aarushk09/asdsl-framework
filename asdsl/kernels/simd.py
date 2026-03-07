@@ -22,6 +22,7 @@ class KernelBackend(IntEnum):
     """Available compute kernel backends."""
 
     NUMPY = 0    # Pure numpy fallback
+    SCALAR = 0   # Alias: scalar/numpy fallback (always available)
     AVX2 = 1     # x86 AVX2 + VPSHUFB
     AVX512 = 2   # x86 AVX-512
     VNNI = 3     # x86 AVX-512 VNNI (INT8 acceleration)
@@ -67,6 +68,12 @@ def lut_shuffle_avx2(
     Returns:
         Looked-up values.
     """
+    # Validate: for a table of len N, indices must be in [0, N-1]
+    if np.any(indices >= len(table)):
+        raise ValueError(
+            f"Index out of range: all indices must be in [0, {len(table) - 1}], "
+            f"got max={int(indices.max())}"
+        )
     # VPSHUFB semantics: for each byte in indices, if high bit is set
     # the result is 0, otherwise result = table[index & 0x0F]
     result = np.zeros_like(indices)
@@ -100,7 +107,7 @@ def lut_tbl_neon(
 def fma_vnni_int8(
     a: np.ndarray,
     b: np.ndarray,
-    accumulator: np.ndarray,
+    accumulator: np.ndarray | None = None,
 ) -> np.ndarray:
     """Emulate AVX-512 VNNI VPDPBUSD (dot product with accumulation).
 
@@ -115,6 +122,10 @@ def fma_vnni_int8(
     Returns:
         Updated accumulator.
     """
+    # When no accumulator provided, behave as standard INT8 matmul
+    if accumulator is None:
+        return a.astype(np.int32) @ b.astype(np.int32)
+
     # VNNI computes 4-element dot products and accumulates into int32
     a_i32 = a.astype(np.int32)
     b_i32 = b.astype(np.int32)
@@ -135,7 +146,7 @@ def fma_vnni_int8(
 def prefill_matmul_int8(
     activations: np.ndarray,
     weights: np.ndarray,
-    scales: np.ndarray,
+    scales: np.ndarray | None = None,
 ) -> np.ndarray:
     """INT8 matrix multiplication for the prefill phase.
 
@@ -152,14 +163,19 @@ def prefill_matmul_int8(
         Output matrix, shape (seq_len, out_dim), float32.
     """
     # INT8 matmul with scale correction
-    result_i32 = activations.astype(np.int32) @ weights.astype(np.int32).T
+    result_i32 = activations.astype(np.int32) @ weights.astype(np.int32)
 
-    # Apply per-group scales
+    # No scales: return plain int32 result as float32
+    if scales is None:
+        return result_i32.astype(np.float32)
+
+    # Apply per-group scales (weights assumed (out_dim, hidden_dim) for legacy callers)
+    result_i32_t = activations.astype(np.int32) @ weights.astype(np.int32).T
     if len(scales) == 1:
-        result = result_i32.astype(np.float32) * float(scales[0])
+        result = result_i32_t.astype(np.float32) * float(scales[0])
     else:
         # Broadcast scales across output dimension
-        result = result_i32.astype(np.float32)
+        result = result_i32_t.astype(np.float32)
         groups = len(scales)
         per_group = max(result.shape[-1] // groups, 1)
         for g in range(groups):
