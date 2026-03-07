@@ -55,6 +55,9 @@ htmlcov/
 *.asdsl
 models/
 
+# Experiment results are tracked; only ignore temp files
+experiments/results/*.tmp
+
 # OS
 .DS_Store
 Thumbs.db
