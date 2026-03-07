@@ -19,68 +19,86 @@ from asdsl.quantization.core import quantize_weights
 
 
 def bench_lut_build(
-    shape: tuple[int, int] = (3072, 3072),
+    shape: tuple[int, int] = (256, 256),
     bits: int = 4,
     group_size: int = 128,
+    group_width: int = 2,
     repeats: int = 3,
 ) -> None:
-    """Benchmark LUT table construction time."""
+    """Benchmark LUT table construction time (Python reference kernels).
+
+    Note: This is the Python reference implementation.  A native AVX2/VNNI
+    backend would process each LUT group in a handful of vector instructions
+    rather than a Python for-loop, giving ~100-1000x speedup.
+    """
     print("=" * 72)
-    print("LUT Table Build Benchmark")
+    print("LUT Table Build Benchmark  [Python reference — see note below]")
     print("=" * 72)
 
     weights = np.random.randn(*shape).astype(np.float32)
     qt = quantize_weights(weights, bits=bits, group_size=group_size)
+    x = np.random.randn(shape[1]).astype(np.float32)
 
     times = []
     for _ in range(repeats):
         t0 = time.perf_counter()
-        tables = build_lut_tables_for_layer(qt)
+        tables = build_lut_tables_for_layer(
+            qt.data, qt.scales, x, qt.bits, qt.group_size, group_width=group_width
+        )
         t1 = time.perf_counter()
         times.append(t1 - t0)
 
     median_ms = sorted(times)[len(times) // 2] * 1000
     num_tables = len(tables)
-    print(f"Shape: {shape}, Bits: {bits}, Group Size: {group_size}")
-    print(f"Tables built: {num_tables}")
-    print(f"Build time: {median_ms:.2f} ms")
+    entries_per_table = (1 << bits) ** group_width
+    print(f"Shape: {shape}, Bits: {bits}, group_width: {group_width}")
+    print(f"Tables built: {num_tables}  ({entries_per_table} entries each)")
+    print(f"Build time (Python): {median_ms:.2f} ms")
+    print(f"NOTE: Native AVX2 would be ~100-500x faster for this step.")
     print()
 
 
 def bench_lut_matvec(
-    out_features: int = 3072,
-    in_features: int = 3072,
-    bits: int = 4,
+    out_features: int = 256,
+    in_features: int = 256,
     group_size: int = 128,
-    repeats: int = 10,
+    group_width: int = 2,
+    repeats: int = 5,
 ) -> None:
-    """Benchmark LUT-based matrix-vector multiply throughput."""
+    """Benchmark LUT-based matrix-vector multiply throughput (Python reference).
+
+    Note: The Python kernel is loop-based and ~100-1000x slower than what a
+    native AVX2/VNNI implementation would achieve.
+    """
     print("=" * 72)
-    print("LUT MatVec Throughput Benchmark")
+    print("LUT MatVec Throughput Benchmark  [Python reference — see note below]")
     print("=" * 72)
 
     print(f"{'Shape':>18s}  {'Bits':>4s}  {'Time (ms)':>10s}  {'GOPS':>10s}")
     print("-" * 50)
 
-    for bits in [2, 3, 4]:
+    for bits in [2, 4]:
         shape = (out_features, in_features)
         weights = np.random.randn(*shape).astype(np.float32)
         qt = quantize_weights(weights, bits=bits, group_size=group_size)
-        tables = build_lut_tables_for_layer(qt)
         x = np.random.randn(in_features).astype(np.float32)
+        tables = build_lut_tables_for_layer(
+            qt.data, qt.scales, x, qt.bits, qt.group_size, group_width=group_width
+        )
 
         times = []
         for _ in range(repeats):
             t0 = time.perf_counter()
-            result = lut_matvec(tables, x, out_features=out_features, group_size=group_size)
+            result = lut_matvec(tables, qt.data, qt.bits, out_features, in_features)
             t1 = time.perf_counter()
             times.append(t1 - t0)
 
         median_ms = sorted(times)[len(times) // 2] * 1000
         ops = 2 * out_features * in_features  # multiply-add pairs
         gops = (ops / 1e9) / (median_ms / 1000) if median_ms > 0 else 0
-        print(f"{str(shape):>18s}  {bits:>4d}  {median_ms:>10.2f}  {gops:>10.2f}")
+        print(f"{str(shape):>18s}  {bits:>4d}  {median_ms:>10.2f}  {gops:>10.4f}")
 
+    print(f"NOTE: Native AVX2 4-bit LUT targets ~200-500 GOPS; Python is a reference.")
     print()
 
 
@@ -94,27 +112,34 @@ def bench_lut_memory(
     if bits_list is None:
         bits_list = [2, 3, 4]
 
+    group_width = 2  # 2 weights per LUT entry → 2^(bits*2) entries
     print("=" * 72)
-    print("LUT Memory Footprint Estimate")
+    print("LUT Memory Footprint Estimate  (group_width=2, one forward pass)")
     print("=" * 72)
-    print(f"{'Shape':>18s}  {'Bits':>4s}  {'LUT Memory':>12s}  {'Fits L1?':>8s}  {'Fits L2?':>8s}")
-    print("-" * 60)
+    print(f"{'Shape':>18s}  {'Bits':>4s}  {'Entries/LUT':>12s}  {'LUT Mem':>10s}  "
+          f"{'In L1?':>6s}  {'In L2?':>6s}")
+    print("-" * 66)
 
     for shape in shapes:
+        in_features = shape[1]
         for bits in bits_list:
+            # num_weight_groups = number of LUT tables for one forward pass
+            # Each group covers group_width elements of the activation vector
+            num_weight_groups = in_features // group_width
             est = estimate_lut_memory(
-                out_features=shape[0],
-                in_features=shape[1],
                 bits=bits,
-                group_size=128,
+                group_width=group_width,
+                num_weight_groups=num_weight_groups,
             )
-            lut_kb = est["total_bytes"] / 1024
-            unit = "KB" if lut_kb < 1024 else "MB"
-            val = lut_kb if lut_kb < 1024 else lut_kb / 1024
+            total_kb = est["total_kb"]
+            unit = "KB" if total_kb < 1024 else "MB"
+            val = total_kb if total_kb < 1024 else total_kb / 1024
+            entries = est["entries_per_table"]
             print(
-                f"{str(shape):>18s}  {bits:>4d}  {val:>9.1f} {unit:>2s}  "
-                f"{'Yes' if est['fits_l1'] else 'No':>8s}  "
-                f"{'Yes' if est['fits_l2'] else 'No':>8s}"
+                f"{str(shape):>18s}  {bits:>4d}  {entries:>12d}  "
+                f"{val:>7.1f} {unit:>2s}  "
+                f"{'Yes' if est['fits_l1_cache'] else 'No':>6s}  "
+                f"{'Yes' if est['fits_l2_cache'] else 'No':>6s}"
             )
 
     print()
@@ -122,6 +147,8 @@ def bench_lut_memory(
 
 def bench_permutation(
     shape: tuple[int, int] = (3072, 3072),
+    bits: int = 4,
+    group_size: int = 128,
     repeats: int = 5,
 ) -> None:
     """Benchmark weight permutation for LUT alignment."""
@@ -130,22 +157,23 @@ def bench_permutation(
     print("=" * 72)
 
     weights = np.random.randn(*shape).astype(np.float32)
+    qt = quantize_weights(weights, bits=bits, group_size=group_size)
 
     times = []
     for _ in range(repeats):
         t0 = time.perf_counter()
-        permuted = permute_weights_for_lut(weights, group_size=128, tile_size=16)
+        permuted = permute_weights_for_lut(qt.data, qt.bits, shape[0], shape[1])
         t1 = time.perf_counter()
         times.append(t1 - t0)
-    print(f"permute_weights_for_lut ({shape}): {sorted(times)[len(times)//2]*1000:.2f} ms")
+    print(f"permute_weights_for_lut ({shape}, {bits}-bit): {sorted(times)[len(times)//2]*1000:.2f} ms")
 
     times = []
     for _ in range(repeats):
         t0 = time.perf_counter()
-        interleaved = interleave_for_simd(weights, lane_width=8)
+        interleaved = interleave_for_simd(qt.data, qt.bits)
         t1 = time.perf_counter()
         times.append(t1 - t0)
-    print(f"interleave_for_simd ({shape}): {sorted(times)[len(times)//2]*1000:.2f} ms")
+    print(f"interleave_for_simd ({shape}, {bits}-bit): {sorted(times)[len(times)//2]*1000:.2f} ms")
     print()
 
 

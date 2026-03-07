@@ -9,7 +9,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from asdsl.quantization.core import quantize_weights, dequantize_weights, compute_quantization_error
-from asdsl.quantization.salience import compute_gradient_salience, allocate_bits_by_salience
+from asdsl.quantization.salience import compute_hessian_salience, allocate_bits_by_salience
 
 
 def bench_quantize_throughput(
@@ -41,8 +41,8 @@ def bench_quantize_throughput(
             throughput = size_mb / (median_ms / 1000) if median_ms > 0 else float("inf")
 
             compressed_bytes = qt.data.nbytes + qt.scales.nbytes
-            if qt.zero_points is not None:
-                compressed_bytes += qt.zero_points.nbytes
+            if qt.zeros is not None:
+                compressed_bytes += qt.zeros.nbytes
             ratio = weights.nbytes / compressed_bytes
 
             print(f"{str(shape):>18s}  {bits:>4d}  {median_ms:>10.2f}  {throughput:>10.1f}  {ratio:>12.2f}x")
@@ -117,16 +117,17 @@ def bench_salience_analysis(
     print("=" * 72)
 
     weights = np.random.randn(*shape).astype(np.float32)
-    gradients = np.random.randn(*shape).astype(np.float32) * 0.01
+    # Simulate 16 calibration activation samples (in_features columns)
+    activations = np.random.randn(16, shape[1]).astype(np.float32)
 
-    # Gradient salience
+    # Hessian-based salience (numpy-compatible, no PyTorch model needed)
     times = []
     for _ in range(repeats):
         t0 = time.perf_counter()
-        salience = compute_gradient_salience(weights, gradients, group_size=128)
+        salience = compute_hessian_salience(weights, activations, group_size=128)
         t1 = time.perf_counter()
         times.append(t1 - t0)
-    print(f"Gradient salience ({shape}): {sorted(times)[len(times)//2]*1000:.2f} ms")
+    print(f"Hessian salience ({shape}): {sorted(times)[len(times)//2]*1000:.2f} ms")
 
     # Bit allocation
     times = []
@@ -136,7 +137,7 @@ def bench_salience_analysis(
         t1 = time.perf_counter()
         times.append(t1 - t0)
     print(f"Bit allocation: {sorted(times)[len(times)//2]*1000:.2f} ms")
-    print(f"Avg bits assigned: {allocation.avg_bits:.3f}")
+    print(f"Avg bits assigned: {allocation.average_bits:.3f}")
     print()
 
 
