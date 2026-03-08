@@ -71,11 +71,11 @@ VOCAB = 200064
 RMS_EPS = 1e-5
 ROPE_THETA = 10000.0
 # Phi-4 uses partial RoPE: only 75% of head_dim is rotated (config: partial_rotary_factor=0.75)
-ROTARY_DIM = int(0.75 * HEAD_DIM)      # 96 — only these dims get RoPE applied
+ROTARY_DIM = int(0.75 * HEAD_DIM)      # 96 - only these dims get RoPE applied
 
 # Special token IDs
 # 200020 = <|end|> (end of turn),  199999 = <|endoftext|> / </s> (end of text)
-# 200019 = <|assistant|> (start of assistant turn — NOT an EOS token)
+# 200019 = <|assistant|> (start of assistant turn - NOT an EOS token)
 EOS_TOKEN_IDS = {200020, 199999}
 
 
@@ -103,19 +103,19 @@ def build_rope_cache(seq_len: int, head_dim: int, theta: float = ROPE_THETA,
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Partial rotate-half RoPE.
 
-    x: (seq, heads, head_dim)  — full head vector
-    cos/sin: (seq, ROTARY_DIM//2)  — tables for the rotated portion only
+    x: (seq, heads, head_dim)  - full head vector
+    cos/sin: (seq, ROTARY_DIM//2)  - tables for the rotated portion only
 
     Phi-4 sets partial_rotary_factor=0.75, so only the first ROTARY_DIM=96 dims
     of each head are rotated; the remaining 32 dims pass through unchanged.
     """
     d = cos.shape[-1]              # = ROTARY_DIM // 2 = 48
     rotary_dim = 2 * d             # = ROTARY_DIM = 96
-    x_rot  = x[..., :rotary_dim]   # (seq, heads, 96) — will be rotated
-    x_pass = x[..., rotary_dim:]   # (seq, heads, 32) — untouched
+    x_rot  = x[..., :rotary_dim]   # (seq, heads, 96) - will be rotated
+    x_pass = x[..., rotary_dim:]   # (seq, heads, 32) - untouched
     x1 = x_rot[..., :d]            # first half:  dims 0..47
     x2 = x_rot[..., d:]            # second half: dims 48..95
-    c  = cos.unsqueeze(-2)         # (seq, 1, 48) — broadcasts over heads
+    c  = cos.unsqueeze(-2)         # (seq, 1, 48) - broadcasts over heads
     s  = sin.unsqueeze(-2)
     rotated = torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)
     return torch.cat([rotated, x_pass], dim=-1)
@@ -162,18 +162,18 @@ class WeightStore:
         self._symmetric = bits > 4
         self._optimize_clips = bits <= 4
 
-        self.layers: dict[int, dict[str, object]] = {}   # layer_idx → {name: QuantizedTensor}
-        self.layer_norms: dict[int, dict[str, torch.Tensor]] = {}  # layer_idx → {name: tensor}
+        self.layers: dict[int, dict[str, object]] = {}   # layer_idx -> {name: QuantizedTensor}
+        self.layer_norms: dict[int, dict[str, torch.Tensor]] = {}  # layer_idx -> {name: tensor}
         self.embed: torch.Tensor | None = None            # (vocab, hidden) bfloat16, freed after caching
-        self.embed_f16: torch.Tensor | None = None        # (vocab, hidden) float16 — for token lookup
+        self.embed_f16: torch.Tensor | None = None        # (vocab, hidden) float16 - for token lookup
         self.lm_head: torch.Tensor | None = None           # same object as embed_f16, for LM head
         self.final_norm: torch.Tensor | None = None       # (hidden,)
-        self._weight_cache: dict[tuple, torch.Tensor] = {}   # (layer, name) → float16 tensor (bits=16 only)
+        self._weight_cache: dict[tuple, torch.Tensor] = {}   # (layer, name) -> float16 tensor (bits=16 only)
         # Quantized path (bits≤8): uint8 values + f16 scales/biases per group
-        self._quant_u8: dict[tuple, torch.Tensor] = {}    # (layer, name) → uint8 (rows*cols,)
-        self._quant_sc: dict[tuple, torch.Tensor] = {}    # (layer, name) → float16 scales (n_groups,)
-        self._quant_bi: dict[tuple, torch.Tensor] = {}    # (layer, name) → float16 biases (n_groups,)
-        self._quant_shapes: dict[tuple, tuple] = {}       # (layer, name) → (rows, cols)
+        self._quant_u8: dict[tuple, torch.Tensor] = {}    # (layer, name) -> uint8 (rows*cols,)
+        self._quant_sc: dict[tuple, torch.Tensor] = {}    # (layer, name) -> float16 scales (n_groups,)
+        self._quant_bi: dict[tuple, torch.Tensor] = {}    # (layer, name) -> float16 biases (n_groups,)
+        self._quant_shapes: dict[tuple, tuple] = {}       # (layer, name) -> (rows, cols)
 
     # ------------------------------------------------------------------
     def load(self) -> None:
@@ -201,9 +201,9 @@ class WeightStore:
         done = 0
 
         if self.bits == 16:
-            print(f"  Loading {total_proj} projection weights directly as float16 (no quantization) …")
+            print(f"  Loading {total_proj} projection weights directly as float16 (no quantization) ...")
         else:
-            print(f"  Loading & quantizing {total_proj} projection weights to {self.bits}-bit …")
+            print(f"  Loading & quantizing {total_proj} projection weights to {self.bits}-bit ...")
         print(f"  (embedding + norms loaded as bfloat16)")
 
         for shard_name, keys in sorted(shard_keys.items()):
@@ -240,8 +240,8 @@ class WeightStore:
                         friendly = key.split(".")[-1]
 
                     if self.bits == 16:
-                        # Skip ASDSL quantization — store directly in float16 cache.
-                        # All forward-pass matmuls use float16→float32 scratch buffers
+                        # Skip ASDSL quantization - store directly in float16 cache.
+                        # All forward-pass matmuls use float16->float32 scratch buffers
                         # anyway, so bits=16 gives best quality at no extra memory cost.
                         self._weight_cache[(layer_idx, friendly)] = tensor.to(torch.float16)
                     else:
@@ -262,7 +262,7 @@ class WeightStore:
         # Embedding: keep as float16 to save ~1.2 GB RAM.
         # Token lookup casts one row to float32 (12 KB, negligible).
         # LM head reads f16 in L2-sized chunks, halving DRAM traffic.
-        print("  Caching embed float16 … ", end="", flush=True)
+        print("  Caching embed float16 ... ", end="", flush=True)
         self.embed_f16 = self.embed.to(torch.float16).clone()
         self.lm_head = self.embed_f16              # tied weight, float16
         self.embed = None                          # free bfloat16 copy (~1.2 GB)
@@ -274,7 +274,7 @@ class WeightStore:
     # --- float16 path (bits=16) helpers --------------------------------
 
     def _matvec_f16(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
-        """Chunked f16→f32 matvec for unquantized weights."""
+        """Chunked f16->f32 matvec for unquantized weights."""
         w_f16 = self._weight_cache[(layer_idx, name)]
         rows, cols = w_f16.shape
         x_flat = x.view(-1)
@@ -291,7 +291,7 @@ class WeightStore:
     # --- quantized path (bits≤8) helpers --------------------------------
 
     def _matvec_quant(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
-        """Chunked uint8→dequant→matvec for quantized weights.
+        """Chunked uint8->dequant->matvec for quantized weights.
 
         Reads uint8 pre-unpacked values in L3-sized chunks, applies
         scale/bias in-place (no intermediate allocations) and does BLAS
@@ -310,7 +310,7 @@ class WeightStore:
             end = min(start + chunk_rows, rows)
             n = end - start
             flat_len = n * cols
-            # Flat view of pool — copy uint8→f32 in-place
+            # Flat view of pool - copy uint8->f32 in-place
             buf = self._pool[:flat_len]
             buf.copy_(u8[start * cols:end * cols])
             vals = buf.view(n, groups_per_row, self.group_size)
@@ -348,7 +348,7 @@ class WeightStore:
 
         bits=16: float16 weight cache is already populated from load().
         bits≤8:  pre-unpack quantized weights to uint8 tensors with f16
-                 scales/biases.  Keeps weights compressed — no f16 cache.
+                 scales/biases.  Keeps weights compressed - no f16 cache.
         """
         from asdsl.quantization.core import _unpack_bits
         total = NUM_LAYERS * 4
@@ -358,7 +358,7 @@ class WeightStore:
         else:
             done = 0
             qmax = (1 << self.bits) - 1
-            print(f"  Pre-unpacking {total} tensors to uint8 … ", end="", flush=True)
+            print(f"  Pre-unpacking {total} tensors to uint8 ... ", end="", flush=True)
             for i in range(NUM_LAYERS):
                 for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
                     qt = self.layers[i][name]
@@ -406,7 +406,7 @@ class KVHistory:
     Pre-allocated KV cache stored as contiguous torch tensors.
 
     Each layer gets a (max_seq, kv_heads, head_dim) buffer.
-    `get()` returns zero-copy views — no np.stack / torch.from_numpy per call.
+    `get()` returns zero-copy views - no np.stack / torch.from_numpy per call.
     """
     def __init__(self, max_seq: int = 2048):
         self.k_buf: dict[int, torch.Tensor] = {
@@ -493,10 +493,10 @@ def forward_layer(
 
     Uses chunked matvec (streaming dequant for quantized, chunked f16 read
     for float16) to minimise DRAM bandwidth.  KV history is pre-allocated
-    torch tensors — no per-token np.stack / allocations.
+    torch tensors - no per-token np.stack / allocations.
     """
 
-    # — Self-attention —
+    # - Self-attention -
     residual = hidden
     h = rms_norm(hidden, store.get_norm(layer_idx, "input_layernorm"))
 
@@ -518,7 +518,7 @@ def forward_layer(
     k_hist, v_hist = kv_hist.get(layer_idx)   # (seq, kv_heads, head_dim)
     seq_len = k_hist.shape[0]
 
-    # GQA: expand KV heads  →  (1, num_heads, seq, head_dim)
+    # GQA: expand KV heads  ->  (1, num_heads, seq, head_dim)
     expand = NUM_HEADS // NUM_KV_HEADS
     k_full = (k_hist.unsqueeze(2)
                     .expand(-1, -1, expand, -1)
@@ -539,7 +539,7 @@ def forward_layer(
 
     hidden = residual + store.matvec(layer_idx, "o_proj", attn_out)
 
-    # — Feed-forward —
+    # - Feed-forward -
     residual = hidden
     h = rms_norm(hidden, store.get_norm(layer_idx, "post_attention_layernorm"))
 
@@ -562,7 +562,7 @@ def generate(
     system_prompt: str = "You are a helpful AI assistant.",
 ) -> str:
     print("\n" + "=" * 66)
-    print("ASDSL × Phi-4 — CPU Inference")
+    print("ASDSL x Phi-4 - CPU Inference")
     print("=" * 66)
     print(f"Prompt : {prompt!r}")
     print("-" * 66)
@@ -579,14 +579,14 @@ def generate(
     )
 
     # Pre-compute RoPE tables (generous max length).
-    # Pass ROTARY_DIM (96) — only the rotated portion of each head needs tables.
+    # Pass ROTARY_DIM (96) - only the rotated portion of each head needs tables.
     max_seq = len(input_ids) + max_new_tokens + 64
     rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
 
     # Per-layer KV history (pre-allocated torch tensors)
     kv_hist = KVHistory(max_seq=max_seq)
 
-    # ASDSL tracker — updated once per generated token for block-sparse analytics
+    # ASDSL tracker - updated once per generated token for block-sparse analytics
     asdsl_tracker = ASDSLKVTracker()
 
     def run_forward(token_id: int, pos: int, need_logits: bool = True) -> torch.Tensor | None:
@@ -687,11 +687,11 @@ def chat(
     """Interactive multi-turn chat loop.
 
     The KV cache (kv_hist) and position counter are kept alive across turns,
-    so the model only processes NEW tokens each round — previous context is
+    so the model only processes NEW tokens each round - previous context is
     already materialised in the K/V tensors.
     """
     print("\n" + "=" * 66)
-    print("ASDSL × Phi-4 — Interactive Chat  (type 'quit' to exit)")
+    print("ASDSL x Phi-4 - Interactive Chat  (type 'quit' to exit)")
     print("=" * 66)
 
     # Persistent state across all turns
@@ -719,7 +719,7 @@ def chat(
 
     # Feed system prompt first
     system_tokens = tokenizer.encode(f"<|system|>\n{system_prompt}<|end|>\n")
-    print(f"Feeding system prompt ({len(system_tokens)} tokens) … ", end="", flush=True)
+    print(f"Feeding system prompt ({len(system_tokens)} tokens) ... ", end="", flush=True)
     with torch.inference_mode():
         for tid in system_tokens:
             run_forward(tid, need_logits=False)
@@ -798,7 +798,7 @@ def main() -> None:
                         help="CPU threads for BLAS/OMP (0=auto: all cores)")
     args = parser.parse_args()
 
-    # Thread control — use all cores by default for memory-bound inference
+    # Thread control - use all cores by default for memory-bound inference
     set_thread_count(args.threads)
 
     # Verify model is present
@@ -812,7 +812,7 @@ def main() -> None:
     print("=" * 66)
 
     # ── Tokenizer ──────────────────────────────────────────────────────────
-    print("Loading tokenizer …", flush=True)
+    print("Loading tokenizer ...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(
         "microsoft/Phi-4-multimodal-instruct",
         trust_remote_code=True,
@@ -821,9 +821,9 @@ def main() -> None:
 
     # ── Weights ────────────────────────────────────────────────────────────
     if args.bits == 16:
-        print(f"Loading weights as float16 (no quantization) …")
+        print(f"Loading weights as float16 (no quantization) ...")
     else:
-        print(f"\nLoading weights (ASDSL {args.bits}-bit quantization) …")
+        print(f"\nLoading weights (ASDSL {args.bits}-bit quantization) ...")
     t0 = time.perf_counter()
     store = WeightStore(bits=args.bits,
                         group_size=args.group_size if args.group_size > 0 else None)
@@ -836,7 +836,7 @@ def main() -> None:
               f"| Norms ready: {len(store.layer_norms)}/32")
     store.warm_cache()
     if args.bits == 16:
-        print(f"  Memory: f16 weight cache (~6.4 GB) + embed_f16 (~1.2 GB) ≈ 7.6 GB")
+        print(f"  Memory: f16 weight cache (~6.4 GB) + embed_f16 (~1.2 GB) ~= 7.6 GB")
     else:
         u8_mb = sum(t.nbytes for t in store._quant_u8.values()) / 1e6
         sc_mb = sum(t.nbytes for t in store._quant_sc.values()) / 1e6
@@ -844,7 +844,7 @@ def main() -> None:
         embed_mb = store.embed_f16.nbytes / 1e6
         total_mb = u8_mb + sc_mb + bi_mb + embed_mb
         print(f"  Memory: uint8 weights ({u8_mb:.0f} MB) + scales/biases ({sc_mb + bi_mb:.0f} MB)"
-              f" + embed_f16 ({embed_mb:.0f} MB) ≈ {total_mb / 1e3:.1f} GB")
+              f" + embed_f16 ({embed_mb:.0f} MB) ~= {total_mb / 1e3:.1f} GB")
 
     # ── Chat or single-turn generate ───────────────────────────────────────
     if args.chat:

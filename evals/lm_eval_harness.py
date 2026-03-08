@@ -89,13 +89,13 @@ def _run_forward_sequence(
 
     logits = None
     for pos, tid in enumerate(token_ids):
-        hidden = store.embed_f32[tid].unsqueeze(0)
+        hidden = store.embed_f16[tid].float().unsqueeze(0)
         for layer in range(NUM_LAYERS):
             hidden = forward_layer(
                 hidden, layer, store, kv_hist, rope_cos, rope_sin, pos=pos,
             )
         hidden = rms_norm(hidden, store.final_norm)
-        logits = (hidden @ store.lm_head.t()).squeeze(0)
+        logits = store.lm_head_matvec(hidden)
         if return_all_logits:
             all_logits.append(logits)
 
@@ -260,14 +260,14 @@ class ASDSLHarnessModel(LM):
             # Prefill
             logits = None
             for pos, tid in enumerate(ctx_ids):
-                hidden = self._store.embed_f32[tid].unsqueeze(0)
+                hidden = self._store.embed_f16[tid].float().unsqueeze(0)
                 for layer in range(NUM_LAYERS):
                     hidden = forward_layer(
                         hidden, layer, self._store, kv_hist,
                         rope_cos, rope_sin, pos=pos,
                     )
                 hidden = rms_norm(hidden, self._store.final_norm)
-                logits = (hidden @ self._store.lm_head.t()).squeeze(0)
+                logits = self._store.lm_head_matvec(hidden)
 
             # Decode
             generated = []
@@ -283,14 +283,14 @@ class ASDSLHarnessModel(LM):
                 if any(s in text_so_far for s in until):
                     break
 
-                hidden = self._store.embed_f32[next_token].unsqueeze(0)
+                hidden = self._store.embed_f16[next_token].float().unsqueeze(0)
                 for layer in range(NUM_LAYERS):
                     hidden = forward_layer(
                         hidden, layer, self._store, kv_hist,
                         rope_cos, rope_sin, pos=pos,
                     )
                 hidden = rms_norm(hidden, self._store.final_norm)
-                logits = (hidden @ self._store.lm_head.t()).squeeze(0)
+                logits = self._store.lm_head_matvec(hidden)
                 pos += 1
 
             gen_text = self.tok_decode(generated)

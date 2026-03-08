@@ -131,14 +131,14 @@ def compute_perplexity(
         # Run forward pass for each token in the window
         logits = None
         for i, tid in enumerate(window[:-1]):
-            hidden = store.embed_f32[tid].unsqueeze(0)
+            hidden = store.embed_f16[tid].float().unsqueeze(0)
             for layer in range(NUM_LAYERS):
                 hidden = forward_layer(
                     hidden, layer, store, kv_hist, rope_cos, rope_sin, pos=i,
                 )
             # LM head (final norm + projection)
             hidden = rms_norm(hidden, store.final_norm)
-            logits = (hidden @ store.lm_head.t()).squeeze(0)  # (vocab,)
+            logits = store.lm_head_matvec(hidden)
 
             # Compute cross-entropy loss for the NEXT token
             target = window[i + 1]
@@ -188,27 +188,27 @@ def main():
     args = parser.parse_args()
 
     print("=" * 66)
-    print(f"  ASDSL Perplexity Evaluation — bits={args.bits}")
+    print(f"  ASDSL Perplexity Evaluation - bits={args.bits}")
     print("=" * 66)
 
     # Load tokenizer
-    print("Loading tokenizer …")
+    print("Loading tokenizer ...")
     tokenizer = AutoTokenizer.from_pretrained(
         "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True
     )
 
     # Load WikiText
-    print("Loading WikiText-2 …")
+    print("Loading WikiText-2 ...")
     tokens = load_wikitext2(tokenizer, max_tokens=args.max_tokens)
 
     # Load model
-    print(f"Loading model (bits={args.bits}) …")
+    print(f"Loading model (bits={args.bits}) ...")
     store = WeightStore(bits=args.bits)
     store.load()
     store.warm_cache()
 
     # Evaluate
-    print("\nComputing perplexity …")
+    print("\nComputing perplexity ...")
     results = compute_perplexity(tokens, store, stride=args.stride)
 
     # Report

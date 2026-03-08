@@ -111,12 +111,12 @@ def evaluate_perplexity(tokens, store, stride=512):
 
         kv_hist = KVHistory()
         for i, tid in enumerate(window[:-1]):
-            hidden = store.embed_f32[tid].unsqueeze(0)
+            hidden = store.embed_f16[tid].float().unsqueeze(0)
             for layer in range(NUM_LAYERS):
                 hidden = forward_layer(hidden, layer, store, kv_hist,
                                        rope_cos, rope_sin, pos=i)
             hidden = rms_norm(hidden, store.final_norm)
-            logits = (hidden @ store.lm_head.t()).squeeze(0)
+            logits = store.lm_head_matvec(hidden)
 
             target = window[i + 1]
             log_probs = torch.log_softmax(logits.float(), dim=-1)
@@ -172,7 +172,7 @@ def generate_charts(all_results, output_dir):
         import matplotlib.pyplot as plt
         from matplotlib.gridspec import GridSpec
     except ImportError:
-        print("  matplotlib not available — skipping chart generation")
+        print("  matplotlib not available - skipping chart generation")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -185,7 +185,7 @@ def generate_charts(all_results, output_dir):
     bar_colors = [colors.get(b, "#607D8B") for b in bits_vals]
 
     fig = plt.figure(figsize=(20, 14))
-    fig.suptitle("ASDSL Framework — Comprehensive Benchmark Results",
+    fig.suptitle("ASDSL Framework - Comprehensive Benchmark Results",
                  fontsize=18, fontweight="bold", y=0.98)
     gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.3)
 
@@ -246,7 +246,7 @@ def generate_charts(all_results, output_dir):
     ax5.set_ylabel("SNR (dB, higher = better)", fontsize=11)
     ax5.set_title("Quantization Quality (SNR)", fontsize=13, fontweight="bold")
     for bar, val in zip(bars, snrs):
-        label = "∞" if val > 100 else f"{val:.1f}"
+        label = "inf" if val > 100 else f"{val:.1f}"
         ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
                  label, ha="center", va="bottom", fontsize=10, fontweight="bold")
     ax5.grid(axis="y", alpha=0.3)
@@ -377,7 +377,7 @@ def run_benchmark(bits: int, tokenizer, wikitext_tokens, max_tokens: int,
     store.warm_cache()
     t_load = time.perf_counter() - t0
     ram_after_cache = get_ram_mb()
-    print(f"  Load time: {t_load:.1f}s | RAM: {ram_after_load:.0f} → {ram_after_cache:.0f} MB")
+    print(f"  Load time: {t_load:.1f}s | RAM: {ram_after_load:.0f} -> {ram_after_cache:.0f} MB")
 
     result = {
         "bits": bits,
@@ -419,12 +419,12 @@ def run_benchmark(bits: int, tokenizer, wikitext_tokens, max_tokens: int,
         t0 = time.perf_counter()
         for pos in range(5):
             tid = wikitext_tokens[pos] if pos < len(wikitext_tokens) else 0
-            hidden = store.embed_f32[tid].unsqueeze(0)
+            hidden = store.embed_f16[tid].float().unsqueeze(0)
             for layer in range(NUM_LAYERS):
                 hidden = forward_layer(hidden, layer, store, kv_hist,
                                        rope_cos, rope_sin, pos=pos)
             hidden = rms_norm(hidden, store.final_norm)
-            _ = (hidden @ store.lm_head.t()).squeeze(0)
+            _ = store.lm_head_matvec(hidden)
         t5 = time.perf_counter() - t0
         tps = 5 / t5
 
@@ -461,7 +461,7 @@ def main():
     bits_list = args.bits or [16, 8, 4, 3]
 
     print("=" * 66)
-    print("  ASDSL Framework — Comprehensive Benchmark Suite")
+    print("  ASDSL Framework - Comprehensive Benchmark Suite")
     print("=" * 66)
     print(f"  CPU: {psutil.cpu_count(logical=False)} cores / {psutil.cpu_count()} threads")
     print(f"  RAM: {psutil.virtual_memory().total / (1024**3):.1f} GB total")
@@ -482,7 +482,7 @@ def main():
     print("\nMeasuring SNR across bit-widths ...")
     snr_results = measure_snr_on_model_weight(bits_list)
     for b, s in sorted(snr_results.items()):
-        snr_str = "∞" if s["snr_db"] > 100 else f"{s['snr_db']:.2f}"
+        snr_str = "inf" if s["snr_db"] > 100 else f"{s['snr_db']:.2f}"
         print(f"  {b:2d}-bit: SNR={snr_str:>6s} dB  comp={s['compression_ratio']:.1f}x")
 
     # Run benchmarks
@@ -505,7 +505,7 @@ def main():
     for r in all_results:
         label = "FP16" if r["bits"] == 16 else f"{r['bits']}-bit"
         ppl_str = f"{r.get('ppl', 0):.2f}" if r.get("ppl", 0) > 0 else "skip"
-        snr_str = "∞" if r.get("snr_db", 0) > 100 else f"{r.get('snr_db', 0):.1f}"
+        snr_str = "inf" if r.get("snr_db", 0) > 100 else f"{r.get('snr_db', 0):.1f}"
         print(f"  {label:<12} {ppl_str:>8} {r.get('tok_per_sec', 0):>8.2f} "
               f"{r.get('ram_peak_mb', 0)/1024:>8.1f} {r.get('active_cores', 0):>6} "
               f"{snr_str:>8} {r.get('compression_ratio', 1):>5.1f}x "
@@ -523,7 +523,7 @@ def main():
     print("\nGenerating visualizations ...")
     generate_charts(all_results, OUTPUT_DIR)
 
-    print("\n✓ Benchmark complete!")
+    print("\n* Benchmark complete!")
 
 
 if __name__ == "__main__":
