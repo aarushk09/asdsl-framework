@@ -52,12 +52,23 @@ integrated subsystems:
 
 ### Inference Quality (WikiText-2 Perplexity)
 
-| Configuration | Perplexity ↓ | vs FP16 | Speed | Compression | Active Cores |
-|---------------|:------------:|:-------:|:-----:|:-----------:|:------------:|
-| **FP16 baseline** | 15.78 | 100% | 0.91 tok/s | 1.0× | 2 |
-| **ASDSL 8-bit** | 15.77 | 100.1% ✅ lossless | 0.98 tok/s | 3.9× | 3 |
-| **ASDSL 4-bit** | 19.16 | 82.4% ✅ correct | 0.98 tok/s | 6.4× | 2 |
-| **ASDSL 3-bit** | 24.70 | 63.9% ✅ coherent | 1.02 tok/s | 6.2× | 3 |
+| Configuration | Perplexity ↓ | vs FP16 | Speed | RAM | Compression | Active Cores |
+|---------------|:------------:|:-------:|:-----:|:---:|:-----------:|:------------:|
+| **FP16 baseline** | 15.78 | 100% | 2.19 tok/s | ~7.6 GB | 1.0× | all |
+| **ASDSL 4-bit** | 19.16 | 82.4% ✅ correct | 0.74 tok/s | **~4.9 GB** | 6.4× | all |
+| **ASDSL 3-bit** | 24.70 | 63.9% ✅ coherent | ~0.74 tok/s | **~4.9 GB** | 6.2× | all |
+
+> **47% less RAM** for quantized models (9.2 GB → 4.9 GB) while being **21% faster** (0.61 → 0.74 tok/s).  
+> FP16 path: **3.6× faster** (0.61 → 2.19 tok/s) at 7.6 GB.
+
+### Memory Footprint by Bit-Width
+
+| Component | FP16 (no quant) | 4-bit ASDSL | 3-bit ASDSL |
+|-----------|:---------------:|:-----------:|:-----------:|
+| Weights | 6.4 GB (f16) | 3.2 GB (uint8) | 3.2 GB (uint8) |
+| Scales + biases | — | 0.4 GB (f16) | 0.4 GB (f16) |
+| Embedding (f16) | 1.2 GB | 1.2 GB | 1.2 GB |
+| **Total** | **~7.6 GB** | **~4.9 GB** | **~4.9 GB** |
 
 ### Before vs. After Quantization Optimization
 
@@ -82,9 +93,25 @@ $ python experiments/phi4_cpu_run.py --bits 3 --prompt "The capital of France is
 
 ### CPU Core Efficiency
 
-| Configuration | Before thread optimization | After `set_thread_count(4)` |
-|---------------|:--------------------------:|:---------------------------:|
-| All bit-widths | 13–15 active cores | **2–3 active cores** |
+| Configuration | Original baseline | Current |
+|---------------|:--------------------:|:-------------------:|
+| FP16 (no quant) | 0.61 tok/s / ~9.2 GB | **2.19 tok/s** / ~7.6 GB |
+| 4-bit ASDSL | 0.61 tok/s / ~9.2 GB | **0.74 tok/s** / ~4.9 GB |
+
+### Inference Engine Optimizations
+
+| Optimization | Impact |
+|-------------|--------|
+| **Dual-path matvec** | bits=16: chunked f16→f32 reads. bits≤8: chunked uint8 dequant+mv with in-place scale/bias (no f16 cache). |
+| **In-place dequant (mul_/add_)** | Eliminates 2 intermediate tensor allocations per chunk, keeping data in L3 cache. |
+| **Pre-unpacked uint8 weights** | Unpacks 4-bit packed data to 1-byte-per-value at load time for fast streaming reads. |
+| **Pre-computed bias** | Stores `bias = -zero * scale` per group; fuses `val * scale + bias` instead of `(val - zero) * scale`. |
+| **Float16 embedding & LM head** | Stores embedding/LM-head as f16 instead of f32, saving 1.2 GB RAM and halving LM-head bandwidth. |
+| **Pre-allocated flat pool** | Single 8 MB f32 buffer, reshaped per-operation. Eliminates per-projection allocation overhead. |
+| **Pre-allocated KV cache** | Contiguous torch tensors per layer. Zero-copy views replace per-token `np.stack`. |
+| **SDPA attention** | `torch.nn.functional.scaled_dot_product_attention` replaces manual Q·K·V loops. |
+| **Auto thread count** | Uses all available CPU cores by default instead of hard-coded 4. |
+| **`torch.inference_mode()`** | Disables autograd bookkeeping during decode and prefill. |
 
 ---
 

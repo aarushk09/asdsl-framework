@@ -260,6 +260,82 @@ def dequantize_weights(qtensor: QuantizedTensor) -> np.ndarray:
     return dequantized.reshape(-1)[:numel].reshape(qtensor.shape)
 
 
+def dequantize_rows(
+    qtensor: QuantizedTensor,
+    row_start: int,
+    row_end: int,
+) -> np.ndarray:
+    """Dequantize a contiguous range of rows for streaming GEMV.
+
+    Instead of materializing the full float32 weight matrix (~200 MB per
+    projection), this unpacks and converts only the requested row chunk.
+    Keeping the working set small enough to fit in CPU cache avoids
+    redundant DRAM traffic during matrix-vector products.
+
+    Args:
+        qtensor: Packed quantized tensor with shape (rows, cols).
+        row_start: First row index (inclusive).
+        row_end: Last row index (exclusive).
+
+    Returns:
+        Float32 array of shape (row_end - row_start, cols).
+    """
+    bits = qtensor.bits
+    group_size = qtensor.group_size
+    rows, cols = qtensor.shape
+    row_end = min(row_end, rows)
+    chunk_rows = row_end - row_start
+
+    elem_start = row_start * cols
+    elem_end = row_end * cols
+    num_elements = elem_end - elem_start
+
+    # Extract and unpack only the packed bytes covering these rows
+    if bits == 8:
+        unpacked = qtensor.data[elem_start:elem_end]
+    elif bits == 4:
+        byte_start = elem_start // 2
+        byte_end = (elem_end + 1) // 2
+        packed_chunk = qtensor.data[byte_start:byte_end]
+        unpacked = _unpack_bits(packed_chunk, 4)[:num_elements]
+    elif bits == 2:
+        byte_start = elem_start // 4
+        byte_end = (elem_end + 3) // 4
+        packed_chunk = qtensor.data[byte_start:byte_end]
+        unpacked = _unpack_bits(packed_chunk, 2)[:num_elements]
+    elif bits == 3:
+        # 10-in-32 packing: every 10 values occupy 4 bytes
+        group10_start = elem_start // 10
+        group10_end = (elem_end + 9) // 10
+        byte_start = group10_start * 4
+        byte_end = group10_end * 4
+        packed_chunk = qtensor.data[byte_start:byte_end]
+        all_unpacked = _unpack_bits(packed_chunk, 3)
+        offset = elem_start - group10_start * 10
+        unpacked = all_unpacked[offset:offset + num_elements]
+    else:
+        raise ValueError(f"Unsupported bit-width: {bits}")
+
+    # Reshape into quantization groups and apply scale/zero
+    grouped = unpacked[:num_elements].reshape(-1, group_size).astype(np.float32)
+
+    groups_per_row = cols // group_size
+    scale_start = row_start * groups_per_row
+    scale_end = row_end * groups_per_row
+    scales = qtensor.scales[scale_start:scale_end].reshape(-1, 1).astype(np.float32)
+
+    qmax = (1 << bits) - 1
+
+    if qtensor.is_symmetric:
+        half_range = qmax / 2
+        dequantized = (grouped - half_range) * scales
+    else:
+        zeros = qtensor.zeros[scale_start:scale_end].reshape(-1, 1).astype(np.float32)
+        dequantized = (grouped - zeros) * scales
+
+    return dequantized.reshape(chunk_rows, cols)
+
+
 def _pack_bits(data: np.ndarray, bits: int) -> np.ndarray:
     """Pack quantized integers into a compact uint8 array.
 
