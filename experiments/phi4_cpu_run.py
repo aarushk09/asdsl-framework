@@ -40,6 +40,15 @@ import torch
 from safetensors import safe_open
 from transformers import AutoTokenizer
 
+
+def set_thread_count(n: int) -> None:
+    """Limit CPU threads for NumPy/BLAS/PyTorch to *n* cores."""
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = str(n)
+    torch.set_num_threads(n)
+
+
 ROOT = Path(__file__).parent.parent
 MODEL_DIR = ROOT / "models" / "phi4-multimodal-instruct"
 INDEX_FILE = MODEL_DIR / "model.safetensors.index.json"
@@ -129,12 +138,23 @@ class WeightStore:
       - Embedding kept as bfloat16 torch tensor (~1.2 GB)
     """
 
-    def __init__(self, bits: int = 4, group_size: int = 128):
+    def __init__(self, bits: int = 4, group_size: int | None = None):
         from asdsl.quantization.core import quantize_weights, dequantize_weights
         self._quantize = quantize_weights
         self._dequantize = dequantize_weights
         self.bits = bits
-        self.group_size = group_size
+        # Smart defaults: smaller groups + asymmetric + MSE-optimal clipping for low bits
+        if group_size is None:
+            if bits <= 3:
+                self.group_size = 16  # Very small groups needed for 3-bit fidelity
+            elif bits <= 4:
+                self.group_size = 32  # Optimal balance for 4-bit
+            else:
+                self.group_size = 128
+        else:
+            self.group_size = group_size
+        self._symmetric = bits > 4
+        self._optimize_clips = bits <= 4
 
         self.layers: dict[int, dict[str, object]] = {}   # layer_idx → {name: QuantizedTensor}
         self.layer_norms: dict[int, dict[str, torch.Tensor]] = {}  # layer_idx → {name: tensor}
@@ -217,7 +237,10 @@ class WeightStore:
                     else:
                         # ASDSL N-bit quantization
                         w_f32 = tensor.to(torch.float32).numpy()
-                        qt = self._quantize(w_f32, bits=self.bits, group_size=self.group_size)
+                        qt = self._quantize(w_f32, bits=self.bits,
+                                            group_size=self.group_size,
+                                            symmetric=self._symmetric,
+                                            optimize_clips=self._optimize_clips)
                         self.layers.setdefault(layer_idx, {})[friendly] = qt
 
                     done += 1
@@ -681,8 +704,14 @@ def main() -> None:
     parser.add_argument("--bits", type=int, default=16, choices=[2, 3, 4, 8, 16],
                         help="Weight precision: 16=float16 (best quality, default), "
                              "8/4/3/2=ASDSL N-bit quantization (demo, lower quality)")
-    parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--group-size", type=int, default=0,
+                        help="Quantization group size (0=auto: 32 for ≤4-bit, 128 for 8-bit)")
+    parser.add_argument("--threads", type=int, default=4,
+                        help="CPU threads for BLAS/OMP (default: 4 for efficiency)")
     args = parser.parse_args()
+
+    # Thread control — fewer cores = less power, often same throughput for memory-bound ops
+    set_thread_count(args.threads)
 
     # Verify model is present
     if not INDEX_FILE.exists():
@@ -708,7 +737,8 @@ def main() -> None:
     else:
         print(f"\nLoading weights (ASDSL {args.bits}-bit quantization) …")
     t0 = time.perf_counter()
-    store = WeightStore(bits=args.bits, group_size=args.group_size)
+    store = WeightStore(bits=args.bits,
+                        group_size=args.group_size if args.group_size > 0 else None)
     store.load()
     t_load = time.perf_counter() - t0
     verb = "Load" if args.bits == 16 else "Load + quantize"

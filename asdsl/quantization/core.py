@@ -87,11 +87,75 @@ def compute_scale_zero(
         return scales.astype(np.float16), zeros.astype(np.float16)
 
 
+def _find_optimal_scales(
+    grouped: np.ndarray,
+    bits: int,
+    symmetric: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Find per-group scales that minimize reconstruction MSE via grid search.
+
+    Tests several clipping ratios and picks the best per group.
+    Fully vectorized across groups — loops only over the small ratio grid.
+    MSE is evaluated at float16 precision (matching storage) so the chosen
+    ratio is truly optimal after quantization parameter rounding.
+    """
+    qmin = 0
+    qmax = (1 << bits) - 1
+    n_groups = grouped.shape[0]
+
+    ratios = np.array([0.85, 0.90, 0.93, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0],
+                      dtype=np.float32)
+    best_mse = np.full(n_groups, np.inf, dtype=np.float32)
+    best_scales = np.ones((n_groups, 1), dtype=np.float32) * 1e-10
+    best_zeros = None if symmetric else np.zeros((n_groups, 1), dtype=np.float32)
+
+    if symmetric:
+        abs_max = np.maximum(np.abs(grouped).max(axis=1, keepdims=True), 1e-10)
+        half_range = (qmax - qmin) / 2.0
+        for r in ratios:
+            clip_val = abs_max * r
+            # Round scale to float16 to match actual storage precision
+            scale = np.maximum(clip_val / half_range, 1e-10)
+            scale_f16 = scale.astype(np.float16).astype(np.float32)
+            quantized = np.clip(np.round(grouped / scale_f16 + half_range), qmin, qmax)
+            dequantized = (quantized - half_range) * scale_f16
+            mse = np.mean((grouped - dequantized) ** 2, axis=1)
+            improved = mse < best_mse
+            best_mse = np.where(improved, mse, best_mse)
+            best_scales = np.where(improved[:, None], scale, best_scales)
+    else:
+        w_min = grouped.min(axis=1, keepdims=True)
+        w_max = grouped.max(axis=1, keepdims=True)
+        w_range = np.maximum(w_max - w_min, 1e-10)
+        for r in ratios:
+            margin = w_range * (1.0 - r) / 2.0
+            clip_min = w_min + margin
+            clip_max = w_max - margin
+            clip_range = np.maximum(clip_max - clip_min, 1e-10)
+            scale = clip_range / qmax
+            zero = np.clip(-clip_min / np.maximum(scale, 1e-10), 0, qmax)
+            # Evaluate MSE at float16 precision (matching storage)
+            scale_f16 = scale.astype(np.float16).astype(np.float32)
+            zero_f16 = zero.astype(np.float16).astype(np.float32)
+            quantized = np.clip(np.round(grouped / scale_f16 + zero_f16), qmin, qmax)
+            dequantized = (quantized - zero_f16) * scale_f16
+            mse = np.mean((grouped - dequantized) ** 2, axis=1)
+            improved = mse < best_mse
+            best_mse = np.where(improved, mse, best_mse)
+            best_scales = np.where(improved[:, None], scale, best_scales)
+            best_zeros = np.where(improved[:, None], zero, best_zeros)
+
+    if best_zeros is not None:
+        return best_scales.astype(np.float16), best_zeros.astype(np.float16)
+    return best_scales.astype(np.float16), None
+
+
 def quantize_weights(
     weights: torch.Tensor | np.ndarray,
     bits: int = 4,
     group_size: int = 128,
     symmetric: bool = True,
+    optimize_clips: bool = False,
 ) -> QuantizedTensor:
     """Quantize a weight tensor to the specified bit-width with group-wise granularity.
 
@@ -100,6 +164,7 @@ def quantize_weights(
         bits: Target quantization bit-width (2, 3, 4, or 8).
         group_size: Number of contiguous elements sharing scale/zero-point.
         symmetric: Whether to use symmetric quantization.
+        optimize_clips: If True, search for MSE-optimal clipping ratio per group.
 
     Returns:
         A QuantizedTensor containing packed data, scales, and metadata.
@@ -122,7 +187,10 @@ def quantize_weights(
     grouped = flat.reshape(num_groups, group_size)
 
     # Compute scales and zeros
-    scales, zeros = compute_scale_zero(grouped, bits, symmetric)
+    if optimize_clips:
+        scales, zeros = _find_optimal_scales(grouped, bits, symmetric)
+    else:
+        scales, zeros = compute_scale_zero(grouped, bits, symmetric)
 
     # Quantize
     qmin = 0
@@ -223,21 +291,16 @@ def _pack_bits(data: np.ndarray, bits: int) -> np.ndarray:
         return (b0 | b1 | b2 | b3).astype(np.uint8)
 
     if bits == 3:
-        # Pack 8 values into 3 bytes (24 bits)
-        pad_needed = (8 - len(data) % 8) % 8
+        # 10-in-32 packing: 10 × 3-bit values → one uint32 (30/32 bits used).
+        # 2 MSBs are wasted for alignment, giving fast 32-bit aligned reads.
+        pad_needed = (10 - len(data) % 10) % 10
         if pad_needed:
             data = np.concatenate([data, np.zeros(pad_needed, dtype=np.uint8)])
-        packed = []
-        for i in range(0, len(data), 8):
-            chunk = data[i : i + 8].astype(np.uint32)
-            # Pack 8x3-bit values into 3 bytes
-            val = 0
-            for j in range(8):
-                val |= int(chunk[j] & 0x07) << (j * 3)
-            packed.append(val & 0xFF)
-            packed.append((val >> 8) & 0xFF)
-            packed.append((val >> 16) & 0xFF)
-        return np.array(packed, dtype=np.uint8)
+        data = data.astype(np.uint32).reshape(-1, 10)
+        packed = np.zeros(data.shape[0], dtype=np.uint32)
+        for j in range(10):
+            packed |= (data[:, j] & 0x07) << (j * 3)
+        return packed.view(np.uint8)
 
     raise ValueError(f"Unsupported bit-width: {bits}")
 
@@ -260,14 +323,12 @@ def _unpack_bits(packed: np.ndarray, bits: int) -> np.ndarray:
         return np.stack([b0, b1, b2, b3], axis=-1).reshape(-1).astype(np.uint8)
 
     if bits == 3:
-        result = []
-        for i in range(0, len(packed), 3):
-            if i + 2 >= len(packed):
-                break
-            val = int(packed[i]) | (int(packed[i + 1]) << 8) | (int(packed[i + 2]) << 16)
-            for j in range(8):
-                result.append((val >> (j * 3)) & 0x07)
-        return np.array(result, dtype=np.uint8)
+        # 10-in-32 unpacking: every 4 bytes → one uint32 → 10 × 3-bit values.
+        words = packed.view(np.uint32)
+        out = np.empty((len(words), 10), dtype=np.uint8)
+        for j in range(10):
+            out[:, j] = ((words >> (j * 3)) & 0x07).astype(np.uint8)
+        return out.reshape(-1)
 
     raise ValueError(f"Unsupported bit-width: {bits}")
 
