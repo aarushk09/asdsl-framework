@@ -125,7 +125,7 @@ $ python experiments/phi4_cpu_run.py --bits 3 --prompt "The capital of France is
 │   Input Weights (FP32/FP16)                               │
 │        │                                                  │
 │        ▼                                                  │
-│   ┌─────────────────────────────────────────────────┐    │
+│   ┌─────────────────────────────────────────────────┐     │
 │   │             Quantization Pipeline                │    │
 │   │  1. Salience scoring (Hessian diagonal)          │    │
 │   │  2. Bit allocation per group (higher salience    │    │
@@ -133,30 +133,30 @@ $ python experiments/phi4_cpu_run.py --bits 3 --prompt "The capital of France is
 │   │  3. MSE-optimal clipping (grid search, 9 ratios) │    │
 │   │  4. Asymmetric quant ≤4-bit / symmetric >4-bit   │    │
 │   │  5. Fine-grained groups (gs=16/32/128)           │    │
-│   └───────────────────────┬─────────────────────────┘    │
+│   └───────────────────────┬─────────────────────────┘     │
 │                           │                               │
-│        ┌──────────────────┼──────────────────┐           │
-│        ▼                  ▼                  ▼           │
-│   ┌─────────┐       ┌──────────┐      ┌───────────┐     │
-│   │  Weight │       │  LUT     │      │  Async    │     │
-│   │  Store  │──────▶│  Engine  │      │  Prefetch │     │
-│   │ (N-bit) │       │ (SIMD)   │      │  Thread   │     │
-│   └─────────┘       └────┬─────┘      └─────┬─────┘     │
-│                          │                  │            │
-│                          ▼                  ▼            │
-│                   ┌──────────────────────────────┐       │
-│                   │     Inference Engine          │       │
-│                   │  RMSNorm → Attn → MLP loop    │       │
-│                   │  BlockSparseKVCache tracking  │       │
-│                   └───────────────┬──────────────┘       │
+│        ┌──────────────────┼──────────────────┐            │
+│        ▼                  ▼                  ▼            │
+│   ┌─────────┐       ┌──────────┐      ┌───────────┐       │
+│   │  Weight │       │  LUT     │      │  Async    │       │
+│   │  Store  │─────▶│  Engine  │      │  Prefetch │       │
+│   │ (N-bit) │       │ (SIMD)   │      │  Thread   │       │
+│   └─────────┘       └────┬─────┘      └─────┬─────┘       │
+│                          │                  │             │
+│                          ▼                  ▼             │
+│                   ┌──────────────────────────────┐        │
+│                   │     Inference Engine         │        │
+│                   │  RMSNorm → Attn → MLP loop   │        │
+│                   │  BlockSparseKVCache tracking │        │
+│                   └───────────────┬──────────────┘        │
 │                                   │                       │
-│                          ┌────────┴────────┐             │
-│                          ▼                 ▼             │
-│                   ┌────────────┐  ┌─────────────────┐   │
-│                   │  SWIFT     │  │  OS Memory Mgr  │   │
-│                   │  Specul.   │  │  mlock + Huge   │   │
-│                   │  Decoder   │  │  Pages + NUMA   │   │
-│                   └────────────┘  └─────────────────┘   │
+│                          ┌────────┴────────┐              │
+│                          ▼                 ▼              │
+│                   ┌────────────┐  ┌─────────────────┐      │
+│                   │  SWIFT     │  │  OS Memory Mgr  │      │
+│                   │  Specul.   │  │  mlock + Huge   │      │
+│                   │  Decoder   │  │  Pages + NUMA   │      │
+│                   └────────────┘  └─────────────────┘      │
 └──────────────────────────────────────────────────────────┘
 ```
 
