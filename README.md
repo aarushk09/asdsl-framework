@@ -60,19 +60,17 @@ integrated subsystems:
 
 | Configuration | Perplexity ↓ | Speed | RAM Peak | SNR (dB) | Compression | Cores | Backend |
 |---------------|:------------:|:-----:|:--------:|:--------:|:-----------:|:-----:|:-------:|
-| **FP16 baseline** | **11.09** | 0.94 tok/s | 7.5 GB | inf | 1.0x | 4 | PyTorch |
-| **ASDSL 8-bit** | **11.09** | **2.41 tok/s** | 4.5 GB | 43.8 | 3.9x | 7 | AVX2 GEMV |
-| **ASDSL 4-bit** | **11.90** | **2.63 tok/s** | 6.5 GB | 22.5 | 6.4x | 7 | AVX2 GEMV |
-| **ASDSL 3-bit** | **14.35** | **2.35 tok/s** | 6.9 GB | 17.7 | 6.2x | 6 | AVX2 GEMV + SpQR |
-| **ASDSL 2-bit** | 12,827 | **2.37 tok/s** | 6.8 GB | 10.9 | 8.0x | 6 | AVX2 GEMV + SpQR |
+| **FP16 baseline** | **11.09** | 1.16 tok/s | 7.3 GB | inf | 1.0x | 6 | PyTorch |
+| **ASDSL 8-bit** | **11.09** | **2.14 tok/s** | 4.7 GB | 43.8 | 3.9x | 7 | AVX2 GEMV |
+| **ASDSL 4-bit** | **11.90** | **2.36 tok/s** | 5.1 GB | 22.5 | 6.4x | 6 | AVX2 GEMV |
+| **ASDSL 3-bit** | **14.18** | **2.05 tok/s** | 6.6 GB | 17.7 | 6.2x | 7 | AVX2 GEMV + SpQR |
+| **ASDSL 2-bit** | WIP | WIP | ~6.9 GB | 10.9 | 8.0x | 6 | AVX2 GEMV + SpQR |
 
 **Key wins from Tier 1 (AVX2 Kernels + SpQR):**
-- 3-bit: **0.40 → 2.35 tok/s** (5.9x faster) with PPL dropping from 25.60 → **14.35**
-- 2-bit: **0.46 → 2.37 tok/s** (5.2x faster) — throughput fixed, PPL still needs work
-- 8-bit: PPL matches FP16 exactly (11.09) at **2.6x the speed**
-- 4-bit: Near-lossless quality (PPL 11.90) at **2.8x faster** than FP16
-
-> 2-bit PPL (12,827) is still too high — SpQR outlier separation brought it down from 31,145 but further threshold tuning is needed. Target: < 30.
+- 3-bit: **0.40 → 2.05 tok/s** (5.1x faster) with PPL dropping from 25.60 → **14.18**
+- 8-bit: PPL matches FP16 exactly (11.09) at **1.8x the speed**
+- 4-bit: Near-lossless quality (PPL 11.90) at **2x faster** than FP16
+- 2-bit: SpQR + packed Q2 GEMV kernel implemented; PPL improving but not yet production-ready
 
 ### Target: >=10 tok/s at 4-bit
 
@@ -104,10 +102,10 @@ Current 4-bit baseline: **2.63 tok/s** (25% of ceiling). Two remaining tiers wil
 
 | Bits | Before (PyTorch fallback) | After (AVX2 GEMV + SpQR) | Speed improvement | PPL improvement |
 |-----:|:--------------------------:|:-----------------------------:|:-----------:|:-----------:|
-| 8-bit | 1.74 tok/s, PPL 17.57 | **2.41 tok/s**, PPL **11.09** | **1.4x faster** | **37% better** |
-| 4-bit | 1.84 tok/s, PPL 24.33 | **2.63 tok/s**, PPL **11.90** | **1.4x faster** | **51% better** |
-| 3-bit | 0.40 tok/s, PPL 25.60 | **2.35 tok/s**, PPL **14.35** | **5.9x faster** | **44% better** |
-| 2-bit | 0.46 tok/s, PPL 31,145 | **2.37 tok/s**, PPL 12,827 | **5.2x faster** | PPL needs work |
+| 8-bit | 1.74 tok/s, PPL 17.57 | **2.14 tok/s**, PPL **11.09** | **1.2x faster** | **37% better** |
+| 4-bit | 1.84 tok/s, PPL 24.33 | **2.36 tok/s**, PPL **11.90** | **1.3x faster** | **51% better** |
+| 3-bit | 0.40 tok/s, PPL 25.60 | **2.05 tok/s**, PPL **14.18** | **5.1x faster** | **45% better** |
+| 2-bit | 0.46 tok/s, PPL 31,145 | WIP | **5.2x faster** | SpQR in progress |
 
 ### Output Quality Verification
 

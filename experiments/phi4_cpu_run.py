@@ -276,10 +276,10 @@ class WeightStore:
                         w_f32 = tensor.to(torch.float32).numpy()
                         if self.bits <= 3:
                             from asdsl.quantization.core import quantize_weights_with_outliers
-                            # 2-bit needs aggressive outlier removal (2.5σ) to avoid
-                            # scale blow-up; 3-bit can use a milder threshold (3.5σ)
-                            sigma = 2.5 if self.bits == 2 else 3.5
-                            cap = 0.01 if self.bits == 2 else 0.005
+                            # 2-bit: 3.0σ with 0.5% cap balances PPL improvement vs
+                            # outlier correction overhead; 3-bit uses milder 3.5σ
+                            sigma = 3.0 if self.bits == 2 else 3.5
+                            cap = 0.005
                             qt, ov, oc = quantize_weights_with_outliers(
                                 w_f32, bits=self.bits,
                                 group_size=self.group_size,
@@ -300,8 +300,8 @@ class WeightStore:
                         # QCSD: also quantize to draft_bits for the draft bank
                         if self._enable_qcsd and self.bits > self._draft_bits:
                             from asdsl.quantization.core import quantize_weights_with_outliers
-                            d_sigma = 2.5 if self._draft_bits == 2 else 3.5
-                            d_cap = 0.01 if self._draft_bits == 2 else 0.005
+                            d_sigma = 3.0 if self._draft_bits == 2 else 3.5
+                            d_cap = 0.005
                             qt_d, ov_d, oc_d = quantize_weights_with_outliers(
                                 w_f32, bits=self._draft_bits,
                                 group_size=self._draft_group_size,
