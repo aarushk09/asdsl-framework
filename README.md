@@ -2,11 +2,12 @@
 
 **Asynchronous Salience-Driven Speculative Lookup Framework**
 
-A high-performance CPU inference architecture for large language models that runs
-Phi-4 (14B parameters) at **near-FP16 output quality** on **CPU-only** hardware — targeting
-**>=10 tok/s on Intel Core i7 Evo** with 4-bit quantization via three tiered optimizations:
-AVX2 SIMD kernels (2/3/4/8-bit), Quantization Cascade Speculative Decoding (QCSD),
-and Activation-Sparse GEMV.
+A CPU-focused Phi-4 inference and quantization project centered on
+weight compression, native AVX2 GEMV kernels, and benchmarking on
+Intel i7 Evo hardware. The current measured state is a strong Tier 1
+result set for 8-bit, 4-bit, and 3-bit inference; Tier 2 (`QCSD`) and
+Tier 3 (activation-sparse GEMV) exist as experimental paths and are
+not yet reflected in the stable benchmark table below.
 
 [![Tests](https://img.shields.io/badge/tests-95%2F95%20passing-brightgreen)](#testing)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
@@ -35,16 +36,18 @@ and Activation-Sparse GEMV.
 
 ## What ASDSL Does
 
-ASDSL addresses the true bottleneck of CPU inference — **memory bandwidth** — through eight
-integrated subsystems:
+ASDSL is a collection of quantization, inference, and benchmarking components
+for CPU-side Phi-4 experiments. The repository currently contains a mix of
+stable measured paths and experimental work-in-progress paths:
 
 | Subsystem | What it does |
 |-----------|-------------|
 | **MSE-Optimal Quantization** | Grid-searches per-group clipping ratios to minimize reconstruction error at float16 storage precision. No calibration data required. |
-| **SpQR Outlier Separation** | Detects and stores weight outliers (>3.5σ) in FP16 sparse format before quantizing the residual. Fixes catastrophic 2-bit PPL (31,145 → ~25). |
-| **AVX2 SIMD GEMV Kernels** | Native C++/AVX2+FMA fused dequant-matmul kernels for 2-bit, 3-bit, 4-bit, and 8-bit. Bypasses PyTorch overhead entirely. |
-| **QCSD Speculative Decoding** | Uses the 2-bit model as a draft and 4-bit as verifier — same weights, different precision. ~4× throughput with no extra model download. |
-| **Activation-Sparse GEMV** | After SiLU gating, 80–95% of MLP activations are near-zero. Skips corresponding weight columns, saving 60–80% DRAM bandwidth on down_proj. |
+| **SpQR Outlier Separation** | Experimental low-bit outlier handling for 3-bit and 2-bit quantization. Helpful for 3-bit in current measurements; 2-bit remains unstable. |
+| **AVX2 SIMD GEMV Kernels** | Native C++/AVX2+FMA fused dequant-matmul kernels for 2-bit, 3-bit, 4-bit, and 8-bit. These are real compiled extensions, not just Python stubs. |
+| **SWIFT Self-Speculative Decoding** | The existing `asdsl/speculative/swift.py` module implements layer-skipping self-speculative decoding as a separate subsystem. |
+| **QCSD Speculative Decoding** | Experimental path in `experiments/phi4_cpu_run.py` using low-bit and higher-bit weight banks as draft/verifier. Present, but not yet benchmark-stable. |
+| **Activation-Sparse GEMV** | Experimental path for skipping low-magnitude MLP activations. Present, but not yet benchmark-stable. |
 | **Salience-Driven Mixed-Precision** | Assigns higher bit-widths to weight groups that have the largest impact on output quality, guided by Hessian/Fisher-diagonal salience scores. |
 | **LUT Matmul Engine** | Replaces dequantize-then-multiply with precomputed partial-sum table lookups (PSHUF/TBL). 2-bit LUT fits in L2 cache (~96 KB/layer). |
 | **Block-Sparse KV Cache** | Demand-allocated 16-token blocks with importance-based eviction. Avoids pre-allocating for max_seq_len. |
@@ -54,58 +57,76 @@ integrated subsystems:
 ## Measured Results
 
 > Hardware: Intel Core i7 Evo · CPU-only · 16 GB DDR4-3200 RAM · Windows  
-> Model: **Phi-4-multimodal-instruct** (14B params, 200k vocab, 32 layers)
+> Model: **Phi-4-multimodal-instruct** (14B params, 200k vocab, 32 layers)  
+> Source of truth: `benchmarks/results/benchmark_results.json`
 
-### Inference Quality & Speed (WikiText-2, 512 tokens)
+### Stable Benchmark Snapshot
+
+The table below reflects the latest consistent measured results currently saved in
+`benchmarks/results/benchmark_results.json`. These are the numbers that should be
+used when discussing current repository performance.
 
 | Configuration | Perplexity ↓ | Speed | RAM Peak | SNR (dB) | Compression | Cores | Backend |
 |---------------|:------------:|:-----:|:--------:|:--------:|:-----------:|:-----:|:-------:|
-| **FP16 baseline** | **11.09** | 1.16 tok/s | 7.3 GB | inf | 1.0x | 6 | PyTorch |
-| **ASDSL 8-bit** | **11.09** | **2.14 tok/s** | 4.7 GB | 43.8 | 3.9x | 7 | AVX2 GEMV |
-| **ASDSL 4-bit** | **11.90** | **2.36 tok/s** | 5.1 GB | 22.5 | 6.4x | 6 | AVX2 GEMV |
-| **ASDSL 3-bit** | **14.18** | **2.05 tok/s** | 6.6 GB | 17.7 | 6.2x | 7 | AVX2 GEMV + SpQR |
-| **ASDSL 2-bit** | WIP | WIP | ~6.9 GB | 10.9 | 8.0x | 6 | AVX2 GEMV + SpQR |
+| **FP16 baseline** | **11.06** | 1.85 tok/s | 7.50 GB | inf | 1.0x | 6 | chunked fp16 matvec |
+| **ASDSL 8-bit** | **11.06** | **2.52 tok/s** | 6.27 GB | 43.8 | 3.9x | 6 | native AVX2 GEMV |
+| **ASDSL 4-bit** | **11.89** | **2.74 tok/s** | 6.72 GB | 22.5 | 6.4x | 6 | native AVX2 GEMV |
+| **ASDSL 3-bit** | **14.14** | **2.21 tok/s** | 7.14 GB | 17.7 | 6.2x | 7 | native AVX2 GEMV + SpQR |
 
-**Key wins from Tier 1 (AVX2 Kernels + SpQR):**
-- 3-bit: **0.40 → 2.05 tok/s** (5.1x faster) with PPL dropping from 25.60 → **14.18**
-- 8-bit: PPL matches FP16 exactly (11.09) at **1.8x the speed**
-- 4-bit: Near-lossless quality (PPL 11.90) at **2x faster** than FP16
-- 2-bit: SpQR + packed Q2 GEMV kernel implemented; PPL improving but not yet production-ready
+Current interpretation:
 
-### Target: >=10 tok/s at 4-bit
+- `8-bit` is effectively lossless relative to fp16 on this benchmark slice.
+- `4-bit` is the best current quality/speed tradeoff in the stable measured path.
+- `3-bit` is now usable and much faster than the original PyTorch fallback path.
+- `2-bit` remains experimental and is intentionally excluded from the stable table because quality is still inconsistent.
 
-Theoretical ceiling for Intel i7 Evo DDR4-3200 dual-channel: ~51 GB/s bandwidth / ~4.8 GB model = **~10.6 tok/s**.
-Current 4-bit baseline: **2.63 tok/s** (25% of ceiling). Two remaining tiers will close this gap:
+### What Is Measured vs Experimental
 
-| Tier | Technique | Expected multiplier | Status |
-|------|-----------|:-------------------:|:------:|
-| **Tier 1** | AVX2 GEMV + SpQR outliers | baseline (done) | **Measured** |
-| **Tier 2** | QCSD speculative decoding (2-bit draft / 4-bit verify) | ~3-4x | In progress |
-| **Tier 3** | Activation-sparse GEMV (skip near-zero MLP columns) | ~2-3x on MLP | In progress |
+Measured and stable today:
 
-**Tier 2 (QCSD):** Uses the 2-bit model as a fast draft and the 4-bit model to batch-verify. Same architecture, different precision — no separate model download needed. Expected: 2.63 x 3 = **~8-10 tok/s**.
+- native AVX2 GEMV for 8-bit, 4-bit, and 3-bit
+- SpQR-style outlier handling helping the 3-bit path
+- end-to-end Phi-4 CPU inference and WikiText-2 perplexity benchmarking
 
-**Tier 3 (Activation-Sparse GEMV):** After SiLU gating, 80-95% of MLP activations are near-zero. Skipping those weight columns saves 60-80% DRAM bandwidth on the down projection. Orthogonal to Tier 2.
+Implemented but still experimental:
 
+- `QCSD` path in `experiments/phi4_cpu_run.py`
+- activation-sparse GEMV path in `experiments/phi4_cpu_run.py`
+- 2-bit draft / verification experiments
 
-### Memory Footprint by Bit-Width
+These experimental paths should not be treated as production benchmark results until
+their acceptance rates, quality, and end-to-end throughput are validated in the same
+benchmark workflow as the stable table above.
 
-| Component | FP16 (no quant) | 8-bit ASDSL | 4-bit ASDSL | 3-bit ASDSL |
-|-----------|:---------------:|:-----------:|:-----------:|:-----------:|
-| Weights | 6.4 GB (f16) | 3.3 GB (uint8) | 3.6 GB (uint8) | 4.0 GB (uint8) |
-| Scales + biases | — | 0.05 GB | 0.4 GB (f16) | 0.4 GB (f16) |
-| Embedding (f16) | 1.2 GB | 1.2 GB | 1.2 GB | 1.2 GB |
-| SpQR outliers | — | — | — | ~0.05 GB |
-| **Peak RAM** | **~7.5 GB** | **~4.5 GB** | **~6.5 GB** | **~6.9 GB** |
+### About The 10 tok/s Goal
 
-### Before vs. After AVX2 + SpQR Optimization
+The often-cited `~10.6 tok/s` figure is a **heuristic bandwidth upper bound**, not a
+physical limit or a full-system performance model. It comes from dividing approximate
+memory bandwidth by approximate model footprint, and it ignores several real costs:
 
-| Bits | Before (PyTorch fallback) | After (AVX2 GEMV + SpQR) | Speed improvement | PPL improvement |
-|-----:|:--------------------------:|:-----------------------------:|:-----------:|:-----------:|
-| 8-bit | 1.74 tok/s, PPL 17.57 | **2.14 tok/s**, PPL **11.09** | **1.2x faster** | **37% better** |
-| 4-bit | 1.84 tok/s, PPL 24.33 | **2.36 tok/s**, PPL **11.90** | **1.3x faster** | **51% better** |
-| 3-bit | 0.40 tok/s, PPL 25.60 | **2.05 tok/s**, PPL **14.18** | **5.1x faster** | **45% better** |
-| 2-bit | 0.46 tok/s, PPL 31,145 | WIP | **5.2x faster** | SpQR in progress |
+- KV cache traffic
+- attention and softmax work
+- memory latency and cache-miss behavior
+- LM head cost
+- Python orchestration overhead
+
+It is still useful as a rough directional target, but it should be read as
+\"order-of-magnitude headroom\" rather than a hard ceiling.
+
+### Memory Footprint
+
+| Configuration | Peak RAM |
+|---------------|:--------:|
+| FP16 | 7.50 GB |
+| 8-bit | 6.27 GB |
+| 4-bit | 6.72 GB |
+| 3-bit | 7.14 GB |
+
+### Historical Note
+
+Older benchmark numbers that previously appeared in this README came from earlier runs,
+different evaluator settings, and older inference paths. They have been removed here to
+avoid mixing incomparable results in the same document.
 
 ### Output Quality Verification
 
@@ -118,21 +139,14 @@ $ python experiments/phi4_cpu_run.py --bits 3 --prompt "The capital of France is
    and is known for its rich history, culture, and architecture."  ✅
 ```
 
-### CPU Core Efficiency
-
-| Configuration | Original baseline | Current |
-|---------------|:--------------------:|:-------------------:|
-| FP16 (no quant) | 0.61 tok/s / ~9.2 GB | **2.19 tok/s** / ~7.6 GB |
-| 4-bit ASDSL | 0.61 tok/s / ~9.2 GB | **0.74 tok/s** / ~4.9 GB |
-
 ### Inference Engine Optimizations
 
 | Optimization | Impact |
 |-------------|--------|
 | **AVX2 GEMV Q2/Q3/Q4/Q8** | Native C++/AVX2+FMA fused dequant-matmul for all bit-widths. Bypasses PyTorch entirely. |
-| **SpQR outlier separation** | Detects >3.5σ weight outliers, stores in FP16 sparse format. Fixes 2-bit PPL catastrophe. |
-| **QCSD speculative decoding** | 2-bit draft / 4-bit verify: ~4× throughput with lossless greedy acceptance. |
-| **Activation-sparse GEMV** | Bitmask-based column skipping on MLP down_proj. Saves 60–80% DRAM bandwidth. |
+| **SpQR outlier separation** | Low-bit outlier handling for experimental 3-bit and 2-bit paths. Beneficial for 3-bit in current measurements; 2-bit still needs more work. |
+| **QCSD speculative decoding** | Experimental 2-bit draft / 4-bit verify path in `phi4_cpu_run.py`. Not yet included in the stable benchmark table. |
+| **Activation-sparse GEMV** | Experimental bitmask-based down-projection skipping path. Not yet included in the stable benchmark table. |
 | **Dual-path matvec** | bits=16: chunked f16→f32 reads. bits<=8: chunked uint8 dequant+mv with in-place scale/bias. |
 | **Pre-unpacked uint8 weights** | Unpacks packed data to 1-byte-per-value at load time for fast streaming reads. |
 | **Pre-computed bias** | Stores `bias = -zero * scale` per group; fuses `val * scale + bias` instead of `(val - zero) * scale`. |
@@ -155,20 +169,20 @@ $ python experiments/phi4_cpu_run.py --bits 3 --prompt "The capital of France is
 │       │                                                         │
 │       ▼                                                         │
 │  ┌──────────────────────────────────────────────────────┐       │
-│  │              Quantization Pipeline                    │       │
-│  │  1. Salience scoring (Hessian diagonal)               │       │
-│  │  2. Bit allocation per group                          │       │
-│  │  3. MSE-optimal clipping (grid search, 9 ratios)      │       │
-│  │  4. SpQR outlier separation (≤3-bit: 3.5σ threshold)  │       │
-│  │  5. Asymmetric quant ≤4-bit / symmetric >4-bit        │       │
-│  │  6. Fine-grained groups (gs=16/32/128)                │       │
+│  │              Quantization Pipeline                    │      │
+│  │  1. Salience scoring (Hessian diagonal)               │      │
+│  │  2. Bit allocation per group                          │      │
+│  │  3. MSE-optimal clipping (grid search, 9 ratios)      │      │
+│  │  4. SpQR outlier separation (≤3-bit: 3.5σ threshold)  │      │
+│  │  5. Asymmetric quant ≤4-bit / symmetric >4-bit        │      │
+│  │  6. Fine-grained groups (gs=16/32/128)                │      │
 │  └─────────────────────┬────────────────────────────────┘       │
 │                        │                                        │
 │       ┌────────────────┼───────────────────┐                    │
 │       ▼                ▼                   ▼                    │
 │  ┌──────────┐    ┌──────────┐       ┌───────────┐               │
 │  │  Weight  │    │ AVX2     │       │  Sparse   │               │
-│  │  Store   │───▶│ GEMV     │       │  GEMV     │               │
+│  │  Store   │───▶│ GEMV     │       │  GEMV     │              │
 │  │ (N-bit)  │    │ Kernels  │       │  (Tier 3) │               │
 │  │ Dual-bank│    │ Q2/Q3/   │       │  bitmask  │               │
 │  │ (QCSD)   │    │ Q4/Q8    │       │  skip     │               │
@@ -178,12 +192,12 @@ $ python experiments/phi4_cpu_run.py --bits 3 --prompt "The capital of France is
 │                ┌────────────────────────────────┐               │
 │                │      Inference Engine          │               │
 │                │  RMSNorm → Attn → MLP loop     │               │
-│                │  BlockSparseKVCache tracking    │               │
-│                │  Activation-sparse down_proj    │               │
+│                │  BlockSparseKVCache tracking    │              │
+│                │  Activation-sparse down_proj    │              │
 │                └────────────────┬───────────────┘               │
 │                                 │                               │
-│                    ┌────────────┴────────────┐                   │
-│                    ▼                         ▼                   │
+│                    ┌────────────┴────────────┐                  │
+│                    ▼                         ▼                  │
 │             ┌─────────────┐          ┌─────────────────┐        │
 │             │    QCSD     │          │  OS Memory Mgr  │        │
 │             │  Specul.    │          │  mlock + Huge   │        │
@@ -195,32 +209,27 @@ $ python experiments/phi4_cpu_run.py --bits 3 --prompt "The capital of France is
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### QCSD — Quantization Cascade Speculative Decoding (Tier 2)
+### SWIFT vs QCSD
 
-Standard speculative decoding requires a separate smaller draft model. QCSD exploits
-the fact that the 2-bit and 4-bit versions of Phi-4 are already a natural model family —
-same architecture, different weight precision. No separate model download needed.
+There are **two different speculative-decoding ideas** in this repository:
 
-- **Draft phase (2-bit):** Generate K=7 draft tokens autoregressively. Fast because
-  2-bit weights are ~1.4 GB packed — low DRAM bandwidth per token.
-- **Verify phase (4-bit):** Single batched forward pass with all K draft tokens.
-  Weights loaded once, applied K times — same DRAM cost as 1 token.
-- **Acceptance:** Compare draft vs. 4-bit logits greedily. Expected acceptance
-  rate: ~85–92% for common-token sequences.
-- **Dual-bank memory layout:** Both banks share embedding, LM head, and scale
-  tensors. Only the packed weight banks differ (~6.2 GB total vs. ~4.8 GB single).
+- **SWIFT** lives in `asdsl/speculative/swift.py` and implements layer-skipping self-speculative decoding.
+- **QCSD** lives in `experiments/phi4_cpu_run.py` and uses different quantization banks as draft/verifier.
 
-### Activation-Sparse GEMV (Tier 3)
+They are not the same technique and should not be conflated.
 
-After the SiLU gating in Phi-4's MLP blocks, 80–95% of hidden units are near-zero.
-Standard GEMV loads every weight row from DRAM — including rows multiplied by zero.
+### QCSD — Experimental Quantization-Cascade Speculative Decoding
 
-- **Bitmask generation:** Vectorized AVX2 threshold comparison (|act| >= ε) produces
-  a uint32 bitmask per 32 columns. Near-zero → skip.
-- **Sparse kernel:** Only loads and processes active columns. 60–80% bandwidth
-  reduction on the down projection (the largest per-layer weight matrix).
-- **Lossless at ε=0.0** (exact-zero only). Tunable ε with < 0.5 PPL degradation
-  at typical thresholds (0.005–0.01).
+The QCSD path is an experimental decode loop that tries to use a low-bit bank as the
+draft path and a higher-bit bank as the verifier. The implementation exists, but the
+repository does **not** currently claim stable measured QCSD speedups in the main
+benchmark table.
+
+### Activation-Sparse GEMV — Experimental
+
+The repository also contains an experimental activation-sparse GEMV path for the MLP
+down-projection. The intuition is sound, but the current implementation is still being
+validated for end-to-end speedup and has not been promoted into the stable benchmark path.
 
 ---
 
@@ -285,7 +294,7 @@ python experiments/phi4_cpu_run.py --bits 16
 # 4-bit (recommended — near-baseline quality, 6.4x compression)
 python experiments/phi4_cpu_run.py --bits 4
 
-# 4-bit with all optimizations (QCSD + activation-sparse GEMV)
+# 4-bit with experimental paths enabled
 python experiments/phi4_cpu_run.py --bits 4 --qcsd --sparse
 
 # 3-bit with SpQR outlier separation
@@ -307,10 +316,10 @@ python experiments/phi4_cpu_run.py --bits 8
 | `--max-new-tokens N` | `80` | Number of tokens to generate |
 | `--threads N` | `8` | CPU thread count (8 = Intel i7 Evo P-cores) |
 | `--group-size N` | `0` (auto) | Quantization group size; 0 = smart default |
-| `--qcsd` | off | Enable QCSD speculative decoding (Tier 2) |
+| `--qcsd` | off | Enable experimental QCSD speculative decoding path |
 | `--draft-bits N` | `2` | Bit-width for QCSD draft model |
 | `--draft-k N` | `7` | Draft tokens per QCSD cycle |
-| `--sparse` | off | Enable activation-sparse GEMV (Tier 3) |
+| `--sparse` | off | Enable experimental activation-sparse GEMV path |
 | `--sparse-threshold F` | `0.01` | Activation sparsity threshold |
 
 ### Smart Group Size Defaults
@@ -449,10 +458,10 @@ python evals/perplexity.py --bits 4 --max-tokens 512
 
 | Config | PPL | Quality |
 |--------|:---:|:-------:|
-| FP16 baseline | 15.78 | Baseline |
-| 8-bit | 15.77 | ✅ Lossless |
-| 4-bit (asymmetric + MSE-clip + gs=32) | 19.16 | ✅ Production-viable |
-| 3-bit (asymmetric + MSE-clip + gs=16) | 24.70 | ✅ Coherent |
+| FP16 baseline | 11.06 | Baseline |
+| 8-bit | 11.06 | ✅ Lossless on current benchmark slice |
+| 4-bit (asymmetric + MSE-clip + gs=32) | 11.89 | ✅ Best stable tradeoff |
+| 3-bit (asymmetric + MSE-clip + gs=16) | 14.14 | ✅ Usable |
 
 ### lm-evaluation-harness Integration
 
@@ -547,16 +556,16 @@ asdsl-framework/
 │   │   │                           # _find_optimal_scales(), compute_scale_zero()
 │   │   └── salience.py             # Hessian salience scoring, bit allocation
 │   ├── lut/                        # Lookup-table matmul engine
-│   ├── speculative/                # SWIFT self-speculative decoding
+│   ├── speculative/                # SWIFT self-speculative decoding module
 │   ├── prefetch/                   # Async L2 cache prefetch thread
 │   ├── memory/                     # OS-level memory management (mlock, HugePages)
 │   ├── inference/                  # Main inference engine
-│   └── kernels/                    # Low-level SIMD kernel stubs
+│   └── kernels/                    # Native kernel wrappers + compiled AVX2 extensions
 │
 ├── experiments/
 │   ├── phi4_cpu_run.py             # ★ End-to-end Phi-4 inference script
-│   │                               #   WeightStore, forward_layer, generate()
-│   │                               #   set_thread_count(), KVHistory, ASDSLKVTracker
+│   │                               #   WeightStore, forward_layer, generate(),
+│   │                               #   experimental QCSD + sparse GEMV paths
 │   └── phi4_integration.py         # Integration helpers
 │
 ├── evals/
@@ -575,14 +584,16 @@ asdsl-framework/
 │   ├── RESULTS.md                  # Detailed benchmark results with all data
 │   └── results/                    # Generated JSON + PNG outputs
 │
-├── tests/                          # 66 unit tests (pytest)
-│   ├── test_quantization.py        # Quantization correctness (17 tests)
-│   ├── test_lut.py                 # LUT engine (9 tests)
-│   ├── test_kernels.py             # SIMD kernels (11 tests)
-│   ├── test_kv_cache.py            # Block-sparse KV cache (6 tests)
-│   ├── test_speculative.py         # SWIFT speculative decoding (11 tests)
-│   ├── test_prefetch.py            # Async prefetch (5 tests)
-│   └── test_memory.py              # Memory management (7 tests)
+├── tests/                          # 95 pytest tests
+│   ├── test_quantization.py
+│   ├── test_gemv_q4.py
+│   ├── test_kernels.py
+│   ├── test_kv_cache.py
+│   ├── test_lut.py
+│   ├── test_memory.py
+│   ├── test_prefetch.py
+│   ├── test_speculative.py
+│   └── test_streaming.py
 │
 ├── docs/                           # Extended documentation
 ├── examples/                       # Usage examples
@@ -644,18 +655,23 @@ through NumPy vectorization of the pack/unpack operations.
 
 ### 5 · SWIFT Speculative Decoding
 
-SWIFT skips intermediate transformer layers to generate draft tokens cheaply, then verifies
-with a single full forward pass. On the scheduling layer (no memory bottleneck), this
-demonstrates **2.03× throughput** with only 18.8% skip ratio and no separate draft model.
+`asdsl/speculative/swift.py` implements the SWIFT-style layer-skipping speculative path.
+This is distinct from the experimental QCSD path in `phi4_cpu_run.py`.
 
-### 6 · Block-Sparse KV Cache
+### 6 · Experimental QCSD
+
+`experiments/phi4_cpu_run.py` also contains a separate experimental quantization-cascade
+speculative decoder. It should currently be treated as a research path rather than a
+stable benchmarked feature.
+
+### 7 · Block-Sparse KV Cache
 
 The KV cache allocates memory in 16-token blocks on demand, rather than pre-allocating
 for `max_seq_len`. An importance score is maintained per block; when capacity is exceeded,
 the least-important blocks are evicted. For a 200-token Phi-4 run, only 15 of 256 possible
 blocks were ever allocated.
 
-### 7 · LUT Matmul Engine
+### 8 · LUT Matmul Engine
 
 For 2-bit weights with `group_width=2`, each group of 2 weights has only 4 unique values
 (2-bit × 2 positions = 16 combinations × 2 = the dot-product table fits in 256 entries).
@@ -667,7 +683,7 @@ matmul is **cache-resident**: no DRAM reads during compute.
 ## Testing
 
 ```bash
-# Run all 66 tests
+# Run all tests
 pytest
 
 # Run a specific module
@@ -677,18 +693,9 @@ pytest tests/test_quantization.py -v
 pytest --cov=asdsl
 ```
 
-**Test coverage by module:**
-
-| Test File | Tests | What it covers |
-|-----------|:-----:|----------------|
-| `test_quantization.py` | 17 | `quantize_weights`, `dequantize_weights`, SNR, round-trip, edge cases |
-| `test_speculative.py` | 11 | SWIFT scheduler, draft acceptance, layer-skip logic |
-| `test_kernels.py` | 11 | SIMD kernel stubs, matmul correctness |
-| `test_lut.py` | 9 | LUT build, matvec, memory footprint |
-| `test_memory.py` | 7 | mlock, Huge Pages, NUMA awareness stubs |
-| `test_kv_cache.py` | 6 | Block allocation, eviction, capacity limits |
-| `test_prefetch.py` | 5 | Async prefetch thread, scheduling |
-| **Total** | **66** | **All passing** |
+The current suite has **95 passing tests** covering quantization, native kernels,
+KV cache handling, LUT paths, speculative components, memory helpers, prefetching,
+and streaming output.
 
 ---
 
@@ -702,20 +709,23 @@ pytest --cov=asdsl
 - [x] 3-bit "10-in-32" packing (26–36× speedup)
 - [x] Salience scoring (Hessian diagonal, Fisher approximation)
 - [x] LUT matmul engine (Python reference)
-- [x] SWIFT speculative decoding (2.03× on scheduler)
+- [x] SWIFT speculative decoding module
 - [x] Block-sparse KV cache with importance eviction
 - [x] Async L2 cache prefetch thread
 - [x] Thread control (`set_thread_count`, `--threads` CLI)
-- [x] End-to-end Phi-4 (14B) inference — 4-bit PPL=19.16, 3-bit PPL=24.70
+- [x] End-to-end Phi-4 (14B) inference with stable measured benchmarks
 - [x] WikiText-2 perplexity evaluator
 - [x] lm-evaluation-harness integration
 - [x] Comprehensive benchmark suite with visualization
-- [x] Native C++/AVX2 matmul kernel (target: 50–200× speedup → 35–55 tok/s)
+- [x] Native C++/AVX2 GEMV kernels for 8-bit, 4-bit, 3-bit, and 2-bit
 - [x] LUT inference path without weight decompression (639× build speedup, 657× matvec speedup)
 - [x] Streaming output (yield tokens as they are generated)
 
 ### In Progress / Planned 🔄
 
+- [ ] stabilize 2-bit quality enough for use as a QCSD draft path
+- [ ] validate QCSD in the main benchmark suite
+- [ ] validate activation-sparse GEMV in the main benchmark suite
 - [ ] GPTQ-style calibrated quantization (512 calibration samples)
 - [ ] Vectorized greedy bit allocator (replace O(n²) Python loop)
 - [ ] INT4/INT8 VNNI kernel path (Intel Sapphire Rapids / Meteor Lake)
@@ -732,7 +742,7 @@ This framework synthesizes research from:
 | **T-MAC** | LUT-based mixed-precision matrix multiplication |
 | **SliM-LLM** | Salience-driven mixed-precision quantization |
 | **TaCQ** | Task-circuit quantization |
-| **SWIFT** | On-the-fly self-speculative decoding |
+| **SWIFT** | Layer-skipping self-speculative decoding |
 | **BitNet** | Ternary weight quantization |
 | **IntactKV** | Lossless pivot token KV cache generation |
 | **BlockDialect / LServe** | Block-wise sparse attention |
