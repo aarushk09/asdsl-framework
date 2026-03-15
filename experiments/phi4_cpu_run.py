@@ -189,6 +189,7 @@ def silu(x: torch.Tensor) -> torch.Tensor:
 # Target chunk size for streaming dequant+BLAS matvec.
 # Each chunk must fit in CPU L2/L3 cache to avoid redundant DRAM traffic.
 _TARGET_CHUNK_BYTES = 8 * 1024 * 1024  # 8 MB – fits L3 comfortably
+_PROJECTION_NAMES = ("qkv_proj", "o_proj", "gate_up_proj", "down_proj")
 
 
 class WeightStore:
@@ -279,7 +280,7 @@ class WeightStore:
                 shard = idx[k]
                 shard_keys.setdefault(shard, []).append(k)
 
-        total_proj = NUM_LAYERS * 4
+        total_proj = NUM_LAYERS * len(_PROJECTION_NAMES)
         done = 0
 
         if self.bits == 16:
@@ -370,7 +371,31 @@ class WeightStore:
                         pct = done / total_proj * 100
                         print(f"    {done}/{total_proj} ({pct:.0f}%)  ", end="\r", flush=True)
 
-        print(f"    {total_proj}/{total_proj} (100%)  done.               ")
+        print(f"    {done}/{total_proj} loaded.                           ")
+        if done == 0:
+            raise RuntimeError(
+                "WeightStore.load() did not load any projection tensors. "
+                "Check the model index keys and the expected Phi-4 projection names."
+            )
+
+        missing_after_load: list[str] = []
+        for i in range(NUM_LAYERS):
+            layer_tensors = self.layers.get(i, {})
+            for name in _PROJECTION_NAMES:
+                if self.bits == 16:
+                    if (i, name) not in self._weight_cache:
+                        missing_after_load.append(f"layer {i}: {name}")
+                else:
+                    if name not in layer_tensors:
+                        missing_after_load.append(f"layer {i}: {name}")
+
+        if missing_after_load:
+            sample = ", ".join(missing_after_load[:8])
+            raise RuntimeError(
+                "WeightStore.load() finished with missing projection tensors. "
+                f"Missing {len(missing_after_load)} entries; sample: {sample}"
+            )
+
         # Embedding: keep as float16 to save ~1.2 GB RAM.
         # Token lookup casts one row to float32 (12 KB, negligible).
         # LM head reads f16 in L2-sized chunks, halving DRAM traffic.
@@ -677,9 +702,18 @@ class WeightStore:
             label = "primary" if self._enable_qcsd else ""
             print(f"  Pre-unpacking {total} {label} tensors to uint8 ... ", end="", flush=True)
 
+            missing_entries: list[str] = []
             for i in range(NUM_LAYERS):
-                for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
-                    qt = self.layers[i][name]
+                layer_tensors = self.layers.get(i)
+                if not layer_tensors:
+                    missing_entries.extend([f"layer {i}: {name}" for name in _PROJECTION_NAMES])
+                    continue
+
+                for name in _PROJECTION_NAMES:
+                    qt = layer_tensors.get(name)
+                    if qt is None:
+                        missing_entries.append(f"layer {i}: {name}")
+                        continue
                     rows, cols = qt.shape
                     key = (i, name)
                     self._quant_shapes[key] = (rows, cols)
@@ -701,8 +735,8 @@ class WeightStore:
 
                     # QCSD: store draft weights PACKED (4 values per byte for 2-bit).
                     # This loads 4x less data from DRAM per draft token.
-                    if self._enable_qcsd and "_draft_" + name in self.layers.get(i, {}):
-                        qt_d = self.layers[i]["_draft_" + name]
+                    if self._enable_qcsd and "_draft_" + name in layer_tensors:
+                        qt_d = layer_tensors["_draft_" + name]
                         d_numel = rows * cols
                         # Keep packed data directly — no pre-unpack
                         self._draft_quant_u8[key] = torch.from_numpy(qt_d.data.copy())
@@ -719,6 +753,13 @@ class WeightStore:
                         self._draft_quant_bi[key] = d_bi
 
                     done += 1
+
+            if missing_entries:
+                sample = ", ".join(missing_entries[:8])
+                raise RuntimeError(
+                    "warm_cache() found missing projection tensors instead of crashing "
+                    f"with KeyError. Missing {len(missing_entries)} entries; sample: {sample}"
+                )
 
             # Clean up draft layer entries
             for i in range(NUM_LAYERS):
