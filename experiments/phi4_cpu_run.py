@@ -42,9 +42,15 @@ from transformers import AutoTokenizer
 
 
 def set_thread_count(n: int) -> None:
-    """Set CPU threads for NumPy/BLAS/PyTorch. 0 = auto-detect."""
+    """Set CPU threads for NumPy/BLAS/PyTorch.
+
+    0 = auto-detect (defaults to 8 for Intel i7 Evo P-core count).
+    Intel i7 Evo has hybrid P+E cores; P-cores are more efficient
+    for compute-heavy GEMV, so we default to P-core thread count.
+    MKL is preferred over OpenBLAS on Intel hardware.
+    """
     if n <= 0:
-        n = max(1, os.cpu_count() or 4)
+        n = min(8, max(1, os.cpu_count() or 4))
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(n)
@@ -139,22 +145,27 @@ class WeightStore:
     Loads backbone weights from safetensors shards, quantizes them to N-bit
     with ASDSL, and stores the compressed tensors in a nested dict.
 
-    Memory layout (4-bit, group_size=128):
+    Supports dual-bank mode for QCSD (Tier 2): holds both a primary (4-bit)
+    and draft (2-bit) weight bank sharing scales/zeros, plus SpQR outlier
+    separation (Tier 1C) for bits <= 3.
+
+    Memory layout (4-bit, group_size=32):
       - ~50 MB per layer (vs ~402 MB float32)
       - ~1.7 GB total backbone (vs ~6.4 GB float32)
       - Embedding kept as bfloat16 torch tensor (~1.2 GB)
     """
 
-    def __init__(self, bits: int = 4, group_size: int | None = None):
+    def __init__(self, bits: int = 4, group_size: int | None = None,
+                 enable_qcsd: bool = False, draft_bits: int = 2,
+                 enable_sparse: bool = False, sparsity_threshold: float = 0.01):
         from asdsl.quantization.core import quantize_weights
         self._quantize = quantize_weights
         self.bits = bits
-        # Smart defaults: smaller groups + asymmetric + MSE-optimal clipping for low bits
         if group_size is None:
             if bits <= 3:
-                self.group_size = 16  # Very small groups needed for 3-bit fidelity
+                self.group_size = 16
             elif bits <= 4:
-                self.group_size = 32  # Optimal balance for 4-bit
+                self.group_size = 32
             else:
                 self.group_size = 128
         else:
@@ -162,21 +173,37 @@ class WeightStore:
         self._symmetric = bits > 4
         self._optimize_clips = bits <= 4
 
-        self.layers: dict[int, dict[str, object]] = {}   # layer_idx -> {name: QuantizedTensor}
-        self.layer_norms: dict[int, dict[str, torch.Tensor]] = {}  # layer_idx -> {name: tensor}
-        self.embed: torch.Tensor | None = None            # (vocab, hidden) bfloat16, freed after caching
-        self.embed_f16: torch.Tensor | None = None        # (vocab, hidden) float16 - for token lookup
-        self.lm_head: torch.Tensor | None = None           # same object as embed_f16, for LM head
-        self.final_norm: torch.Tensor | None = None       # (hidden,)
-        self._weight_cache: dict[tuple, torch.Tensor] = {}   # (layer, name) -> float16 tensor (bits=16 only)
-        # Quantized path (bits≤8): uint8 values + f16 scales/biases per group
-        self._quant_u8: dict[tuple, torch.Tensor] = {}    # (layer, name) -> uint8 (rows*cols,)
-        self._quant_sc: dict[tuple, torch.Tensor] = {}    # (layer, name) -> float16 scales (n_groups,)
-        self._quant_bi: dict[tuple, torch.Tensor] = {}    # (layer, name) -> float16 biases (n_groups,)
-        self._quant_shapes: dict[tuple, tuple] = {}       # (layer, name) -> (rows, cols)
-        
+        self.layers: dict[int, dict[str, object]] = {}
+        self.layer_norms: dict[int, dict[str, torch.Tensor]] = {}
+        self.embed: torch.Tensor | None = None
+        self.embed_f16: torch.Tensor | None = None
+        self.lm_head: torch.Tensor | None = None
+        self.final_norm: torch.Tensor | None = None
+        self._weight_cache: dict[tuple, torch.Tensor] = {}
+        self._quant_u8: dict[tuple, torch.Tensor] = {}
+        self._quant_sc: dict[tuple, torch.Tensor] = {}
+        self._quant_bi: dict[tuple, torch.Tensor] = {}
+        self._quant_shapes: dict[tuple, tuple] = {}
+
         # Native LUT/GEMV fast path
         self._use_native_gemv = False
+
+        # SpQR outlier separation (Tier 1C) — for bits <= 3
+        self._outlier_values: dict[tuple, np.ndarray] = {}
+        self._outlier_coords: dict[tuple, np.ndarray] = {}
+
+        # QCSD dual-bank (Tier 2)
+        self._enable_qcsd = enable_qcsd
+        self._draft_bits = draft_bits
+        self._draft_quant_u8: dict[tuple, torch.Tensor] = {}
+        self._draft_quant_sc: dict[tuple, torch.Tensor] = {}
+        self._draft_quant_bi: dict[tuple, torch.Tensor] = {}
+        self._draft_outlier_values: dict[tuple, np.ndarray] = {}
+        self._draft_outlier_coords: dict[tuple, np.ndarray] = {}
+
+        # Activation-sparse GEMV (Tier 3)
+        self._enable_sparse = enable_sparse
+        self._sparsity_threshold = sparsity_threshold
 
     # ------------------------------------------------------------------
     def load(self) -> None:
@@ -243,18 +270,39 @@ class WeightStore:
                         friendly = key.split(".")[-1]
 
                     if self.bits == 16:
-                        # Skip ASDSL quantization - store directly in float16 cache.
-                        # All forward-pass matmuls use float16->float32 scratch buffers
-                        # anyway, so bits=16 gives best quality at no extra memory cost.
                         self._weight_cache[(layer_idx, friendly)] = tensor.to(torch.float16)
                     else:
-                        # ASDSL N-bit quantization
                         w_f32 = tensor.to(torch.float32).numpy()
-                        qt = self._quantize(w_f32, bits=self.bits,
-                                            group_size=self.group_size,
-                                            symmetric=self._symmetric,
-                                            optimize_clips=self._optimize_clips)
+                        if self.bits <= 3:
+                            from asdsl.quantization.core import quantize_weights_with_outliers
+                            qt, ov, oc = quantize_weights_with_outliers(
+                                w_f32, bits=self.bits,
+                                group_size=self.group_size,
+                                symmetric=self._symmetric,
+                                optimize_clips=self._optimize_clips,
+                            )
+                            self._outlier_values[(layer_idx, friendly)] = ov
+                            self._outlier_coords[(layer_idx, friendly)] = oc
+                        else:
+                            qt = self._quantize(w_f32, bits=self.bits,
+                                                group_size=self.group_size,
+                                                symmetric=self._symmetric,
+                                                optimize_clips=self._optimize_clips)
                         self.layers.setdefault(layer_idx, {})[friendly] = qt
+
+                        # QCSD: also quantize to draft_bits for the draft bank
+                        if self._enable_qcsd and self.bits > self._draft_bits:
+                            from asdsl.quantization.core import quantize_weights_with_outliers
+                            draft_gs = 16 if self._draft_bits <= 3 else 32
+                            qt_d, ov_d, oc_d = quantize_weights_with_outliers(
+                                w_f32, bits=self._draft_bits,
+                                group_size=draft_gs,
+                                symmetric=False,
+                                optimize_clips=True,
+                            )
+                            self.layers.setdefault(layer_idx, {})["_draft_" + friendly] = qt_d
+                            self._draft_outlier_values[(layer_idx, friendly)] = ov_d
+                            self._draft_outlier_coords[(layer_idx, friendly)] = oc_d
 
                     done += 1
                     if done % 16 == 0 or done == total_proj:
@@ -325,36 +373,105 @@ class WeightStore:
             torch.mv(vals.view(n, cols), x_flat, out=result[start:end])
         return result.unsqueeze(0)
 
-    def _matvec_native_gemv(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
-        """AVX2 GEMV fast path for 4-bit and 8-bit weights.
-        
-        Uses the C++ extensions to do on-the-fly dequantization and matmul,
-        bypassing PyTorch entirely for this operation.
-        """
+    def _matvec_native_gemv(self, layer_idx: int, name: str, x: torch.Tensor,
+                            use_draft: bool = False) -> torch.Tensor:
+        """AVX2 GEMV fast path for 4-bit, 8-bit, 3-bit, and 2-bit weights."""
+        key = (layer_idx, name)
+
+        if use_draft and key in self._draft_quant_u8:
+            u8_weights = self._draft_quant_u8[key].numpy()
+            sc = self._draft_quant_sc[key].float().numpy()
+            bi = self._draft_quant_bi[key].float().numpy()
+            rows, cols = self._quant_shapes[key]
+            bits = self._draft_bits
+        else:
+            u8_weights = self._quant_u8[key].numpy()
+            sc = self._quant_sc[key].float().numpy()
+            bi = self._quant_bi[key].float().numpy()
+            rows, cols = self._quant_shapes[key]
+            bits = self.bits
+
+        x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+
+        if bits == 4:
+            from asdsl.kernels import gemv_q4_unpacked
+            out_np = gemv_q4_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+        elif bits == 8:
+            from asdsl.kernels import gemv_q8_unpacked
+            out_np = gemv_q8_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+        elif bits == 3:
+            from asdsl.kernels import gemv_q3_unpacked
+            out_np = gemv_q3_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+        elif bits == 2:
+            from asdsl.kernels import gemv_q2_unpacked
+            out_np = gemv_q2_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+        else:
+            raise ValueError(f"No native kernel for {bits}-bit")
+
+        result = torch.from_numpy(out_np).unsqueeze(0)
+
+        # Apply outlier correction for low-bit quantization
+        outlier_store = (self._draft_outlier_values if use_draft else self._outlier_values)
+        coord_store = (self._draft_outlier_coords if use_draft else self._outlier_coords)
+        if key in outlier_store and len(outlier_store[key]) > 0:
+            ov = outlier_store[key].astype(np.float32)
+            oc = coord_store[key]
+            col_indices = oc[:, 1]
+            row_indices = oc[:, 0]
+            x_sel = x_np[col_indices]
+            contributions = ov * x_sel
+            out_corr = np.zeros(rows, dtype=np.float32)
+            np.add.at(out_corr, row_indices, contributions)
+            result = result + torch.from_numpy(out_corr).unsqueeze(0)
+
+        return result
+
+    def matvec_sparse(self, layer_idx: int, name: str, x: torch.Tensor,
+                      bitmask: np.ndarray, active_indices: np.ndarray) -> torch.Tensor:
+        """Activation-sparse GEMV: skip near-zero activation columns (Tier 3)."""
         key = (layer_idx, name)
         u8_weights = self._quant_u8[key].numpy()
         sc = self._quant_sc[key].float().numpy()
         bi = self._quant_bi[key].float().numpy()
         rows, cols = self._quant_shapes[key]
-        
-        # Ensure x is float32 contiguous numpy array
         x_np = x.detach().cpu().float().contiguous().numpy().ravel()
-        
-        if self.bits == 4:
-            from asdsl.kernels import gemv_q4_unpacked
-            out_np = gemv_q4_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
-        else:  # bits == 8
-            from asdsl.kernels import gemv_q8_unpacked
-            out_np = gemv_q8_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
-            
-        return torch.from_numpy(out_np).unsqueeze(0)
 
-    def matvec(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
+        try:
+            from asdsl.kernels import gemv_sparse_with_indices
+            out_np = gemv_sparse_with_indices(
+                u8_weights, x_np, sc, bi, active_indices, rows, cols, self.group_size
+            )
+        except ImportError:
+            from asdsl.kernels import gemv_sparse_unpacked
+            out_np = gemv_sparse_unpacked(
+                u8_weights, x_np, sc, bi, bitmask, rows, cols, self.group_size
+            )
+
+        result = torch.from_numpy(out_np).unsqueeze(0)
+
+        # Outlier correction
+        if key in self._outlier_values and len(self._outlier_values[key]) > 0:
+            ov = self._outlier_values[key].astype(np.float32)
+            oc = self._outlier_coords[key]
+            col_mask = np.isin(oc[:, 1], active_indices)
+            if col_mask.any():
+                ov_act = ov[col_mask]
+                oc_act = oc[col_mask]
+                x_sel = x_np[oc_act[:, 1]]
+                contributions = ov_act * x_sel
+                out_corr = np.zeros(rows, dtype=np.float32)
+                np.add.at(out_corr, oc_act[:, 0], contributions)
+                result = result + torch.from_numpy(out_corr).unsqueeze(0)
+
+        return result
+
+    def matvec(self, layer_idx: int, name: str, x: torch.Tensor,
+               use_draft: bool = False) -> torch.Tensor:
         """Bandwidth-efficient matrix-vector product: y = W @ x."""
-        if self.bits == 16:
+        if self.bits == 16 and not use_draft:
             return self._matvec_f16(layer_idx, name, x)
-        if self._use_native_gemv:
-            return self._matvec_native_gemv(layer_idx, name, x)
+        if self._use_native_gemv or use_draft:
+            return self._matvec_native_gemv(layer_idx, name, x, use_draft=use_draft)
         return self._matvec_quant(layer_idx, name, x)
 
     def lm_head_matvec(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -376,22 +493,29 @@ class WeightStore:
         """Prepare weight cache for streaming inference.
 
         bits=16: float16 weight cache is already populated from load().
-        bits≤8:  pre-unpack quantized weights to uint8 tensors with f16
+        bits<=8:  pre-unpack quantized weights to uint8 tensors with f16
                  scales/biases.  Keeps weights compressed - no f16 cache.
         """
         from asdsl.quantization.core import _unpack_bits
-        
+
         try:
-            from asdsl.kernels import has_native_kernel, has_native_q8_kernel
+            from asdsl.kernels import (
+                has_native_kernel, has_native_q8_kernel,
+                has_native_q3_kernel, has_native_q2_kernel,
+            )
             if self.bits == 4:
                 has_gemv = has_native_kernel()
             elif self.bits == 8:
                 has_gemv = has_native_q8_kernel()
+            elif self.bits == 3:
+                has_gemv = has_native_q3_kernel()
+            elif self.bits == 2:
+                has_gemv = has_native_q2_kernel()
             else:
                 has_gemv = False
         except ImportError:
             has_gemv = False
-            
+
         self._use_native_gemv = has_gemv
 
         total = NUM_LAYERS * 4
@@ -401,7 +525,8 @@ class WeightStore:
         else:
             done = 0
             qmax = (1 << self.bits) - 1
-            print(f"  Pre-unpacking {total} tensors to uint8 ... ", end="", flush=True)
+            label = "primary" if self._enable_qcsd else ""
+            print(f"  Pre-unpacking {total} {label} tensors to uint8 ... ", end="", flush=True)
 
             for i in range(NUM_LAYERS):
                 for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
@@ -410,12 +535,10 @@ class WeightStore:
                     key = (i, name)
                     self._quant_shapes[key] = (rows, cols)
 
-                    # Unpack to uint8 (1 byte per value vs 0.5 for 4-bit packed)
                     numel = rows * cols
                     unpacked = _unpack_bits(qt.data, qt.bits)[:numel]
                     self._quant_u8[key] = torch.from_numpy(unpacked.astype(np.uint8))
 
-                    # Compute per-group scales and biases (bias = -zero * scale)
                     n_groups = numel // qt.group_size
                     sc_f16 = torch.from_numpy(qt.scales[:n_groups].copy()).to(torch.float16)
                     if qt.is_symmetric:
@@ -427,21 +550,54 @@ class WeightStore:
                     self._quant_sc[key] = sc_f16
                     self._quant_bi[key] = bi_f16
 
+                    # QCSD: also pre-unpack draft bank
+                    if self._enable_qcsd and "_draft_" + name in self.layers.get(i, {}):
+                        qt_d = self.layers[i]["_draft_" + name]
+                        d_numel = rows * cols
+                        d_unpacked = _unpack_bits(qt_d.data, qt_d.bits)[:d_numel]
+                        self._draft_quant_u8[key] = torch.from_numpy(d_unpacked.astype(np.uint8))
+                        d_qmax = (1 << qt_d.bits) - 1
+                        d_n_groups = d_numel // qt_d.group_size
+                        d_sc = torch.from_numpy(qt_d.scales[:d_n_groups].copy()).to(torch.float16)
+                        if qt_d.is_symmetric:
+                            d_half = d_qmax / 2.0
+                            d_bi = (-d_half * d_sc.float()).half()
+                        else:
+                            d_zr = torch.from_numpy(qt_d.zeros[:d_n_groups].copy()).to(torch.float16)
+                            d_bi = (-d_zr.float() * d_sc.float()).half()
+                        self._draft_quant_sc[key] = d_sc
+                        self._draft_quant_bi[key] = d_bi
+
                     done += 1
-            self.layers.clear()           # free packed QuantizedTensor data
-            self._weight_cache.clear()    # ensure no stale f16 cache
+
+            # Clean up draft layer entries
+            for i in range(NUM_LAYERS):
+                if i in self.layers:
+                    for k in list(self.layers[i].keys()):
+                        if k.startswith("_draft_"):
+                            del self.layers[i][k]
+
+            self.layers.clear()
+            self._weight_cache.clear()
             u8_bytes = sum(t.nbytes for t in self._quant_u8.values())
             sc_bytes = sum(t.nbytes for t in self._quant_sc.values())
             bi_bytes = sum(t.nbytes for t in self._quant_bi.values())
-            
+
             total_mb = (u8_bytes + sc_bytes + bi_bytes) / 1e6
             print(f"done ({done}/{total}) | {total_mb:.0f} MB")
-            
+
+            if self._enable_qcsd:
+                d_bytes = sum(t.nbytes for t in self._draft_quant_u8.values())
+                print(f"  QCSD draft bank: {d_bytes / 1e6:.0f} MB ({self._draft_bits}-bit)")
+
+            n_outliers = sum(len(v) for v in self._outlier_values.values())
+            if n_outliers > 0:
+                print(f"  SpQR outliers: {n_outliers:,} values in FP16 sparse format")
+
+            kernel_labels = {4: "Q4", 8: "Q8", 3: "Q3", 2: "Q2"}
             if has_gemv:
-                if self.bits == 4:
-                    print(f"  Inference: native AVX2 GEMV Q4 kernel")
-                elif self.bits == 8:
-                    print(f"  Inference: native AVX2 GEMV Q8 kernel")
+                kl = kernel_labels.get(self.bits, f"Q{self.bits}")
+                print(f"  Inference: native AVX2 GEMV {kl} kernel")
             else:
                 print(f"  Inference: chunked uint8 dequant+matvec (in-place, no AVX GEMV)")
 
@@ -484,6 +640,17 @@ class KVHistory:
         """Return the most recently appended K/V as numpy (zero-copy view)."""
         n = self._len[layer] - 1
         return self.k_buf[layer][n].numpy(), self.v_buf[layer][n].numpy()
+
+    def snapshot(self) -> dict:
+        """Save a lightweight snapshot for QCSD draft rollback."""
+        return {
+            "lens": dict(self._len),
+        }
+
+    def restore(self, snap: dict) -> None:
+        """Restore KV cache lengths from a snapshot (zero-copy: data stays)."""
+        for i, n in snap["lens"].items():
+            self._len[i] = n
 
     @property
     def num_tokens(self) -> int:
@@ -540,19 +707,23 @@ def forward_layer(
     rope_cos: torch.Tensor,
     rope_sin: torch.Tensor,
     pos: int,
+    use_draft: bool = False,
 ) -> torch.Tensor:
     """Single Phi-4 transformer layer. Updates kv_hist with the new K/V.
 
     Uses chunked matvec (streaming dequant for quantized, chunked f16 read
     for float16) to minimise DRAM bandwidth.  KV history is pre-allocated
     torch tensors - no per-token np.stack / allocations.
+
+    Args:
+        use_draft: If True, use the draft (2-bit) weight bank for QCSD.
     """
 
     # - Self-attention -
     residual = hidden
     h = rms_norm(hidden, store.get_norm(layer_idx, "input_layernorm"))
 
-    qkv = store.matvec(layer_idx, "qkv_proj", h)           # (1, qkv_dim)
+    qkv = store.matvec(layer_idx, "qkv_proj", h, use_draft=use_draft)
 
     q = qkv[:, :Q_DIM].view(1, NUM_HEADS, HEAD_DIM)
     k = qkv[:, Q_DIM:Q_DIM + KV_DIM].view(1, NUM_KV_HEADS, HEAD_DIM)
@@ -563,14 +734,11 @@ def forward_layer(
     q = apply_rope(q, cos_pos, sin_pos)
     k = apply_rope(k, cos_pos, sin_pos)
 
-    # Append torch tensors directly (no numpy conversion)
     kv_hist.append(layer_idx, k.squeeze(0), v.squeeze(0))
 
-    # Retrieve views into pre-allocated buffers (zero-copy)
-    k_hist, v_hist = kv_hist.get(layer_idx)   # (seq, kv_heads, head_dim)
+    k_hist, v_hist = kv_hist.get(layer_idx)
     seq_len = k_hist.shape[0]
 
-    # GQA: expand KV heads  ->  (1, num_heads, seq, head_dim)
     expand = NUM_HEADS // NUM_KV_HEADS
     k_full = (k_hist.unsqueeze(2)
                     .expand(-1, -1, expand, -1)
@@ -583,22 +751,34 @@ def forward_layer(
                     .permute(1, 0, 2)
                     .unsqueeze(0))
 
-    q_attn = q.unsqueeze(2)   # (1, num_heads, 1, head_dim)
+    q_attn = q.unsqueeze(2)
     attn_out = torch.nn.functional.scaled_dot_product_attention(
         q_attn, k_full, v_full,
-    )  # (1, num_heads, 1, head_dim)
+    )
     attn_out = attn_out.permute(0, 2, 1, 3).reshape(1, Q_DIM)
 
-    hidden = residual + store.matvec(layer_idx, "o_proj", attn_out)
+    hidden = residual + store.matvec(layer_idx, "o_proj", attn_out, use_draft=use_draft)
 
-    # - Feed-forward -
+    # - Feed-forward (MLP) -
     residual = hidden
     h = rms_norm(hidden, store.get_norm(layer_idx, "post_attention_layernorm"))
 
-    gu = store.matvec(layer_idx, "gate_up_proj", h)         # (1, 2*inter)
-    h = silu(gu[:, :INTER]) * gu[:, INTER:]                 # (1, inter)
+    gu = store.matvec(layer_idx, "gate_up_proj", h, use_draft=use_draft)
+    act = silu(gu[:, :INTER]) * gu[:, INTER:]
 
-    hidden = residual + store.matvec(layer_idx, "down_proj", h)
+    # Tier 3: Activation-sparse GEMV for the down projection
+    if store._enable_sparse and not use_draft:
+        from asdsl.kernels import compute_activation_bitmask
+        act_np = act.detach().cpu().float().contiguous().numpy().ravel()
+        bitmask, active_indices = compute_activation_bitmask(
+            act_np, threshold=store._sparsity_threshold
+        )
+        hidden = residual + store.matvec_sparse(
+            layer_idx, "down_proj", act, bitmask, active_indices
+        )
+    else:
+        hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
+
     return hidden
 
 
@@ -838,6 +1018,202 @@ def generate_stream(
 
 
 # ---------------------------------------------------------------------------
+# QCSD: Quantization Cascade Speculative Decoding (Tier 2)
+# ---------------------------------------------------------------------------
+
+def generate_qcsd(
+    prompt: str,
+    store: WeightStore,
+    tokenizer,
+    max_new_tokens: int = 50,
+    system_prompt: str = "You are a helpful AI assistant.",
+    draft_k: int = 7,
+) -> str:
+    """Generate tokens using Quantization Cascade Speculative Decoding.
+
+    Uses the 2-bit draft bank to speculatively generate K tokens, then
+    verifies against the primary (4-bit) model. Accepted tokens are
+    produced at the throughput of batch verification.
+    """
+    print("\n" + "=" * 66)
+    print("ASDSL x Phi-4 - QCSD Speculative Decoding")
+    print("=" * 66)
+    print(f"Prompt : {prompt!r}")
+    print(f"Draft K: {draft_k} | Primary: {store.bits}-bit | Draft: {store._draft_bits}-bit")
+    print("-" * 66)
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+
+    max_seq = len(input_ids) + max_new_tokens + draft_k + 64
+    rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
+    kv_hist = KVHistory(max_seq=max_seq)
+    asdsl_tracker = ASDSLKVTracker()
+
+    def run_forward(token_id: int, pos: int, kv: KVHistory,
+                    need_logits: bool = True, use_draft: bool = False):
+        hidden = store.embed_f16[token_id].float().unsqueeze(0)
+        k_new, v_new = [], []
+        for i in range(NUM_LAYERS):
+            hidden = forward_layer(hidden, i, store, kv, rope_cos, rope_sin,
+                                   pos, use_draft=use_draft)
+            k_np, v_np = kv.get_last_np(i)
+            k_new.append(k_np)
+            v_new.append(v_np)
+        asdsl_tracker.record_token(k_new, v_new)
+        if not need_logits:
+            return None
+        hidden = rms_norm(hidden, store.final_norm)
+        return store.lm_head_matvec(hidden)
+
+    # Prefill with primary model
+    print("Prefill: ", end="", flush=True)
+    t_prefill_start = time.perf_counter()
+    with torch.inference_mode():
+        logits = None
+        for pos, tid in enumerate(input_ids):
+            is_last = (pos == len(input_ids) - 1)
+            logits = run_forward(tid, pos, kv_hist, need_logits=is_last, use_draft=False)
+    t_prefill = time.perf_counter() - t_prefill_start
+    print(f"done ({len(input_ids)} tokens in {t_prefill:.1f}s)")
+
+    # QCSD decode loop
+    print("\nAssistant: ", end="", flush=True)
+    generated: list[int] = []
+    total_draft = 0
+    total_accepted = 0
+    t_decode_start = time.perf_counter()
+
+    pos = len(input_ids)
+    with torch.inference_mode():
+        while len(generated) < max_new_tokens:
+            # Current token from previous logits
+            current_token = int(logits.argmax())
+
+            if current_token in EOS_TOKEN_IDS:
+                generated.append(current_token)
+                tok_text = tokenizer.convert_tokens_to_string(
+                    tokenizer.convert_ids_to_tokens([current_token])
+                )
+                print(tok_text, end="", flush=True)
+                break
+
+            # Snapshot KV cache before drafting
+            kv_snap = kv_hist.snapshot()
+            draft_start_pos = pos
+
+            # DRAFT PHASE: run 2-bit model autoregressively for K steps
+            draft_tokens = []
+            draft_logits_list = []
+            draft_token = current_token
+
+            for k_step in range(draft_k):
+                draft_logits = run_forward(
+                    draft_token, draft_start_pos + k_step, kv_hist,
+                    need_logits=True, use_draft=True,
+                )
+                next_draft = int(draft_logits.argmax())
+                draft_tokens.append(next_draft)
+                draft_logits_list.append(draft_logits)
+                draft_token = next_draft
+                if next_draft in EOS_TOKEN_IDS:
+                    break
+
+            total_draft += len(draft_tokens)
+
+            # Restore KV cache to pre-draft state
+            kv_hist.restore(kv_snap)
+
+            # VERIFY PHASE: run primary model on [current_token] + draft_tokens[:-1]
+            # to get reference logits for each position
+            verify_tokens = [current_token] + draft_tokens[:-1]
+            verify_logits = []
+            for vi, vtok in enumerate(verify_tokens):
+                vl = run_forward(
+                    vtok, draft_start_pos + vi, kv_hist,
+                    need_logits=True, use_draft=False,
+                )
+                verify_logits.append(vl)
+
+            # ACCEPT / REJECT
+            accepted = []
+            # First: the current_token itself is already committed
+            generated.append(current_token)
+            tok_text = tokenizer.convert_tokens_to_string(
+                tokenizer.convert_ids_to_tokens([current_token])
+            )
+            print(tok_text, end="", flush=True)
+            pos += 1
+
+            for k_idx in range(len(draft_tokens)):
+                ref_tok = int(verify_logits[k_idx].argmax())
+                if ref_tok == draft_tokens[k_idx]:
+                    accepted.append(draft_tokens[k_idx])
+                else:
+                    accepted.append(ref_tok)
+                    break
+
+            for tok in accepted:
+                generated.append(tok)
+                tok_text = tokenizer.convert_tokens_to_string(
+                    tokenizer.convert_ids_to_tokens([tok])
+                )
+                print(tok_text, end="", flush=True)
+                if tok in EOS_TOKEN_IDS:
+                    break
+
+            total_accepted += len(accepted)
+
+            # Run forward for any accepted tokens not yet in KV cache
+            # (verify already processed current_token and some draft tokens)
+            remaining_accepted = accepted[len(verify_logits) - 1:]
+            for ra_idx, ra_tok in enumerate(remaining_accepted):
+                run_forward(ra_tok, pos + ra_idx, kv_hist,
+                            need_logits=False, use_draft=False)
+
+            pos += len(accepted)
+
+            # Get logits for next cycle from the last accepted token
+            if accepted and accepted[-1] not in EOS_TOKEN_IDS:
+                logits = run_forward(accepted[-1], pos - 1, kv_hist,
+                                     need_logits=True, use_draft=False)
+                # Adjust: if we already computed logits in verify, reuse
+                if len(accepted) <= len(verify_logits):
+                    last_verify_idx = len(accepted) - 1
+                    if last_verify_idx < len(verify_logits):
+                        logits = verify_logits[last_verify_idx]
+            else:
+                break
+
+            if any(t in EOS_TOKEN_IDS for t in accepted):
+                break
+
+    t_decode = time.perf_counter() - t_decode_start
+    n_tokens = len(generated)
+    tps = n_tokens / t_decode if t_decode > 0 else 0
+    accept_rate = total_accepted / max(total_draft, 1)
+
+    response_text = tokenizer.convert_tokens_to_string(
+        tokenizer.convert_ids_to_tokens(generated)
+    )
+
+    kv_stats = asdsl_tracker.stats()
+    print(f"\n\nGenerated : {n_tokens} tokens  |  {tps:.2f} tok/s  |  decode {t_decode:.1f}s")
+    print(f"QCSD      : acceptance rate {accept_rate:.1%}  |  "
+          f"drafted {total_draft} / accepted {total_accepted}")
+    print(f"ASDSL KV  : {kv_stats['tokens']} tokens tracked  "
+          f"| {kv_stats['blocks_used']}/{kv_stats['blocks_capacity']} blocks")
+    print("=" * 66)
+
+    return response_text
+
+
+# ---------------------------------------------------------------------------
 # Interactive chat session
 # ---------------------------------------------------------------------------
 
@@ -956,17 +1332,28 @@ def main() -> None:
                         help="Weight precision: 16=float16 (best quality, default), "
                              "8/4/3/2=ASDSL N-bit quantization (demo, lower quality)")
     parser.add_argument("--group-size", type=int, default=0,
-                        help="Quantization group size (0=auto: 32 for ≤4-bit, 128 for 8-bit)")
+                        help="Quantization group size (0=auto: 32 for <=4-bit, 128 for 8-bit)")
     parser.add_argument("--threads", type=int, default=0,
-                        help="CPU threads for BLAS/OMP (0=auto: all cores)")
+                        help="CPU threads for BLAS/OMP (0=auto: P-cores on Intel i7 Evo)")
     parser.add_argument("--stream", action="store_true",
                         help="Use streaming output (yield tokens as generated)")
+    parser.add_argument("--qcsd", action="store_true",
+                        help="Enable QCSD speculative decoding (Tier 2)")
+    parser.add_argument("--draft-bits", type=int, default=2,
+                        help="Bit-width for the QCSD draft model (default: 2)")
+    parser.add_argument("--draft-k", type=int, default=7,
+                        help="Number of draft tokens per QCSD cycle (default: 7)")
+    parser.add_argument("--sparse", action="store_true",
+                        help="Enable activation-sparse GEMV (Tier 3)")
+    parser.add_argument("--sparse-threshold", type=float, default=0.01,
+                        help="Activation sparsity threshold (default: 0.01)")
     args = parser.parse_args()
 
-    # Thread control - use all cores by default for memory-bound inference
+    # Intel i7 Evo optimal threading: use P-cores by default (8 threads)
+    if args.threads == 0:
+        args.threads = 8
     set_thread_count(args.threads)
 
-    # Verify model is present
     if not INDEX_FILE.exists():
         print("ERROR: Model index not found at", INDEX_FILE)
         print("Run the download step first: python experiments/phi4_integration.py")
@@ -975,8 +1362,8 @@ def main() -> None:
     print("=" * 66)
     print("ASDSL Phi-4 CPU Inference Setup")
     print("=" * 66)
+    print(f"  Hardware: Intel Core i7 Evo | CPU-only | threads={args.threads}")
 
-    # ── Tokenizer ──────────────────────────────────────────────────────────
     print("Loading tokenizer ...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(
         "microsoft/Phi-4-multimodal-instruct",
@@ -984,14 +1371,26 @@ def main() -> None:
     )
     print(f"  Vocabulary size: {tokenizer.vocab_size:,}")
 
-    # ── Weights ────────────────────────────────────────────────────────────
     if args.bits == 16:
         print(f"Loading weights as float16 (no quantization) ...")
     else:
-        print(f"\nLoading weights (ASDSL {args.bits}-bit quantization) ...")
+        features = []
+        if args.qcsd:
+            features.append(f"QCSD draft={args.draft_bits}-bit K={args.draft_k}")
+        if args.sparse:
+            features.append(f"sparse-GEMV threshold={args.sparse_threshold}")
+        feat_str = f" [{', '.join(features)}]" if features else ""
+        print(f"\nLoading weights (ASDSL {args.bits}-bit quantization){feat_str} ...")
+
     t0 = time.perf_counter()
-    store = WeightStore(bits=args.bits,
-                        group_size=args.group_size if args.group_size > 0 else None)
+    store = WeightStore(
+        bits=args.bits,
+        group_size=args.group_size if args.group_size > 0 else None,
+        enable_qcsd=args.qcsd,
+        draft_bits=args.draft_bits,
+        enable_sparse=args.sparse,
+        sparsity_threshold=args.sparse_threshold,
+    )
     store.load()
     t_load = time.perf_counter() - t0
     verb = "Load" if args.bits == 16 else "Load + quantize"
@@ -1008,15 +1407,25 @@ def main() -> None:
         bi_mb = sum(t.nbytes for t in store._quant_bi.values()) / 1e6
         embed_mb = store.embed_f16.nbytes / 1e6
         total_mb = u8_mb + sc_mb + bi_mb + embed_mb
+        if args.qcsd:
+            d_mb = sum(t.nbytes for t in store._draft_quant_u8.values()) / 1e6
+            total_mb += d_mb
         print(f"  Memory: uint8 weights ({u8_mb:.0f} MB) + scales/biases ({sc_mb + bi_mb:.0f} MB)"
               f" + embed_f16 ({embed_mb:.0f} MB) ~= {total_mb / 1e3:.1f} GB")
 
-    # ── Chat, streaming, or single-turn generate ──────────────────────────
     if args.chat:
         chat(
             store=store,
             tokenizer=tokenizer,
             max_new_tokens=args.max_new_tokens,
+        )
+    elif args.qcsd:
+        generate_qcsd(
+            prompt=args.prompt,
+            store=store,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            draft_k=args.draft_k,
         )
     elif args.stream:
         print("\nAssistant (streaming): ", end="", flush=True)

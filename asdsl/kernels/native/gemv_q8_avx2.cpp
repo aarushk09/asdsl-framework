@@ -169,7 +169,7 @@ static bool has_avx2() {
 #elif defined(__GNUC__) || defined(__clang__)
     unsigned int eax, ebx, ecx, edx;
     if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
-    return (ebx & bit_AVX2) != 0;
+    return (ebx & (1 << 5)) != 0;
 #else
     return false;
 #endif

@@ -409,6 +409,81 @@ def _unpack_bits(packed: np.ndarray, bits: int) -> np.ndarray:
     raise ValueError(f"Unsupported bit-width: {bits}")
 
 
+def quantize_weights_with_outliers(
+    weights: np.ndarray,
+    bits: int,
+    group_size: int,
+    outlier_threshold_sigma: float = 3.5,
+    outlier_fraction_cap: float = 0.005,
+    symmetric: bool = False,
+    optimize_clips: bool = True,
+) -> tuple["QuantizedTensor", np.ndarray, np.ndarray]:
+    """Quantize weights with SpQR-style outlier separation.
+
+    Detects weight outliers (values beyond threshold_sigma standard deviations)
+    and stores them separately in FP16 sparse format. The cleaned residual is
+    then quantized normally to the target bit-width.
+
+    This is critical for 2-bit and 3-bit quantization: without outlier
+    separation, a handful of extreme weights force the scale factor to be
+    enormous, wasting nearly all precision for the remaining 99.5% of weights.
+
+    Returns:
+        qtensor:        QuantizedTensor of the cleaned residual
+        outlier_values: float16 array of outlier weight values
+        outlier_coords: int32 array of (row, col) coordinates, shape (N, 2)
+    """
+    if isinstance(weights, torch.Tensor):
+        weights = weights.detach().cpu().float().numpy()
+    weights = weights.astype(np.float32)
+    original_shape = weights.shape
+
+    W_flat = weights.reshape(-1, group_size)
+    group_std = W_flat.std(axis=1, keepdims=True)
+    group_mean = W_flat.mean(axis=1, keepdims=True)
+
+    # Avoid division by zero for constant groups
+    group_std = np.maximum(group_std, 1e-10)
+
+    outlier_mask = np.abs(W_flat - group_mean) > (outlier_threshold_sigma * group_std)
+
+    n_outliers = outlier_mask.sum()
+    total_elements = weights.size
+
+    if n_outliers / total_elements > outlier_fraction_cap:
+        abs_dev = np.abs(W_flat - group_mean)
+        n_keep = int(total_elements * outlier_fraction_cap)
+        if n_keep > 0:
+            threshold_val = np.partition(abs_dev.ravel(), -n_keep)[-n_keep]
+            outlier_mask = abs_dev >= threshold_val
+        else:
+            outlier_mask = np.zeros_like(outlier_mask)
+
+    # Reshape mask back to original weight shape
+    outlier_mask_orig = outlier_mask.reshape(original_shape)
+
+    # Extract outlier coordinates and values
+    outlier_coords = np.argwhere(outlier_mask_orig).astype(np.int32)
+    if len(outlier_coords) > 0:
+        outlier_values = weights[outlier_coords[:, 0], outlier_coords[:, 1]].astype(np.float16)
+    else:
+        outlier_values = np.array([], dtype=np.float16)
+        outlier_coords = np.zeros((0, 2), dtype=np.int32)
+
+    # Zero out outliers in residual
+    W_residual = weights.copy()
+    if len(outlier_coords) > 0:
+        W_residual[outlier_coords[:, 0], outlier_coords[:, 1]] = 0.0
+
+    # Quantize the cleaned residual
+    qtensor = quantize_weights(
+        W_residual, bits=bits, group_size=group_size,
+        symmetric=symmetric, optimize_clips=optimize_clips,
+    )
+
+    return qtensor, outlier_values, outlier_coords
+
+
 def compute_quantization_error(
     original: torch.Tensor | np.ndarray,
     qtensor: QuantizedTensor,

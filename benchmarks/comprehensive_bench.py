@@ -21,18 +21,19 @@ import time
 from pathlib import Path
 
 # Thread control BEFORE importing numpy/torch
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
-os.environ["OPENBLAS_NUM_THREADS"] = "4"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
-os.environ["NUMEXPR_NUM_THREADS"] = "4"
+# Intel i7 Evo: default to 8 threads (P-cores), prefer MKL
+os.environ["OMP_NUM_THREADS"] = "8"
+os.environ["MKL_NUM_THREADS"] = "8"
+os.environ["OPENBLAS_NUM_THREADS"] = "8"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "8"
+os.environ["NUMEXPR_NUM_THREADS"] = "8"
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_JAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 import numpy as np
 import torch
-torch.set_num_threads(4)
+torch.set_num_threads(8)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -358,20 +359,23 @@ def generate_charts(all_results, output_dir):
 # ---------------------------------------------------------------------------
 
 def run_benchmark(bits: int, tokenizer, wikitext_tokens, max_tokens: int,
-                  skip_perplexity: bool = False) -> dict:
+                  skip_perplexity: bool = False,
+                  enable_sparse: bool = False) -> dict:
     """Run full benchmark for a single bit-width configuration."""
     print(f"\n{'='*66}")
-    print(f"  Benchmarking: {'FP16 baseline' if bits == 16 else f'ASDSL {bits}-bit'}")
+    label = 'FP16 baseline' if bits == 16 else f'ASDSL {bits}-bit'
+    if enable_sparse and bits != 16:
+        label += ' + sparse-GEMV'
+    print(f"  Benchmarking: {label}")
     print(f"{'='*66}")
 
     gc.collect()
     ram_baseline = get_ram_mb()
     print(f"  RAM baseline: {ram_baseline:.0f} MB")
 
-    # Load model
     print(f"  Loading model (bits={bits}) ...")
     t0 = time.perf_counter()
-    store = WeightStore(bits=bits)
+    store = WeightStore(bits=bits, enable_sparse=enable_sparse)
     store.load()
     ram_after_load = get_ram_mb()
     store.warm_cache()
@@ -451,14 +455,17 @@ def main():
     parser = argparse.ArgumentParser(description="ASDSL Comprehensive Benchmark")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--bits", type=int, nargs="*", default=None,
-                        help="Bit-widths to test (default: 16 8 4 3)")
+                        help="Bit-widths to test (default: 16 8 4 3 2)")
     parser.add_argument("--skip-perplexity", action="store_true")
-    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--threads", type=int, default=8,
+                        help="CPU threads (default: 8 for Intel i7 Evo P-cores)")
+    parser.add_argument("--sparse", action="store_true",
+                        help="Enable activation-sparse GEMV (Tier 3)")
     args = parser.parse_args()
 
     set_thread_count(args.threads)
 
-    bits_list = args.bits or [16, 8, 4, 3]
+    bits_list = args.bits or [16, 8, 4, 3, 2]
 
     print("=" * 66)
     print("  ASDSL Framework - Comprehensive Benchmark Suite")
@@ -489,7 +496,8 @@ def main():
     all_results = []
     for bits in bits_list:
         result = run_benchmark(bits, tokenizer, wikitext_tokens, args.max_tokens,
-                               skip_perplexity=args.skip_perplexity)
+                               skip_perplexity=args.skip_perplexity,
+                               enable_sparse=args.sparse)
         snr = snr_results.get(bits, {})
         result["snr_db"] = snr.get("snr_db", 0)
         result["compression_ratio"] = snr.get("compression_ratio", 1.0)
