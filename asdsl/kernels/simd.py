@@ -3,6 +3,9 @@
 Provides Python bindings to the platform-specific SIMD kernels
 (AVX2 VPSHUFB, AVX-512 VNNI, ARM NEON TBL) used by the LUT engine.
 Falls back to numpy for platforms without compiled kernels.
+
+The fused 4-bit GEMV kernel (gemv_q4) is available via the sibling
+module ``asdsl.kernels.gemv_q4`` and re-exported from ``asdsl.kernels``.
 """
 
 from __future__ import annotations
@@ -28,10 +31,21 @@ class KernelBackend(IntEnum):
     VNNI = 3     # x86 AVX-512 VNNI (INT8 acceleration)
     AMX = 4      # Intel AMX (tile-based matrix ops)
     NEON = 5     # ARM NEON + TBL
+    AVX2_NATIVE = 10  # Compiled AVX2+FMA C++ kernels (gemv_q4)
 
 
 def select_backend() -> KernelBackend:
-    """Auto-detect and select the best available kernel backend."""
+    """Auto-detect and select the best available kernel backend.
+
+    Prefers the compiled native AVX2 GEMV kernel when available,
+    falling back through the feature hierarchy.
+    """
+    from asdsl.kernels.gemv_q4 import has_native_kernel
+
+    if has_native_kernel():
+        logger.info("Selected kernel backend: AVX2 Native (compiled C++)")
+        return KernelBackend.AVX2_NATIVE
+
     features = detect_cpu_features()
 
     if CPUFeature.AVX512_VNNI in features:

@@ -108,3 +108,115 @@ class TestWeightPermutation:
         valid = perm[perm >= 0]
         # All original indices should appear
         assert len(np.unique(valid)) == 256  # 16*16
+
+
+class TestNativeLUT:
+    """Tests for the native AVX2 LUT builder + matvec."""
+
+    @pytest.fixture(autouse=True)
+    def _check_native(self):
+        """Skip all native tests if the C++ extension isn't compiled."""
+        from asdsl.lut.lut_native import has_native_lut
+        if not has_native_lut():
+            pytest.skip("Native LUT extension not compiled")
+
+    def _build_test_data(self, output_size, input_size, bits, group_size, group_width):
+        """Helper to create quantised weights, activation, and scales."""
+        np.random.seed(42)
+        weights = np.random.randn(output_size, input_size).astype(np.float32)
+        from asdsl.quantization.core import quantize_weights, _unpack_bits
+        qt = quantize_weights(weights, bits=bits, group_size=group_size)
+        x = np.random.randn(input_size).astype(np.float32)
+        unpacked = _unpack_bits(qt.data, bits)
+        return qt, x, unpacked
+
+    def test_native_build_matches_python_2bit_gw2(self):
+        """Native 2-bit, group_width=2 table build matches Python."""
+        from asdsl.lut.engine import build_lut_tables_for_layer
+        from asdsl.lut.lut_native import build_lut_tables_native
+        from asdsl.quantization.core import _unpack_bits
+
+        out, inp, bits, gs, gw = 16, 16, 2, 8, 2
+        qt, x, unpacked = self._build_test_data(out, inp, bits, gs, gw)
+
+        py_tables = build_lut_tables_for_layer(
+            qt.data, qt.scales, x, bits, gs, group_width=gw,
+        )
+        native_flat = build_lut_tables_native(
+            unpacked[:out * inp], x,
+            np.asarray(qt.scales, dtype=np.float32),
+            bits, gw, out, inp, gs,
+        )
+
+        # Compare each table entry
+        py_flat = np.concatenate([t.table for t in py_tables])
+        np.testing.assert_allclose(native_flat, py_flat, atol=1e-4)
+
+    def test_native_build_matches_python_4bit_gw2(self):
+        """Native 4-bit, group_width=2 table build matches Python."""
+        from asdsl.lut.engine import build_lut_tables_for_layer
+        from asdsl.lut.lut_native import build_lut_tables_native
+        from asdsl.quantization.core import _unpack_bits
+
+        out, inp, bits, gs, gw = 16, 32, 4, 16, 2
+        qt, x, unpacked = self._build_test_data(out, inp, bits, gs, gw)
+
+        py_tables = build_lut_tables_for_layer(
+            qt.data, qt.scales, x, bits, gs, group_width=gw,
+        )
+        native_flat = build_lut_tables_native(
+            unpacked[:out * inp], x,
+            np.asarray(qt.scales, dtype=np.float32),
+            bits, gw, out, inp, gs,
+        )
+
+        py_flat = np.concatenate([t.table for t in py_tables])
+        np.testing.assert_allclose(native_flat, py_flat, atol=1e-4)
+
+    def test_native_matvec_matches_python(self):
+        """Native matvec output matches Python reference."""
+        from asdsl.lut.engine import build_lut_tables_for_layer, lut_matvec
+        from asdsl.lut.lut_native import build_lut_tables_native, lut_matvec_native
+        from asdsl.quantization.core import _unpack_bits
+
+        out, inp, bits, gs, gw = 32, 32, 2, 8, 2
+        qt, x, unpacked = self._build_test_data(out, inp, bits, gs, gw)
+
+        py_tables = build_lut_tables_for_layer(
+            qt.data, qt.scales, x, bits, gs, group_width=gw,
+        )
+        py_result = lut_matvec(py_tables, qt.data, bits, out, inp)
+
+        native_flat = build_lut_tables_native(
+            unpacked[:out * inp], x,
+            np.asarray(qt.scales, dtype=np.float32),
+            bits, gw, out, inp, gs,
+        )
+        native_result = lut_matvec_native(
+            native_flat, unpacked[:out * inp], bits, gw, out, inp,
+        )
+
+        np.testing.assert_allclose(native_result, py_result, atol=1e-3)
+
+    def test_native_matvec_4bit(self):
+        """Native 4-bit matvec produces correct output shape and values."""
+        from asdsl.lut.lut_native import build_lut_tables_native, lut_matvec_native
+        from asdsl.quantization.core import _unpack_bits
+
+        out, inp, bits, gs, gw = 16, 32, 4, 16, 2
+        qt, x, unpacked = self._build_test_data(out, inp, bits, gs, gw)
+
+        native_flat = build_lut_tables_native(
+            unpacked[:out * inp], x,
+            np.asarray(qt.scales, dtype=np.float32),
+            bits, gw, out, inp, gs,
+        )
+        result = lut_matvec_native(
+            native_flat, unpacked[:out * inp], bits, gw, out, inp,
+        )
+
+        assert result.shape == (out,)
+        assert result.dtype == np.float32
+        # Should not be all zeros (sanity check)
+        assert np.any(result != 0.0)
+

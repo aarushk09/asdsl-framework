@@ -174,6 +174,9 @@ class WeightStore:
         self._quant_sc: dict[tuple, torch.Tensor] = {}    # (layer, name) -> float16 scales (n_groups,)
         self._quant_bi: dict[tuple, torch.Tensor] = {}    # (layer, name) -> float16 biases (n_groups,)
         self._quant_shapes: dict[tuple, tuple] = {}       # (layer, name) -> (rows, cols)
+        
+        # Native LUT/GEMV fast path
+        self._use_native_gemv = False
 
     # ------------------------------------------------------------------
     def load(self) -> None:
@@ -322,10 +325,36 @@ class WeightStore:
             torch.mv(vals.view(n, cols), x_flat, out=result[start:end])
         return result.unsqueeze(0)
 
+    def _matvec_native_gemv(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
+        """AVX2 GEMV fast path for 4-bit and 8-bit weights.
+        
+        Uses the C++ extensions to do on-the-fly dequantization and matmul,
+        bypassing PyTorch entirely for this operation.
+        """
+        key = (layer_idx, name)
+        u8_weights = self._quant_u8[key].numpy()
+        sc = self._quant_sc[key].float().numpy()
+        bi = self._quant_bi[key].float().numpy()
+        rows, cols = self._quant_shapes[key]
+        
+        # Ensure x is float32 contiguous numpy array
+        x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+        
+        if self.bits == 4:
+            from asdsl.kernels import gemv_q4_unpacked
+            out_np = gemv_q4_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+        else:  # bits == 8
+            from asdsl.kernels import gemv_q8_unpacked
+            out_np = gemv_q8_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+            
+        return torch.from_numpy(out_np).unsqueeze(0)
+
     def matvec(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
         """Bandwidth-efficient matrix-vector product: y = W @ x."""
         if self.bits == 16:
             return self._matvec_f16(layer_idx, name, x)
+        if self._use_native_gemv:
+            return self._matvec_native_gemv(layer_idx, name, x)
         return self._matvec_quant(layer_idx, name, x)
 
     def lm_head_matvec(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -351,6 +380,20 @@ class WeightStore:
                  scales/biases.  Keeps weights compressed - no f16 cache.
         """
         from asdsl.quantization.core import _unpack_bits
+        
+        try:
+            from asdsl.kernels import has_native_kernel, has_native_q8_kernel
+            if self.bits == 4:
+                has_gemv = has_native_kernel()
+            elif self.bits == 8:
+                has_gemv = has_native_q8_kernel()
+            else:
+                has_gemv = False
+        except ImportError:
+            has_gemv = False
+            
+        self._use_native_gemv = has_gemv
+
         total = NUM_LAYERS * 4
         if self.bits == 16:
             print(f"  Float16 weight cache already populated ({total} tensors)")
@@ -359,6 +402,7 @@ class WeightStore:
             done = 0
             qmax = (1 << self.bits) - 1
             print(f"  Pre-unpacking {total} tensors to uint8 ... ", end="", flush=True)
+
             for i in range(NUM_LAYERS):
                 for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
                     qt = self.layers[i][name]
@@ -389,9 +433,17 @@ class WeightStore:
             u8_bytes = sum(t.nbytes for t in self._quant_u8.values())
             sc_bytes = sum(t.nbytes for t in self._quant_sc.values())
             bi_bytes = sum(t.nbytes for t in self._quant_bi.values())
+            
             total_mb = (u8_bytes + sc_bytes + bi_bytes) / 1e6
             print(f"done ({done}/{total}) | {total_mb:.0f} MB")
-            print(f"  Inference: chunked uint8 dequant+matvec (in-place, no f16 cache)")
+            
+            if has_gemv:
+                if self.bits == 4:
+                    print(f"  Inference: native AVX2 GEMV Q4 kernel")
+                elif self.bits == 8:
+                    print(f"  Inference: native AVX2 GEMV Q8 kernel")
+            else:
+                print(f"  Inference: chunked uint8 dequant+matvec (in-place, no AVX GEMV)")
 
     def get_norm(self, layer_idx: int, name: str) -> torch.Tensor:
         return self.layer_norms[layer_idx][name]
@@ -675,6 +727,117 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
+# Streaming generation
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass
+
+@dataclass
+class StreamToken:
+    """A single streamed token with metadata.
+
+    Attributes:
+        text: The decoded text fragment for this token.
+        token_id: The integer token ID.
+        step: Zero-based step index within the decode phase.
+        is_eos: True if this token is an end-of-sequence marker.
+        elapsed_s: Seconds elapsed since decode started (for this token).
+        tokens_per_second: Running average tok/s up to this point.
+    """
+    text: str
+    token_id: int
+    step: int
+    is_eos: bool = False
+    elapsed_s: float = 0.0
+    tokens_per_second: float = 0.0
+
+
+def generate_stream(
+    prompt: str,
+    store: WeightStore,
+    tokenizer,
+    max_new_tokens: int = 50,
+    system_prompt: str = "You are a helpful AI assistant.",
+):
+    """Generator that yields StreamToken objects as they are decoded.
+
+    Usage::
+
+        for tok in generate_stream("Hello!", store, tokenizer):
+            print(tok.text, end="", flush=True)
+            if tok.is_eos:
+                break
+
+    The generator handles prefill internally before yielding any tokens.
+    After the final token (EOS or max_new_tokens), it yields one last
+    StreamToken with ``is_eos=True``.
+    """
+    # Format prompt
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+
+    max_seq = len(input_ids) + max_new_tokens + 64
+    rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
+    kv_hist = KVHistory(max_seq=max_seq)
+    asdsl_tracker = ASDSLKVTracker()
+
+    def run_forward(token_id: int, pos: int, need_logits: bool = True):
+        hidden = store.embed_f16[token_id].float().unsqueeze(0)
+        k_new, v_new = [], []
+        for i in range(NUM_LAYERS):
+            hidden = forward_layer(hidden, i, store, kv_hist, rope_cos, rope_sin, pos)
+            k_np, v_np = kv_hist.get_last_np(i)
+            k_new.append(k_np)
+            v_new.append(v_np)
+        asdsl_tracker.record_token(k_new, v_new)
+        if not need_logits:
+            return None
+        hidden = rms_norm(hidden, store.final_norm)
+        return store.lm_head_matvec(hidden)
+
+    # Prefill
+    with torch.inference_mode():
+        logits = None
+        for pos, tid in enumerate(input_ids):
+            is_last = (pos == len(input_ids) - 1)
+            logits = run_forward(tid, pos, need_logits=is_last)
+
+    # Decode — yield each token as it's produced
+    pos = len(input_ids)
+    t_decode_start = time.perf_counter()
+
+    with torch.inference_mode():
+        for step in range(max_new_tokens):
+            next_token = int(logits.argmax())
+            tok_text = tokenizer.convert_tokens_to_string(
+                tokenizer.convert_ids_to_tokens([next_token])
+            )
+            elapsed = time.perf_counter() - t_decode_start
+            tps = (step + 1) / elapsed if elapsed > 0 else 0.0
+            is_eos = next_token in EOS_TOKEN_IDS
+
+            yield StreamToken(
+                text=tok_text,
+                token_id=next_token,
+                step=step,
+                is_eos=is_eos,
+                elapsed_s=elapsed,
+                tokens_per_second=tps,
+            )
+
+            if is_eos:
+                return
+
+            logits = run_forward(next_token, pos)
+            pos += 1
+
+
+# ---------------------------------------------------------------------------
 # Interactive chat session
 # ---------------------------------------------------------------------------
 
@@ -796,6 +959,8 @@ def main() -> None:
                         help="Quantization group size (0=auto: 32 for ≤4-bit, 128 for 8-bit)")
     parser.add_argument("--threads", type=int, default=0,
                         help="CPU threads for BLAS/OMP (0=auto: all cores)")
+    parser.add_argument("--stream", action="store_true",
+                        help="Use streaming output (yield tokens as generated)")
     args = parser.parse_args()
 
     # Thread control - use all cores by default for memory-bound inference
@@ -846,13 +1011,23 @@ def main() -> None:
         print(f"  Memory: uint8 weights ({u8_mb:.0f} MB) + scales/biases ({sc_mb + bi_mb:.0f} MB)"
               f" + embed_f16 ({embed_mb:.0f} MB) ~= {total_mb / 1e3:.1f} GB")
 
-    # ── Chat or single-turn generate ───────────────────────────────────────
+    # ── Chat, streaming, or single-turn generate ──────────────────────────
     if args.chat:
         chat(
             store=store,
             tokenizer=tokenizer,
             max_new_tokens=args.max_new_tokens,
         )
+    elif args.stream:
+        print("\nAssistant (streaming): ", end="", flush=True)
+        for tok in generate_stream(
+            prompt=args.prompt,
+            store=store,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+        ):
+            print(tok.text, end="", flush=True)
+        print(f"\n  [{tok.step + 1} tokens | {tok.tokens_per_second:.2f} tok/s]")
     else:
         generate(
             prompt=args.prompt,

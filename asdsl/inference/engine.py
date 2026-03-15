@@ -62,6 +62,24 @@ class GenerationResult:
         return len(self.token_ids)
 
 
+@dataclass
+class StreamToken:
+    """A single streamed token yielded by generate_stream().
+
+    Attributes:
+        token_id: The integer token ID.
+        step: Zero-based step index within the decode phase.
+        is_eos: True if this token is an end-of-sequence marker.
+        elapsed_s: Seconds elapsed since decode started.
+        tokens_per_second: Running average tok/s up to this point.
+    """
+    token_id: int
+    step: int
+    is_eos: bool = False
+    elapsed_s: float = 0.0
+    tokens_per_second: float = 0.0
+
+
 class TransformerLayerExecutor:
     """Executes individual transformer layers using LUT-based computation.
 
@@ -366,6 +384,56 @@ class ASDSLEngine:
         )
 
         return result
+
+    def generate_stream(
+        self,
+        input_ids: list[int],
+        max_new_tokens: int = 256,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ):
+        """Generator that yields StreamToken objects as tokens are decoded.
+
+        Usage::
+
+            engine.setup()
+            for tok in engine.generate_stream(input_ids):
+                print(tok.text, end="", flush=True)
+
+        Args:
+            input_ids: Input prompt token IDs.
+            max_new_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+            top_k: Top-k sampling parameter.
+
+        Yields:
+            StreamToken with token_id, step index, timing, and EOS flag.
+        """
+        if not self._is_initialized:
+            raise RuntimeError("Engine not initialized. Call setup() first.")
+
+        # Phase 1: Prefill
+        hidden_state = self._prefill(input_ids)
+
+        # Phase 2: Streaming decode
+        decode_start = time.perf_counter()
+
+        for step in range(max_new_tokens):
+            logits = self._forward_all_layers(hidden_state)
+            token_id = self._sample(logits, temperature, top_k)
+
+            elapsed = time.perf_counter() - decode_start
+            tps = (step + 1) / elapsed if elapsed > 0 else 0.0
+
+            yield StreamToken(
+                token_id=token_id,
+                step=step,
+                is_eos=False,  # Caller decides EOS based on their stop tokens
+                elapsed_s=elapsed,
+                tokens_per_second=tps,
+            )
+
+            hidden_state = self._step_hidden_state(hidden_state)
 
     def shutdown(self) -> None:
         """Shut down all subsystems and release resources."""

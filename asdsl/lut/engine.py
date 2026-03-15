@@ -132,8 +132,13 @@ def build_lut_tables_for_layer(
     bits: int,
     group_size: int,
     group_width: int = 4,
+    output_size: int | None = None,
+    input_size: int | None = None,
 ) -> list[LookupTable]:
     """Build all LUT tables needed for a single layer's weight matrix.
+
+    When the native AVX2 extension is available and output_size/input_size
+    are provided, this dispatches to the compiled C++ kernel.
 
     Args:
         packed_weights: Packed quantized weights (uint8 array).
@@ -142,6 +147,8 @@ def build_lut_tables_for_layer(
         bits: Bit-width.
         group_size: Elements per quantization group (for scale lookup).
         group_width: Elements per LUT entry.
+        output_size: Number of output features (rows). Optional.
+        input_size: Number of input features (columns). Optional.
 
     Returns:
         List of LookupTable objects covering the entire weight matrix.
@@ -149,6 +156,37 @@ def build_lut_tables_for_layer(
     from asdsl.quantization.core import _unpack_bits
 
     unpacked = _unpack_bits(packed_weights, bits)
+
+    # Try native path when shape info is available
+    if output_size is not None and input_size is not None:
+        try:
+            from asdsl.lut.lut_native import has_native_lut, build_lut_tables_native
+            if has_native_lut():
+                flat_tables = build_lut_tables_native(
+                    unpacked, activation,
+                    np.asarray(scales, dtype=np.float32),
+                    bits, group_width,
+                    output_size, input_size, group_size,
+                )
+                # Wrap flat result into LookupTable objects for API compat
+                num_values = 1 << bits
+                entries_per_table = num_values ** group_width
+                lut_groups_per_row = input_size // group_width
+                total_tables = output_size * lut_groups_per_row
+                table_list = []
+                for t in range(total_tables):
+                    start = t * entries_per_table
+                    end = start + entries_per_table
+                    table_list.append(LookupTable(
+                        table=flat_tables[start:end],
+                        bits=bits,
+                        group_width=group_width,
+                        scale=0.0,  # baked into table entries
+                    ))
+                return table_list
+        except Exception:
+            pass  # Fall through to Python path
+
     tables = []
 
     # Process in LUT groups of group_width elements
@@ -229,6 +267,23 @@ def lut_matvec(
         return output
 
     group_width = tables[0].group_width
+
+    # Try native AVX2 matvec
+    try:
+        from asdsl.lut.lut_native import has_native_lut, lut_matvec_native
+        if has_native_lut():
+            num_values = 1 << bits
+            entries_per_table = num_values ** group_width
+            # Reconstruct flat table array
+            flat_tables = np.concatenate(
+                [t.table for t in tables]
+            ).astype(np.float32)
+            return lut_matvec_native(
+                flat_tables, unpacked,
+                bits, group_width, output_size, input_size,
+            )
+    except Exception:
+        pass  # Fall through to Python path
 
     # Process each output row
     for row in range(output_size):

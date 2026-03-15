@@ -31,8 +31,8 @@ def bench_lut_build(
     backend would process each LUT group in a handful of vector instructions
     rather than a Python for-loop, giving ~100-1000x speedup.
     """
-    print("=" * 72)
-    print("LUT Table Build Benchmark  [Python reference — see note below]")
+    print("="* 72)
+    print("LUT Table Build Benchmark")
     print("=" * 72)
 
     weights = np.random.randn(*shape).astype(np.float32)
@@ -54,7 +54,29 @@ def bench_lut_build(
     print(f"Shape: {shape}, Bits: {bits}, group_width: {group_width}")
     print(f"Tables built: {num_tables}  ({entries_per_table} entries each)")
     print(f"Build time (Python): {median_ms:.2f} ms")
-    print(f"NOTE: Native AVX2 would be ~100-500x faster for this step.")
+
+    # Native AVX2 path
+    try:
+        from asdsl.lut.lut_native import has_native_lut, build_lut_tables_native
+        from asdsl.quantization.core import _unpack_bits
+        if has_native_lut():
+            unpacked = _unpack_bits(qt.data, bits)
+            native_times = []
+            for _ in range(repeats):
+                t0 = time.perf_counter()
+                flat = build_lut_tables_native(
+                    unpacked[:shape[0] * shape[1]], x,
+                    np.asarray(qt.scales, dtype=np.float32),
+                    bits, group_width, shape[0], shape[1], group_size,
+                )
+                t1 = time.perf_counter()
+                native_times.append(t1 - t0)
+            native_ms = sorted(native_times)[len(native_times) // 2] * 1000
+            speedup = median_ms / native_ms if native_ms > 0 else 0
+            print(f"Build time (Native AVX2): {native_ms:.2f} ms  ({speedup:.1f}x faster)")
+    except Exception:
+        pass
+
     print()
 
 
@@ -71,11 +93,11 @@ def bench_lut_matvec(
     native AVX2/VNNI implementation would achieve.
     """
     print("=" * 72)
-    print("LUT MatVec Throughput Benchmark  [Python reference — see note below]")
+    print("LUT MatVec Throughput Benchmark")
     print("=" * 72)
 
-    print(f"{'Shape':>18s}  {'Bits':>4s}  {'Time (ms)':>10s}  {'GOPS':>10s}")
-    print("-" * 50)
+    print(f"{'Shape':>18s}  {'Bits':>4s}  {'Python (ms)':>12s}  {'Native (ms)':>12s}  {'Speedup':>8s}  {'GOPS':>10s}")
+    print("-" * 70)
 
     for bits in [2, 4]:
         shape = (out_features, in_features)
@@ -86,19 +108,49 @@ def bench_lut_matvec(
             qt.data, qt.scales, x, qt.bits, qt.group_size, group_width=group_width
         )
 
+        # Python timing
         times = []
         for _ in range(repeats):
             t0 = time.perf_counter()
             result = lut_matvec(tables, qt.data, qt.bits, out_features, in_features)
             t1 = time.perf_counter()
             times.append(t1 - t0)
+        py_ms = sorted(times)[len(times) // 2] * 1000
 
-        median_ms = sorted(times)[len(times) // 2] * 1000
-        ops = 2 * out_features * in_features  # multiply-add pairs
-        gops = (ops / 1e9) / (median_ms / 1000) if median_ms > 0 else 0
-        print(f"{str(shape):>18s}  {bits:>4d}  {median_ms:>10.2f}  {gops:>10.4f}")
+        # Native timing
+        native_ms_str = "N/A"
+        speedup_str = "-"
+        gops_ms = py_ms
+        try:
+            from asdsl.lut.lut_native import has_native_lut, build_lut_tables_native, lut_matvec_native
+            from asdsl.quantization.core import _unpack_bits
+            if has_native_lut():
+                unpacked = _unpack_bits(qt.data, bits)
+                flat = build_lut_tables_native(
+                    unpacked[:out_features * in_features], x,
+                    np.asarray(qt.scales, dtype=np.float32),
+                    bits, group_width, out_features, in_features, group_size,
+                )
+                native_times = []
+                for _ in range(repeats):
+                    t0 = time.perf_counter()
+                    native_result = lut_matvec_native(
+                        flat, unpacked[:out_features * in_features],
+                        bits, group_width, out_features, in_features,
+                    )
+                    t1 = time.perf_counter()
+                    native_times.append(t1 - t0)
+                n_ms = sorted(native_times)[len(native_times) // 2] * 1000
+                native_ms_str = f"{n_ms:.4f}"
+                speedup_str = f"{py_ms / n_ms:.1f}x" if n_ms > 0 else "-"
+                gops_ms = n_ms
+        except Exception:
+            pass
 
-    print(f"NOTE: Native AVX2 4-bit LUT targets ~200-500 GOPS; Python is a reference.")
+        ops = 2 * out_features * in_features
+        gops = (ops / 1e9) / (gops_ms / 1000) if gops_ms > 0 else 0
+        print(f"{str(shape):>18s}  {bits:>4d}  {py_ms:>12.2f}  {native_ms_str:>12s}  {speedup_str:>8s}  {gops:>10.4f}")
+
     print()
 
 
