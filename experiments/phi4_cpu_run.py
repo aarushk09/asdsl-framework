@@ -25,6 +25,7 @@ import argparse
 import json
 import math
 import os
+import platform
 import sys
 import time
 from pathlib import Path
@@ -42,20 +43,69 @@ from safetensors import safe_open
 from transformers import AutoTokenizer
 
 
-def set_thread_count(n: int) -> None:
-    """Set CPU threads for NumPy/BLAS/PyTorch.
+def detect_cpu_info() -> dict[str, object]:
+    """Best-effort host CPU detection for portable runtime defaults."""
+    logical = max(1, os.cpu_count() or 1)
+    physical = None
+    try:
+        import psutil  # type: ignore
 
-    0 = auto-detect (defaults to 8 for Intel i7 Evo P-core count).
-    Intel i7 Evo has hybrid P+E cores; P-cores are more efficient
-    for compute-heavy GEMV, so we default to P-core thread count.
-    MKL is preferred over OpenBLAS on Intel hardware.
+        physical = psutil.cpu_count(logical=False)
+    except Exception:
+        physical = None
+
+    brand = (
+        platform.processor().strip()
+        or os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
+        or platform.machine().strip()
+        or "unknown cpu"
+    )
+    brand_lower = brand.lower()
+    if "intel" in brand_lower:
+        vendor = "intel"
+    elif "amd" in brand_lower or "ryzen" in brand_lower or "epyc" in brand_lower:
+        vendor = "amd"
+    elif "apple" in brand_lower or brand_lower.startswith("m1") or brand_lower.startswith("m2"):
+        vendor = "apple"
+    else:
+        vendor = "generic"
+
+    return {
+        "brand": brand,
+        "vendor": vendor,
+        "logical_cores": logical,
+        "physical_cores": physical or logical,
+        "architecture": platform.machine() or "unknown",
+    }
+
+
+def get_auto_thread_count() -> int:
+    """Choose a portable default thread count for CPU inference.
+
+    We prefer physical cores over logical threads because the decode path is
+    largely memory-bandwidth-bound and typically scales better without SMT
+    oversubscription. A soft cap of 16 avoids runaway defaults on larger hosts.
+    """
+    info = detect_cpu_info()
+    physical = int(info["physical_cores"])
+    logical = int(info["logical_cores"])
+    preferred = physical if physical > 0 else logical
+    return max(1, min(preferred, 16))
+
+
+def set_thread_count(n: int) -> int:
+    """Set CPU threads for NumPy/BLAS/PyTorch and return the applied count.
+
+    Passing `0` selects an automatic host-dependent default based on detected
+    CPU topology instead of a hardcoded machine-specific value.
     """
     if n <= 0:
-        n = min(8, max(1, os.cpu_count() or 4))
+        n = get_auto_thread_count()
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(n)
     torch.set_num_threads(n)
+    return n
 
 
 ROOT = Path(__file__).parent.parent
@@ -1537,7 +1587,7 @@ def main() -> None:
     parser.add_argument("--group-size", type=int, default=0,
                         help="Quantization group size (0=auto: 32 for <=4-bit, 128 for 8-bit)")
     parser.add_argument("--threads", type=int, default=0,
-                        help="CPU threads for BLAS/OMP (0=auto: P-cores on Intel i7 Evo)")
+                        help="CPU threads for BLAS/OMP (0=auto-detect based on host CPU)")
     parser.add_argument("--stream", action="store_true",
                         help="Use streaming output (yield tokens as generated)")
     parser.add_argument("--qcsd", action="store_true",
@@ -1552,10 +1602,8 @@ def main() -> None:
                         help="Activation sparsity threshold (default: 0.01)")
     args = parser.parse_args()
 
-    # Intel i7 Evo optimal threading: use P-cores by default (8 threads)
-    if args.threads == 0:
-        args.threads = 8
-    set_thread_count(args.threads)
+    args.threads = set_thread_count(args.threads)
+    cpu_info = detect_cpu_info()
 
     if not INDEX_FILE.exists():
         print("ERROR: Model index not found at", INDEX_FILE)
@@ -1565,7 +1613,11 @@ def main() -> None:
     print("=" * 66)
     print("ASDSL Phi-4 CPU Inference Setup")
     print("=" * 66)
-    print(f"  Hardware: Intel Core i7 Evo | CPU-only | threads={args.threads}")
+    print(
+        f"  Hardware: {cpu_info['brand']} | {cpu_info['architecture']} | "
+        f"{cpu_info['physical_cores']} cores / {cpu_info['logical_cores']} threads"
+    )
+    print(f"  Runtime : CPU-only | threads={args.threads}")
 
     print("Loading tokenizer ...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(

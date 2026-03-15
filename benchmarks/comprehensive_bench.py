@@ -16,24 +16,39 @@ import gc
 import json
 import math
 import os
+import platform
 import sys
 import time
 from pathlib import Path
 
 # Thread control BEFORE importing numpy/torch
-# Intel i7 Evo: default to 8 threads (P-cores), prefer MKL
-os.environ["OMP_NUM_THREADS"] = "8"
-os.environ["MKL_NUM_THREADS"] = "8"
-os.environ["OPENBLAS_NUM_THREADS"] = "8"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "8"
-os.environ["NUMEXPR_NUM_THREADS"] = "8"
+def _detect_auto_threads() -> int:
+    logical = max(1, os.cpu_count() or 1)
+    physical = None
+    try:
+        import psutil  # type: ignore
+
+        physical = psutil.cpu_count(logical=False)
+    except Exception:
+        physical = None
+    preferred = physical or logical
+    return max(1, min(preferred, 16))
+
+
+_AUTO_THREADS = _detect_auto_threads()
+
+os.environ["OMP_NUM_THREADS"] = str(_AUTO_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(_AUTO_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = str(_AUTO_THREADS)
+os.environ["VECLIB_MAXIMUM_THREADS"] = str(_AUTO_THREADS)
+os.environ["NUMEXPR_NUM_THREADS"] = str(_AUTO_THREADS)
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_JAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 import numpy as np
 import torch
-torch.set_num_threads(8)
+torch.set_num_threads(_AUTO_THREADS)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -457,20 +472,26 @@ def main():
     parser.add_argument("--bits", type=int, nargs="*", default=None,
                         help="Bit-widths to test (default: 16 8 4 3 2)")
     parser.add_argument("--skip-perplexity", action="store_true")
-    parser.add_argument("--threads", type=int, default=8,
-                        help="CPU threads (default: 8 for Intel i7 Evo P-cores)")
+    parser.add_argument("--threads", type=int, default=0,
+                        help="CPU threads (default: auto-detect based on host CPU)")
     parser.add_argument("--sparse", action="store_true",
                         help="Enable activation-sparse GEMV (Tier 3)")
     args = parser.parse_args()
 
-    set_thread_count(args.threads)
+    args.threads = set_thread_count(args.threads)
 
     bits_list = args.bits or [16, 8, 4, 3, 2]
 
     print("=" * 66)
     print("  ASDSL Framework - Comprehensive Benchmark Suite")
     print("=" * 66)
-    print(f"  CPU: {psutil.cpu_count(logical=False)} cores / {psutil.cpu_count()} threads")
+    cpu_name = (
+        platform.processor().strip()
+        or os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
+        or platform.machine()
+    )
+    print(f"  CPU: {cpu_name}")
+    print(f"  Topology: {psutil.cpu_count(logical=False)} cores / {psutil.cpu_count()} threads")
     print(f"  RAM: {psutil.virtual_memory().total / (1024**3):.1f} GB total")
     print(f"  Threads limited to: {args.threads}")
     print(f"  Bit-widths: {bits_list}")

@@ -4,7 +4,7 @@
 
 A CPU-focused Phi-4 inference and quantization project centered on
 weight compression, native AVX2 GEMV kernels, and benchmarking on
-Intel i7 Evo hardware. The current measured state is a strong Tier 1
+general desktop and laptop CPUs. The current measured state is a strong Tier 1
 result set for 8-bit, 4-bit, and 3-bit inference; Tier 2 (`QCSD`) and
 Tier 3 (activation-sparse GEMV) exist as experimental paths and are
 not yet reflected in the stable benchmark table below.
@@ -56,7 +56,7 @@ stable measured paths and experimental work-in-progress paths:
 
 ## Measured Results
 
-> Hardware: Intel Core i7 Evo · CPU-only · 16 GB DDR4-3200 RAM · Windows  
+> Reference benchmark hardware: Intel Core i7 Evo · CPU-only · 16 GB DDR4-3200 RAM · Windows  
 > Model: **Phi-4-multimodal-instruct** (14B params, 200k vocab, 32 layers)  
 > Source of truth: `benchmarks/results/benchmark_results.json`
 
@@ -97,6 +97,22 @@ Implemented but still experimental:
 These experimental paths should not be treated as production benchmark results until
 their acceptance rates, quality, and end-to-end throughput are validated in the same
 benchmark workflow as the stable table above.
+
+### Cross-CPU Support
+
+The runtime is no longer hardcoded around one Intel laptop profile.
+Inference and benchmarking now auto-detect the current host CPU and use
+portable defaults instead of assuming an `Intel i7 Evo` with `8` preferred threads.
+
+What this means in practice:
+
+- `--threads 0` now means **auto-detect based on the current machine**
+- the default thread count prefers **physical cores** over logical threads
+- startup output now reports the detected CPU name, architecture, and topology
+- benchmark defaults are host-aware instead of fixed to a single CPU profile
+
+This makes the project behave more sensibly on other Intel CPUs, AMD Ryzen / EPYC,
+and any other x86 host where the best default is not exactly `8` threads.
 
 ### About The 10 tok/s Goal
 
@@ -153,7 +169,7 @@ $ python experiments/phi4_cpu_run.py --bits 3 --prompt "The capital of France is
 | **Float16 embedding & LM head** | Stores embedding/LM-head as f16 instead of f32, saving 1.2 GB RAM. |
 | **Pre-allocated KV cache** | Contiguous torch tensors per layer with snapshot/restore for QCSD. |
 | **SDPA attention** | `torch.nn.functional.scaled_dot_product_attention` replaces manual Q·K·V loops. |
-| **Intel i7 Evo thread tuning** | Defaults to 8 threads (P-cores only). MKL preferred over OpenBLAS. |
+| **Host-aware thread tuning** | Defaults are derived from detected CPU topology instead of a hardcoded machine profile. |
 | **`torch.inference_mode()`** | Disables autograd bookkeeping during decode and prefill. |
 
 ---
@@ -314,7 +330,7 @@ python experiments/phi4_cpu_run.py --bits 8
 | `--bits N` | `16` | Quantization bit-width (2, 3, 4, 8, or 16 for FP16) |
 | `--prompt TEXT` | `"What is 2+2?"` | Input prompt |
 | `--max-new-tokens N` | `80` | Number of tokens to generate |
-| `--threads N` | `8` | CPU thread count (8 = Intel i7 Evo P-cores) |
+| `--threads N` | `0` | CPU thread count (`0` = auto-detect based on the current host CPU) |
 | `--group-size N` | `0` (auto) | Quantization group size; 0 = smart default |
 | `--qcsd` | off | Enable experimental QCSD speculative decoding path |
 | `--draft-bits N` | `2` | Bit-width for QCSD draft model |
@@ -343,6 +359,12 @@ set_thread_count(4)   # Limits OMP, MKL, OpenBLAS, VECLIB, NUMEXPR, and torch th
 ```
 
 Or use the CLI flag: `python experiments/phi4_cpu_run.py --threads 2`
+
+Or let ASDSL auto-detect a host-appropriate default:
+
+```bash
+python experiments/phi4_cpu_run.py --threads 0
+```
 
 ---
 
@@ -718,6 +740,7 @@ and streaming output.
 - [x] lm-evaluation-harness integration
 - [x] Comprehensive benchmark suite with visualization
 - [x] Native C++/AVX2 GEMV kernels for 8-bit, 4-bit, 3-bit, and 2-bit
+- [x] Host-aware thread auto-detection for inference and benchmarks
 - [x] LUT inference path without weight decompression (639× build speedup, 657× matvec speedup)
 - [x] Streaming output (yield tokens as they are generated)
 
@@ -728,6 +751,7 @@ and streaming output.
 - [ ] validate activation-sparse GEMV in the main benchmark suite
 - [ ] GPTQ-style calibrated quantization (512 calibration samples)
 - [ ] Vectorized greedy bit allocator (replace O(n²) Python loop)
+- [ ] Add more architecture-specific optimized paths beyond AVX2 where available
 - [ ] INT4/INT8 VNNI kernel path (Intel Sapphire Rapids / Meteor Lake)
 - [ ] ARM NEON/SVE backend
 
