@@ -113,3 +113,59 @@ def gemv_q2_unpacked(
         )
 
     return _gemv_q2_numpy_unpacked(w, x, scales, biases, M, K, group_size)
+
+
+def gemv_q2_packed(
+    w_packed: np.ndarray,
+    x: np.ndarray,
+    scales: np.ndarray,
+    biases: np.ndarray,
+    M: int,
+    K: int,
+    group_size: int,
+) -> np.ndarray:
+    """Fused 2-bit GEMV on packed weights (4 values per byte).
+
+    Loads 4x less data from DRAM than the unpacked path. Used for
+    QCSD draft tokens where bandwidth is the bottleneck.
+    """
+    x = _ensure_f32(x)
+    scales = _ensure_f32(scales)
+    biases = _ensure_f32(biases)
+    w_packed = _ensure_u8(w_packed)
+
+    if _native_available:
+        return np.asarray(
+            _native_q2.gemv_q2_packed(w_packed, x, scales, biases, M, K, group_size)
+        )
+
+    # NumPy fallback: unpack inline per chunk
+    groups_per_row = K // group_size
+    packed_per_row = K // 4
+    x_grouped = x.reshape(groups_per_row, group_size)
+    sum_x = x_grouped.sum(axis=1)
+
+    y = np.empty(M, dtype=np.float32)
+    CHUNK = 256
+
+    for start in range(0, M, CHUNK):
+        end = min(start + CHUNK, M)
+        n = end - start
+        chunk = w_packed[start * packed_per_row : end * packed_per_row].reshape(n, packed_per_row)
+
+        unpacked = np.empty((n, K), dtype=np.float32)
+        unpacked[:, 0::4] = (chunk & 0x03).astype(np.float32)
+        unpacked[:, 1::4] = ((chunk >> 2) & 0x03).astype(np.float32)
+        unpacked[:, 2::4] = ((chunk >> 4) & 0x03).astype(np.float32)
+        unpacked[:, 3::4] = ((chunk >> 6) & 0x03).astype(np.float32)
+
+        ug = unpacked.reshape(n, groups_per_row, group_size)
+        int_dots = np.sum(ug * x_grouped[np.newaxis, :, :], axis=2)
+
+        gs = start * groups_per_row
+        ge = end * groups_per_row
+        s = scales[gs:ge].reshape(n, groups_per_row)
+        b = biases[gs:ge].reshape(n, groups_per_row)
+        y[start:end] = np.sum(int_dots * s + b * sum_x[np.newaxis, :], axis=1)
+
+    return y

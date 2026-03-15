@@ -114,6 +114,66 @@ static void gemv_q2_unpacked_impl(
 }
 
 /* ===================================================================
+ * Core Kernel: 2-bit PACKED GEMV (4 values per byte)
+ *
+ * Reads the packed format directly: each byte contains 4 x 2-bit values.
+ * This loads 4x less data from DRAM than the unpacked path, making it
+ * ideal for QCSD draft tokens where bandwidth is the bottleneck.
+ * =================================================================== */
+
+static void gemv_q2_packed_impl(
+    const uint8_t* __restrict w_packed,
+    const float*   __restrict x,
+    const float*   __restrict scales,
+    const float*   __restrict biases,
+    float*         __restrict y,
+    int M, int K, int group_size
+) {
+    const int groups_per_row = K / group_size;
+    const int packed_stride = K / 4;
+
+    std::vector<float> group_sum_x(groups_per_row);
+    for (int g = 0; g < groups_per_row; ++g) {
+        __m256 acc = _mm256_setzero_ps();
+        const float* xg = x + g * group_size;
+        int j = 0;
+        for (; j <= group_size - 8; j += 8) {
+            acc = _mm256_add_ps(acc, _mm256_loadu_ps(xg + j));
+        }
+        float sum = hsum256_ps(acc);
+        for (; j < group_size; ++j) sum += xg[j];
+        group_sum_x[g] = sum;
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; ++m) {
+        const uint8_t* row = w_packed + static_cast<size_t>(m) * packed_stride;
+        float row_sum = 0.0f;
+
+        for (int g = 0; g < groups_per_row; ++g) {
+            const int k0   = g * group_size;
+            const int gidx = m * groups_per_row + g;
+            float dot_val = 0.0f;
+
+            for (int j = 0; j < group_size; j += 4) {
+                uint8_t byte = row[(k0 + j) / 4];
+                float v0 = static_cast<float>(byte & 0x03);
+                float v1 = static_cast<float>((byte >> 2) & 0x03);
+                float v2 = static_cast<float>((byte >> 4) & 0x03);
+                float v3 = static_cast<float>((byte >> 6) & 0x03);
+
+                dot_val += v0 * x[k0+j+0] + v1 * x[k0+j+1]
+                         + v2 * x[k0+j+2] + v3 * x[k0+j+3];
+            }
+
+            row_sum += scales[gidx] * dot_val + biases[gidx] * group_sum_x[g];
+        }
+
+        y[m] = row_sum;
+    }
+}
+
+/* ===================================================================
  * Sparse GEMV: skip columns where activation bitmask is zero
  *
  * Iterates over 32-column blocks. If the bitmask word is zero,
@@ -278,12 +338,44 @@ static py::array_t<float> py_gemv_q2_sparse(
     return result;
 }
 
+static py::array_t<float> py_gemv_q2_packed(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> w_packed,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> x,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> scales,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> biases,
+    int M, int K, int group_size
+) {
+    if (M <= 0 || K <= 0 || group_size <= 0)
+        throw std::invalid_argument("M, K, group_size must be positive");
+    if (K % 4 != 0)
+        throw std::invalid_argument("K must be divisible by 4 for 2-bit packing");
+    if (K % group_size != 0)
+        throw std::invalid_argument("K must be divisible by group_size");
+
+    auto result = py::array_t<float>(M);
+
+    {
+        py::gil_scoped_release release;
+        gemv_q2_packed_impl(
+            w_packed.data(), x.data(), scales.data(), biases.data(),
+            result.mutable_data(), M, K, group_size);
+    }
+
+    return result;
+}
+
 PYBIND11_MODULE(_native_gemv_q2, m) {
     m.doc() = "Fused 2-bit GEMV kernels with AVX2 + FMA for ASDSL";
 
     m.def("gemv_q2_unpacked", &py_gemv_q2_unpacked,
         "Fused 2-bit GEMV on pre-unpacked uint8 weights.",
         py::arg("w"), py::arg("x"),
+        py::arg("scales"), py::arg("biases"),
+        py::arg("M"), py::arg("K"), py::arg("group_size"));
+
+    m.def("gemv_q2_packed", &py_gemv_q2_packed,
+        "Fused 2-bit GEMV on packed weights (4 values per byte). 4x less DRAM.",
+        py::arg("w_packed"), py::arg("x"),
         py::arg("scales"), py::arg("biases"),
         py::arg("M"), py::arg("K"), py::arg("group_size"));
 

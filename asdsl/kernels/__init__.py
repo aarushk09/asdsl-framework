@@ -21,6 +21,7 @@ from asdsl.kernels.gemv_q3 import (
 )
 from asdsl.kernels.gemv_q2 import (
     gemv_q2_unpacked,
+    gemv_q2_packed,
     has_native_kernel as has_native_q2_kernel,
 )
 from asdsl.kernels.gemv_sparse import (
@@ -40,6 +41,7 @@ __all__ = [
     "gemv_q3_unpacked",
     "has_native_q3_kernel",
     "gemv_q2_unpacked",
+    "gemv_q2_packed",
     "has_native_q2_kernel",
     "compute_activation_bitmask",
     "gemv_sparse_unpacked",

@@ -195,6 +195,7 @@ class WeightStore:
         # QCSD dual-bank (Tier 2)
         self._enable_qcsd = enable_qcsd
         self._draft_bits = draft_bits
+        self._draft_group_size = 16 if draft_bits <= 3 else 32
         self._draft_quant_u8: dict[tuple, torch.Tensor] = {}
         self._draft_quant_sc: dict[tuple, torch.Tensor] = {}
         self._draft_quant_bi: dict[tuple, torch.Tensor] = {}
@@ -275,9 +276,15 @@ class WeightStore:
                         w_f32 = tensor.to(torch.float32).numpy()
                         if self.bits <= 3:
                             from asdsl.quantization.core import quantize_weights_with_outliers
+                            # 2-bit needs aggressive outlier removal (2.5σ) to avoid
+                            # scale blow-up; 3-bit can use a milder threshold (3.5σ)
+                            sigma = 2.5 if self.bits == 2 else 3.5
+                            cap = 0.01 if self.bits == 2 else 0.005
                             qt, ov, oc = quantize_weights_with_outliers(
                                 w_f32, bits=self.bits,
                                 group_size=self.group_size,
+                                outlier_threshold_sigma=sigma,
+                                outlier_fraction_cap=cap,
                                 symmetric=self._symmetric,
                                 optimize_clips=self._optimize_clips,
                             )
@@ -293,10 +300,13 @@ class WeightStore:
                         # QCSD: also quantize to draft_bits for the draft bank
                         if self._enable_qcsd and self.bits > self._draft_bits:
                             from asdsl.quantization.core import quantize_weights_with_outliers
-                            draft_gs = 16 if self._draft_bits <= 3 else 32
+                            d_sigma = 2.5 if self._draft_bits == 2 else 3.5
+                            d_cap = 0.01 if self._draft_bits == 2 else 0.005
                             qt_d, ov_d, oc_d = quantize_weights_with_outliers(
                                 w_f32, bits=self._draft_bits,
-                                group_size=draft_gs,
+                                group_size=self._draft_group_size,
+                                outlier_threshold_sigma=d_sigma,
+                                outlier_fraction_cap=d_cap,
                                 symmetric=False,
                                 optimize_clips=True,
                             )
@@ -379,32 +389,39 @@ class WeightStore:
         key = (layer_idx, name)
 
         if use_draft and key in self._draft_quant_u8:
-            u8_weights = self._draft_quant_u8[key].numpy()
+            w_data = self._draft_quant_u8[key].numpy()
             sc = self._draft_quant_sc[key].float().numpy()
             bi = self._draft_quant_bi[key].float().numpy()
             rows, cols = self._quant_shapes[key]
             bits = self._draft_bits
+            gs = self._draft_group_size
+            is_packed = True
         else:
-            u8_weights = self._quant_u8[key].numpy()
+            w_data = self._quant_u8[key].numpy()
             sc = self._quant_sc[key].float().numpy()
             bi = self._quant_bi[key].float().numpy()
             rows, cols = self._quant_shapes[key]
             bits = self.bits
+            gs = self.group_size
+            is_packed = False
 
         x_np = x.detach().cpu().float().contiguous().numpy().ravel()
 
-        if bits == 4:
+        if is_packed and bits == 2:
+            from asdsl.kernels import gemv_q2_packed
+            out_np = gemv_q2_packed(w_data, x_np, sc, bi, rows, cols, gs)
+        elif bits == 4:
             from asdsl.kernels import gemv_q4_unpacked
-            out_np = gemv_q4_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+            out_np = gemv_q4_unpacked(w_data, x_np, sc, bi, rows, cols, gs)
         elif bits == 8:
             from asdsl.kernels import gemv_q8_unpacked
-            out_np = gemv_q8_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+            out_np = gemv_q8_unpacked(w_data, x_np, sc, bi, rows, cols, gs)
         elif bits == 3:
             from asdsl.kernels import gemv_q3_unpacked
-            out_np = gemv_q3_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+            out_np = gemv_q3_unpacked(w_data, x_np, sc, bi, rows, cols, gs)
         elif bits == 2:
             from asdsl.kernels import gemv_q2_unpacked
-            out_np = gemv_q2_unpacked(u8_weights, x_np, sc, bi, rows, cols, self.group_size)
+            out_np = gemv_q2_unpacked(w_data, x_np, sc, bi, rows, cols, gs)
         else:
             raise ValueError(f"No native kernel for {bits}-bit")
 
@@ -464,6 +481,87 @@ class WeightStore:
                 result = result + torch.from_numpy(out_corr).unsqueeze(0)
 
         return result
+
+    def _matmul_quant_batch(self, layer_idx: int, name: str,
+                            X_batch: torch.Tensor) -> torch.Tensor:
+        """Batched dequant+matmul: Y = W @ X^T, loading W once for K tokens.
+
+        This is the key to QCSD verify speedup: weight data is read from DRAM
+        once and applied to K activation vectors via BLAS GEMM.
+
+        Args:
+            X_batch: (K, hidden_dim) — K activation vectors stacked.
+        Returns:
+            (K, output_dim) — K output vectors.
+        """
+        key = (layer_idx, name)
+        u8 = self._quant_u8[key]
+        sc = self._quant_sc[key]
+        bi = self._quant_bi[key]
+        rows, cols = self._quant_shapes[key]
+        groups_per_row = cols // self.group_size
+
+        K_batch = X_batch.shape[0]
+        X_flat = X_batch.reshape(K_batch, cols)
+
+        chunk_rows = max(1, _TARGET_CHUNK_BYTES // (cols * 4))
+        result = torch.empty(rows, K_batch, dtype=torch.float32)
+
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            n = end - start
+            flat_len = n * cols
+            buf = self._pool[:flat_len]
+            buf.copy_(u8[start * cols:end * cols])
+            vals = buf.view(n, groups_per_row, self.group_size)
+            gs = start * groups_per_row
+            ge = end * groups_per_row
+            vals.mul_(sc[gs:ge].float().view(n, groups_per_row, 1))
+            vals.add_(bi[gs:ge].float().view(n, groups_per_row, 1))
+            torch.mm(vals.view(n, cols), X_flat.T, out=result[start:end, :])
+
+        return result.T
+
+    def _matmul_f16_batch(self, layer_idx: int, name: str,
+                          X_batch: torch.Tensor) -> torch.Tensor:
+        """Batched f16->f32 matmul for unquantized weights."""
+        w_f16 = self._weight_cache[(layer_idx, name)]
+        rows, cols = w_f16.shape
+        K_batch = X_batch.shape[0]
+        X_flat = X_batch.reshape(K_batch, cols)
+
+        chunk_rows = max(1, _TARGET_CHUNK_BYTES // (cols * 4))
+        result = torch.empty(rows, K_batch, dtype=torch.float32)
+        buf = self._pool[:chunk_rows * cols].view(chunk_rows, cols)
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            n = end - start
+            buf[:n].copy_(w_f16[start:end])
+            torch.mm(buf[:n], X_flat.T, out=result[start:end, :])
+        return result.T
+
+    def matmul_batch(self, layer_idx: int, name: str,
+                     X_batch: torch.Tensor) -> torch.Tensor:
+        """Batched matrix multiply: Y = X_batch @ W^T, loading W once."""
+        if self.bits == 16:
+            return self._matmul_f16_batch(layer_idx, name, X_batch)
+        return self._matmul_quant_batch(layer_idx, name, X_batch)
+
+    def lm_head_matmul_batch(self, hidden_batch: torch.Tensor) -> torch.Tensor:
+        """Batched logits = hidden_batch @ lm_head.T, loading lm_head once."""
+        K_batch = hidden_batch.shape[0]
+        X = hidden_batch.reshape(K_batch, -1)
+        lm = self.lm_head
+        rows, cols = lm.shape
+        chunk_rows = max(1, _TARGET_CHUNK_BYTES // (cols * 4))
+        result = torch.empty(rows, K_batch, dtype=torch.float32)
+        buf = self._pool[:chunk_rows * cols].view(chunk_rows, cols)
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            n = end - start
+            buf[:n].copy_(lm[start:end])
+            torch.mm(buf[:n], X.T, out=result[start:end, :])
+        return result.T
 
     def matvec(self, layer_idx: int, name: str, x: torch.Tensor,
                use_draft: bool = False) -> torch.Tensor:
@@ -550,12 +648,13 @@ class WeightStore:
                     self._quant_sc[key] = sc_f16
                     self._quant_bi[key] = bi_f16
 
-                    # QCSD: also pre-unpack draft bank
+                    # QCSD: store draft weights PACKED (4 values per byte for 2-bit).
+                    # This loads 4x less data from DRAM per draft token.
                     if self._enable_qcsd and "_draft_" + name in self.layers.get(i, {}):
                         qt_d = self.layers[i]["_draft_" + name]
                         d_numel = rows * cols
-                        d_unpacked = _unpack_bits(qt_d.data, qt_d.bits)[:d_numel]
-                        self._draft_quant_u8[key] = torch.from_numpy(d_unpacked.astype(np.uint8))
+                        # Keep packed data directly — no pre-unpack
+                        self._draft_quant_u8[key] = torch.from_numpy(qt_d.data.copy())
                         d_qmax = (1 << qt_d.bits) - 1
                         d_n_groups = d_numel // qt_d.group_size
                         d_sc = torch.from_numpy(qt_d.scales[:d_n_groups].copy()).to(torch.float16)
@@ -766,20 +865,105 @@ def forward_layer(
     gu = store.matvec(layer_idx, "gate_up_proj", h, use_draft=use_draft)
     act = silu(gu[:, :INTER]) * gu[:, INTER:]
 
-    # Tier 3: Activation-sparse GEMV for the down projection
-    if store._enable_sparse and not use_draft:
+    # Tier 3: Activation-sparse GEMV for the down projection.
+    # Only worthwhile when sparsity > 80% AND native sparse kernel is available.
+    # Without transposed weight storage, cache-unfriendly column access makes
+    # the sparse path slower than dense unless sparsity is extreme.
+    use_sparse = (store._enable_sparse and not use_draft
+                  and store._use_native_gemv)
+    if use_sparse:
         from asdsl.kernels import compute_activation_bitmask
         act_np = act.detach().cpu().float().contiguous().numpy().ravel()
         bitmask, active_indices = compute_activation_bitmask(
             act_np, threshold=store._sparsity_threshold
         )
-        hidden = residual + store.matvec_sparse(
-            layer_idx, "down_proj", act, bitmask, active_indices
-        )
+        sparsity = 1.0 - len(active_indices) / len(act_np)
+        if sparsity > 0.80:
+            hidden = residual + store.matvec_sparse(
+                layer_idx, "down_proj", act, bitmask, active_indices
+            )
+        else:
+            hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
     else:
         hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
 
     return hidden
+
+
+def forward_layer_batch(
+    hidden_batch: torch.Tensor,    # (K, hidden)
+    layer_idx: int,
+    store: WeightStore,
+    kv_hist: KVHistory,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+    start_pos: int,
+) -> torch.Tensor:
+    """Batched forward pass for K tokens through one transformer layer.
+
+    Used by QCSD verify phase: loads each weight matrix ONCE and produces
+    K outputs via BLAS GEMM instead of K separate GEMV calls.
+    Appends all K tokens' KV to the cache with proper causal masking.
+    """
+    K = hidden_batch.shape[0]
+
+    residual = hidden_batch
+    h = rms_norm(hidden_batch, store.get_norm(layer_idx, "input_layernorm"))
+
+    qkv = store.matmul_batch(layer_idx, "qkv_proj", h)
+
+    q = qkv[:, :Q_DIM].view(K, NUM_HEADS, HEAD_DIM)
+    k_new = qkv[:, Q_DIM:Q_DIM + KV_DIM].view(K, NUM_KV_HEADS, HEAD_DIM)
+    v_new = qkv[:, Q_DIM + KV_DIM:].view(K, NUM_KV_HEADS, HEAD_DIM)
+
+    for i in range(K):
+        pos_i = start_pos + i
+        cos_p = rope_cos[pos_i:pos_i + 1]
+        sin_p = rope_sin[pos_i:pos_i + 1]
+        q[i:i + 1] = apply_rope(q[i:i + 1], cos_p, sin_p)
+        k_new[i:i + 1] = apply_rope(k_new[i:i + 1], cos_p, sin_p)
+
+    for i in range(K):
+        kv_hist.append(layer_idx, k_new[i], v_new[i])
+
+    k_hist, v_hist = kv_hist.get(layer_idx)
+    S = k_hist.shape[0]
+
+    expand = NUM_HEADS // NUM_KV_HEADS
+    k_full = (k_hist.unsqueeze(2)
+                    .expand(-1, -1, expand, -1)
+                    .reshape(S, NUM_HEADS, HEAD_DIM)
+                    .permute(1, 0, 2)
+                    .unsqueeze(0))
+    v_full = (v_hist.unsqueeze(2)
+                    .expand(-1, -1, expand, -1)
+                    .reshape(S, NUM_HEADS, HEAD_DIM)
+                    .permute(1, 0, 2)
+                    .unsqueeze(0))
+
+    q_attn = q.permute(1, 0, 2).unsqueeze(0)  # (1, heads, K, head_dim)
+
+    # Causal mask: query i at position start_pos+i attends to KV 0..start_pos+i
+    # tril(diagonal=d) keeps j <= i+d; we need j <= i + start_pos
+    causal = torch.ones(K, S, dtype=torch.bool).tril(diagonal=start_pos)
+    attn_mask = torch.where(causal, 0.0, float('-inf'))
+    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+
+    attn_out = torch.nn.functional.scaled_dot_product_attention(
+        q_attn, k_full, v_full, attn_mask=attn_mask,
+    )
+    attn_out = attn_out.squeeze(0).permute(1, 0, 2).reshape(K, Q_DIM)
+
+    hidden_batch = residual + store.matmul_batch(layer_idx, "o_proj", attn_out)
+
+    residual = hidden_batch
+    h = rms_norm(hidden_batch, store.get_norm(layer_idx, "post_attention_layernorm"))
+
+    gu = store.matmul_batch(layer_idx, "gate_up_proj", h)
+    act = silu(gu[:, :INTER]) * gu[:, INTER:]
+
+    hidden_batch = residual + store.matmul_batch(layer_idx, "down_proj", act)
+    return hidden_batch
 
 
 # ---------------------------------------------------------------------------
@@ -1092,7 +1276,6 @@ def generate_qcsd(
     pos = len(input_ids)
     with torch.inference_mode():
         while len(generated) < max_new_tokens:
-            # Current token from previous logits
             current_token = int(logits.argmax())
 
             if current_token in EOS_TOKEN_IDS:
@@ -1103,13 +1286,12 @@ def generate_qcsd(
                 print(tok_text, end="", flush=True)
                 break
 
-            # Snapshot KV cache before drafting
+            # ── DRAFT PHASE ──────────────────────────────────────
+            # Run 2-bit model autoregressively for K steps.
+            # Snapshot KV first so we can roll back after drafting.
             kv_snap = kv_hist.snapshot()
             draft_start_pos = pos
-
-            # DRAFT PHASE: run 2-bit model autoregressively for K steps
             draft_tokens = []
-            draft_logits_list = []
             draft_token = current_token
 
             for k_step in range(draft_k):
@@ -1119,30 +1301,50 @@ def generate_qcsd(
                 )
                 next_draft = int(draft_logits.argmax())
                 draft_tokens.append(next_draft)
-                draft_logits_list.append(draft_logits)
                 draft_token = next_draft
                 if next_draft in EOS_TOKEN_IDS:
                     break
 
             total_draft += len(draft_tokens)
-
-            # Restore KV cache to pre-draft state
             kv_hist.restore(kv_snap)
 
-            # VERIFY PHASE: run primary model on [current_token] + draft_tokens[:-1]
-            # to get reference logits for each position
-            verify_tokens = [current_token] + draft_tokens[:-1]
-            verify_logits = []
-            for vi, vtok in enumerate(verify_tokens):
-                vl = run_forward(
-                    vtok, draft_start_pos + vi, kv_hist,
-                    need_logits=True, use_draft=False,
-                )
-                verify_logits.append(vl)
+            # ── VERIFY PHASE (BATCHED) ───────────────────────────
+            # Feed [current_token, d_0, d_1, ..., d_{K-2}] through the
+            # primary model in a SINGLE batched forward pass.
+            # Weight matrices are loaded ONCE and applied to all K tokens
+            # via BLAS GEMM — this is the core QCSD speedup.
+            verify_tokens = [current_token] + draft_tokens[:-1] if len(draft_tokens) > 1 else [current_token]
+            n_verify = len(verify_tokens)
 
-            # ACCEPT / REJECT
-            accepted = []
-            # First: the current_token itself is already committed
+            # Build batched hidden input: (n_verify, hidden_dim)
+            hidden_batch = torch.stack([
+                store.embed_f16[tid].float() for tid in verify_tokens
+            ])
+
+            # Run all layers with batched matmul
+            for i in range(NUM_LAYERS):
+                hidden_batch = forward_layer_batch(
+                    hidden_batch, i, store, kv_hist,
+                    rope_cos, rope_sin, draft_start_pos,
+                )
+
+            # LM head on all positions — also batched
+            hidden_batch = rms_norm(hidden_batch, store.final_norm)
+            all_logits = store.lm_head_matmul_batch(hidden_batch)
+            # all_logits shape: (n_verify, vocab_size)
+
+            # Record KV for ASDSL tracker
+            for vi in range(n_verify):
+                k_new_list, v_new_list = [], []
+                for layer in range(NUM_LAYERS):
+                    cache_idx = kv_hist._len[layer] - n_verify + vi
+                    k_new_list.append(kv_hist.k_buf[layer][cache_idx].numpy())
+                    v_new_list.append(kv_hist.v_buf[layer][cache_idx].numpy())
+                asdsl_tracker.record_token(k_new_list, v_new_list)
+
+            # ── ACCEPT / REJECT ──────────────────────────────────
+            # Logits[i] gives the primary model's prediction after seeing
+            # verify_tokens[0..i]. Compare logits[i].argmax() vs draft_tokens[i].
             generated.append(current_token)
             tok_text = tokenizer.convert_tokens_to_string(
                 tokenizer.convert_ids_to_tokens([current_token])
@@ -1150,8 +1352,11 @@ def generate_qcsd(
             print(tok_text, end="", flush=True)
             pos += 1
 
+            accepted = []
             for k_idx in range(len(draft_tokens)):
-                ref_tok = int(verify_logits[k_idx].argmax())
+                if k_idx >= n_verify:
+                    break
+                ref_tok = int(all_logits[k_idx].argmax())
                 if ref_tok == draft_tokens[k_idx]:
                     accepted.append(draft_tokens[k_idx])
                 else:
@@ -1169,24 +1374,21 @@ def generate_qcsd(
 
             total_accepted += len(accepted)
 
-            # Run forward for any accepted tokens not yet in KV cache
-            # (verify already processed current_token and some draft tokens)
-            remaining_accepted = accepted[len(verify_logits) - 1:]
-            for ra_idx, ra_tok in enumerate(remaining_accepted):
-                run_forward(ra_tok, pos + ra_idx, kv_hist,
-                            need_logits=False, use_draft=False)
+            # Trim KV cache: verify processed n_verify tokens but we only
+            # accepted 1 (current) + len(accepted). Roll back the rest.
+            n_keep = 1 + len(accepted)
+            if n_keep < n_verify:
+                trimmed_snap = kv_hist.snapshot()
+                for layer in range(NUM_LAYERS):
+                    trimmed_snap["lens"][layer] -= (n_verify - n_keep)
+                kv_hist.restore(trimmed_snap)
 
             pos += len(accepted)
 
-            # Get logits for next cycle from the last accepted token
+            # Next cycle: reuse the verify logit at the accepted boundary
             if accepted and accepted[-1] not in EOS_TOKEN_IDS:
-                logits = run_forward(accepted[-1], pos - 1, kv_hist,
-                                     need_logits=True, use_draft=False)
-                # Adjust: if we already computed logits in verify, reuse
-                if len(accepted) <= len(verify_logits):
-                    last_verify_idx = len(accepted) - 1
-                    if last_verify_idx < len(verify_logits):
-                        logits = verify_logits[last_verify_idx]
+                last_idx = min(len(accepted), n_verify - 1)
+                logits = all_logits[last_idx]
             else:
                 break
 

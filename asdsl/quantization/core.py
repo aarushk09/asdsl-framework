@@ -420,13 +420,9 @@ def quantize_weights_with_outliers(
 ) -> tuple["QuantizedTensor", np.ndarray, np.ndarray]:
     """Quantize weights with SpQR-style outlier separation.
 
-    Detects weight outliers (values beyond threshold_sigma standard deviations)
-    and stores them separately in FP16 sparse format. The cleaned residual is
-    then quantized normally to the target bit-width.
-
-    This is critical for 2-bit and 3-bit quantization: without outlier
-    separation, a handful of extreme weights force the scale factor to be
-    enormous, wasting nearly all precision for the remaining 99.5% of weights.
+    Detects weight outliers and stores them separately in FP16 sparse format.
+    Uses ROW-LEVEL statistics (not per-group) for robust outlier detection,
+    avoiding the noisy sigma estimates from small group sizes (e.g., gs=16).
 
     Returns:
         qtensor:        QuantizedTensor of the cleaned residual
@@ -438,44 +434,45 @@ def quantize_weights_with_outliers(
     weights = weights.astype(np.float32)
     original_shape = weights.shape
 
-    W_flat = weights.reshape(-1, group_size)
-    group_std = W_flat.std(axis=1, keepdims=True)
-    group_mean = W_flat.mean(axis=1, keepdims=True)
+    if len(original_shape) < 2:
+        qtensor = quantize_weights(weights, bits=bits, group_size=group_size,
+                                   symmetric=symmetric, optimize_clips=optimize_clips)
+        return qtensor, np.array([], dtype=np.float16), np.zeros((0, 2), dtype=np.int32)
 
-    # Avoid division by zero for constant groups
-    group_std = np.maximum(group_std, 1e-10)
+    rows, cols = original_shape
 
-    outlier_mask = np.abs(W_flat - group_mean) > (outlier_threshold_sigma * group_std)
+    # Use ROW-level statistics for robust outlier detection.
+    # Per-group stats with group_size=16 have ~35% CV and flag far too many values.
+    row_std = weights.std(axis=1, keepdims=True)
+    row_mean = weights.mean(axis=1, keepdims=True)
+    row_std = np.maximum(row_std, 1e-10)
 
+    outlier_mask = np.abs(weights - row_mean) > (outlier_threshold_sigma * row_std)
+
+    # Hard-cap: never exceed fraction_cap of total elements
     n_outliers = outlier_mask.sum()
-    total_elements = weights.size
+    max_outliers = int(weights.size * outlier_fraction_cap)
 
-    if n_outliers / total_elements > outlier_fraction_cap:
-        abs_dev = np.abs(W_flat - group_mean)
-        n_keep = int(total_elements * outlier_fraction_cap)
-        if n_keep > 0:
-            threshold_val = np.partition(abs_dev.ravel(), -n_keep)[-n_keep]
-            outlier_mask = abs_dev >= threshold_val
-        else:
-            outlier_mask = np.zeros_like(outlier_mask)
+    if n_outliers > max_outliers and max_outliers > 0:
+        abs_dev = np.abs(weights - row_mean).ravel()
+        top_indices = np.argpartition(abs_dev, -max_outliers)[-max_outliers:]
+        outlier_mask = np.zeros(weights.size, dtype=bool)
+        outlier_mask[top_indices] = True
+        outlier_mask = outlier_mask.reshape(original_shape)
+    elif max_outliers == 0:
+        outlier_mask = np.zeros_like(outlier_mask)
 
-    # Reshape mask back to original weight shape
-    outlier_mask_orig = outlier_mask.reshape(original_shape)
-
-    # Extract outlier coordinates and values
-    outlier_coords = np.argwhere(outlier_mask_orig).astype(np.int32)
+    outlier_coords = np.argwhere(outlier_mask).astype(np.int32)
     if len(outlier_coords) > 0:
         outlier_values = weights[outlier_coords[:, 0], outlier_coords[:, 1]].astype(np.float16)
     else:
         outlier_values = np.array([], dtype=np.float16)
         outlier_coords = np.zeros((0, 2), dtype=np.int32)
 
-    # Zero out outliers in residual
     W_residual = weights.copy()
     if len(outlier_coords) > 0:
         W_residual[outlier_coords[:, 0], outlier_coords[:, 1]] = 0.0
 
-    # Quantize the cleaned residual
     qtensor = quantize_weights(
         W_residual, bits=bits, group_size=group_size,
         symmetric=symmetric, optimize_clips=optimize_clips,
