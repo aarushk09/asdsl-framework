@@ -262,26 +262,83 @@ class WeightStore:
     def load(self) -> None:
         idx = json.loads(INDEX_FILE.read_text())["weight_map"]
 
+        # Build needed from actual index keys so we support both naming conventions
+        # (e.g. qkv_proj.base_layer.weight vs q_proj/k_proj/v_proj.weight)
+        needed = set()
+        for k in idx:
+            if k == "model.embed_tokens.weight" or k == "model.norm.weight":
+                needed.add(k)
+            elif "layers." in k and "layernorm" in k and k.endswith(".weight"):
+                needed.add(k)
+            elif "self_attn" in k and k.endswith(".weight"):
+                needed.add(k)
+            elif "mlp" in k and k.endswith(".weight"):
+                needed.add(k)
+
         # Which shard holds which key
         shard_keys: dict[str, list[str]] = {}
-        needed = set()
-        needed.add("model.embed_tokens.weight")
-        needed.add("model.norm.weight")
-        for i in range(NUM_LAYERS):
-            needed.add(f"model.layers.{i}.input_layernorm.weight")
-            needed.add(f"model.layers.{i}.post_attention_layernorm.weight")
-            needed.add(f"model.layers.{i}.self_attn.qkv_proj.base_layer.weight")
-            needed.add(f"model.layers.{i}.self_attn.o_proj.base_layer.weight")
-            needed.add(f"model.layers.{i}.mlp.gate_up_proj.base_layer.weight")
-            needed.add(f"model.layers.{i}.mlp.down_proj.base_layer.weight")
-
         for k in needed:
-            if k in idx:
-                shard = idx[k]
-                shard_keys.setdefault(shard, []).append(k)
+            shard = idx[k]
+            shard_keys.setdefault(shard, []).append(k)
 
         total_proj = NUM_LAYERS * len(_PROJECTION_NAMES)
         done = 0
+        # Accumulate separate q_proj, k_proj, v_proj then concat into qkv_proj per layer
+        _pending_qkv: dict[int, dict[str, torch.Tensor]] = {}
+
+        def flush_qkv(layer_idx: int) -> None:
+            nonlocal done
+            p = _pending_qkv.get(layer_idx)
+            if not p or set(p) != {"q", "k", "v"}:
+                return
+            q, k, v = p["q"], p["k"], p["v"]
+            del _pending_qkv[layer_idx]
+            # Concat along output dim (dim 0): [q_out, k_out, v_out]
+            stacked = torch.cat([q, k, v], dim=0)
+            friendly = "qkv_proj"
+            if self.bits == 16:
+                self._weight_cache[(layer_idx, friendly)] = stacked.to(torch.float16)
+            else:
+                w_f32 = stacked.to(torch.float32).numpy()
+                if self.bits <= 3:
+                    from asdsl.quantization.core import quantize_weights_with_outliers
+                    sigma = 3.0 if self.bits == 2 else 3.5
+                    cap = 0.005
+                    qt, ov, oc = quantize_weights_with_outliers(
+                        w_f32, bits=self.bits,
+                        group_size=self.group_size,
+                        outlier_threshold_sigma=sigma,
+                        outlier_fraction_cap=cap,
+                        symmetric=self._symmetric,
+                        optimize_clips=self._optimize_clips,
+                    )
+                    self._outlier_values[(layer_idx, friendly)] = ov
+                    self._outlier_coords[(layer_idx, friendly)] = oc
+                else:
+                    qt = self._quantize(w_f32, bits=self.bits,
+                                        group_size=self.group_size,
+                                        symmetric=self._symmetric,
+                                        optimize_clips=self._optimize_clips)
+                self.layers.setdefault(layer_idx, {})[friendly] = qt
+                if self._enable_qcsd and self.bits > self._draft_bits:
+                    from asdsl.quantization.core import quantize_weights_with_outliers
+                    d_sigma = 3.0 if self._draft_bits == 2 else 3.5
+                    d_cap = 0.005
+                    qt_d, ov_d, oc_d = quantize_weights_with_outliers(
+                        w_f32, bits=self._draft_bits,
+                        group_size=self._draft_group_size,
+                        outlier_threshold_sigma=d_sigma,
+                        outlier_fraction_cap=d_cap,
+                        symmetric=False,
+                        optimize_clips=True,
+                    )
+                    self.layers.setdefault(layer_idx, {})["_draft_" + friendly] = qt_d
+                    self._draft_outlier_values[(layer_idx, friendly)] = ov_d
+                    self._draft_outlier_coords[(layer_idx, friendly)] = oc_d
+            done += 1
+            if done % 16 == 0 or done == total_proj:
+                pct = done / total_proj * 100
+                print(f"    {done}/{total_proj} ({pct:.0f}%)  ", end="\r", flush=True)
 
         if self.bits == 16:
             print(f"  Loading {total_proj} projection weights directly as float16 (no quantization) ...")
@@ -310,9 +367,21 @@ class WeightStore:
                             tensor.to(torch.float32)
                         continue
 
-                    # Derive friendly key like "qkv_proj" / "o_proj" etc.
+                    # Derive friendly key; support both fused (qkv_proj) and separate (q_proj, k_proj, v_proj)
                     if "qkv_proj" in key:
                         friendly = "qkv_proj"
+                    elif "q_proj" in key:
+                        _pending_qkv.setdefault(layer_idx, {})["q"] = tensor
+                        flush_qkv(layer_idx)
+                        continue
+                    elif "k_proj" in key:
+                        _pending_qkv.setdefault(layer_idx, {})["k"] = tensor
+                        flush_qkv(layer_idx)
+                        continue
+                    elif "v_proj" in key:
+                        _pending_qkv.setdefault(layer_idx, {})["v"] = tensor
+                        flush_qkv(layer_idx)
+                        continue
                     elif "o_proj" in key:
                         friendly = "o_proj"
                     elif "gate_up_proj" in key:
@@ -320,7 +389,7 @@ class WeightStore:
                     elif "down_proj" in key:
                         friendly = "down_proj"
                     else:
-                        friendly = key.split(".")[-1]
+                        continue  # skip unknown projection key
 
                     if self.bits == 16:
                         self._weight_cache[(layer_idx, friendly)] = tensor.to(torch.float16)
