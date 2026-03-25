@@ -93,11 +93,27 @@ def main():
         print("Assistant: ", end="", flush=True)
 
         prefill_start = time.perf_counter()
-        
-        # Prefill all but the last token (using the current sequence position)
-        for i in range(len(input_ids) - 1):
+
+        # Prefill route: batch GEMM for T>1, scalar GEMV decode path for T=1.
+        prefill_ids = input_ids[:-1]
+        if len(prefill_ids) > 1:
+            native_forward.prefill_prompt_tokens(
+                np.asarray(prefill_ids, dtype=np.int32),
+                current_seq_pos,
+                mmap_store,
+                num_layers,
+                dim,
+                hidden_dim,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                vocab_size,
+                cache,
+            )
+            current_seq_pos += len(prefill_ids)
+        elif len(prefill_ids) == 1:
             native_forward.generate_token(
-                input_ids[i], current_seq_pos, mmap_store,
+                prefill_ids[0], current_seq_pos, mmap_store,
                 num_layers, dim, hidden_dim, num_heads, num_kv_heads, head_dim, vocab_size,
                 cache
             )

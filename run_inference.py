@@ -58,11 +58,27 @@ def main():
     
     seq_pos = 0
     next_token = input_ids[0]
-    
-    # Feed prompt tokens sequentially to build KV cache history
-    for i in range(len(input_ids) - 1):
+
+    # Prefill route: T>1 uses batched tiled GEMM; T=1 stays on decode GEMV.
+    prefill_ids = input_ids[:-1]
+    if len(prefill_ids) > 1:
+        native_forward.prefill_prompt_tokens(
+            np.asarray(prefill_ids, dtype=np.int32),
+            seq_pos,
+            mmap_store,
+            num_layers,
+            dim,
+            hidden_dim,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size,
+            cache,
+        )
+        seq_pos += len(prefill_ids)
+    elif len(prefill_ids) == 1:
         native_forward.generate_token(
-            input_ids[i], seq_pos, mmap_store,
+            prefill_ids[0], seq_pos, mmap_store,
             num_layers, dim, hidden_dim, num_heads, num_kv_heads, head_dim, vocab_size,
             cache
         )

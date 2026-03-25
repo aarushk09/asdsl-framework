@@ -39,11 +39,11 @@ def get_native_extensions():
         # MSVC OpenMP
         extra_compile_args.append("/openmp")
     elif sys.platform == "darwin":
-        extra_compile_args = ["-mavx2", "-mfma", "-O3", "-ffast-math"]
+        extra_compile_args = ["-mavx2", "-mfma", "-mf16c", "-O3", "-ffast-math"]
         extra_compile_args.append("-std=c++17")
     else:
         extra_compile_args = [
-            "-mavx2", "-mfma", "-O3", "-ffast-math", "-std=c++17",
+            "-mavx2", "-mfma", "-mf16c", "-O3", "-ffast-math", "-std=c++17",
         ]
         extra_compile_args.append("-fopenmp")
         extra_link_args.append("-fopenmp")
