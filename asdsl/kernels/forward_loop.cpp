@@ -1,10 +1,11 @@
-﻿#include <pybind11/pybind11.h>
+#include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <windows.h>
 #include <immintrin.h>
 #include <thread>
 #include <vector>
 #include <iostream>
+#include <cmath>
 
 namespace py = pybind11;
 
@@ -25,42 +26,30 @@ public:
     size_t size;
     std::unordered_map<std::string, uint8_t*> tensors;
 
-    MmapWeights(const std::string& filepath, py::dict metadata) {
+    MmapWeights(const std::string& filepath, py::dict metadata) : data(nullptr), hMapping(NULL), hFile(INVALID_HANDLE_VALUE) {
         hFile = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) throw std::runtime_error("Failed to open file");
         
         LARGE_INTEGER li;
         GetFileSizeEx(hFile, &li);
         size = li.QuadPart;
-        
+
         hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
         if (!hMapping) throw std::runtime_error("Failed to create mapping");
-        
+
         data = (uint8_t*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
         if (!data) throw std::runtime_error("Failed to map view");
 
-        // Parse offsets from the metadata JSON passed as a Python dict
         for (auto item : metadata) {
             std::string key = py::cast<std::string>(item.first);
             py::dict info = py::cast<py::dict>(item.second);
             size_t offset = py::cast<size_t>(info["offset"]);
             tensors[key] = data + offset;
         }
-
-        // --- DEBUG PRINT ---
-        std::string test_key = "model.layers.0.self_attn.qkv_proj.base_layer.weight";
-        if (tensors.find(test_key) != tensors.end()) {
-            std::cout << "[C++ MMAP DEBUG] First 5 bytes of " << test_key << ": ";
-            uint8_t* ptr = tensors[test_key];
-            for (int i = 0; i < 5; i++) {
-                printf("%02X ", ptr[i]);
-            }
-            std::cout << std::endl;
-        } else {
-            std::cout << "[C++ MMAP DEBUG] Key " << test_key << " not found in metadata!" << std::endl;
-        }
     }
-    
+
+    void test_gemv_q4() {}
+
     ~MmapWeights() {
         if (data) UnmapViewOfFile(data);
         if (hMapping) CloseHandle(hMapping);
@@ -68,65 +57,264 @@ public:
     }
 };
 
-// Step 3: AVX2 Unpacking and MatVec (Simplified core loop)
 void gemv_q4_avx2(const BlockQ4_32* weights, const float* activations, float* output, int num_blocks) {
-    // Note: FP16 to FP32 conversion requires F16C extension (_mm256_cvtph_ps)
     for (int b = 0; b < num_blocks; ++b) {
         const BlockQ4_32& block = weights[b];
-        
-        // Load half-precision scale (convert to float format logic here - omitted for brevity)
-        float scale = 1.0f; // placeholder for _cvtsh_ss(block.scale)
-
-        // Load 16 bytes of 4-bit weights
-        __m128i raw_w = _mm_loadu_si128((const __m128i*)block.weights);
-        
-        // Extract lower 4 bits
-        __m128i mask = _mm_set1_epi8(0x0F);
-        __m128i lower = _mm_and_si128(raw_w, mask);
-        
-        // Extract upper 4 bits
-        __m128i upper = _mm_and_si128(_mm_srli_epi16(raw_w, 4), mask);
-        
-        // (Convert lower/upper to float and perform 32-element dot product with activations... omitted full unroll for brevity)
     }
 }
 
-// Step 4: Strangle Thread Pool to Physical Cores
+void gemv_f32(const float* weights, const float* activations, float* output, int out_dim, int in_dim) {
+    for (int i = 0; i < out_dim; ++i) {
+        float sum = 0.0f;
+        for (int j = 0; j < in_dim; ++j) {
+            sum += weights[i * in_dim + j] * activations[j];
+        }
+        output[i] += sum;
+    }
+}
+
+void apply_rmsnorm(float* x, const float* weight, int size, float eps) {
+    float sum_sq = 0.0f;
+    for (int i = 0; i < size; ++i) sum_sq += x[i] * x[i];
+    float rms = std::sqrt(sum_sq / size + eps);
+    float inv_rms = 1.0f / rms;
+    for (int i = 0; i < size; ++i) {
+        x[i] = x[i] * inv_rms * weight[i];
+    }
+}
+
+void apply_rope(float* q, float* k, int seq_pos, int head_dim, int num_heads, int num_kv_heads, float theta) {
+    int half_dim = head_dim / 2;
+    for (int d = 0; d < half_dim; ++d) {
+        float freq = seq_pos * (1.0f / std::pow(theta, (float)(2 * d) / head_dim));
+        float cos_f = std::cos(freq);
+        float sin_f = std::sin(freq);
+
+        for (int h = 0; h < num_heads; ++h) {
+            float* q_p = q + h * head_dim + d;
+            float* q_p2 = q_p + half_dim;
+            float q1 = *q_p;
+            float q2 = *q_p2;
+            *q_p = q1 * cos_f - q2 * sin_f;
+            *q_p2 = q2 * cos_f + q1 * sin_f;
+        }
+
+        for (int h = 0; h < num_kv_heads; ++h) {
+            float* k_p = k + h * head_dim + d;
+            float* k_p2 = k_p + half_dim;
+            float k1 = *k_p;
+            float k2 = *k_p2;
+            *k_p = k1 * cos_f - k2 * sin_f;
+            *k_p2 = k2 * cos_f + k1 * sin_f;
+        }
+    }
+}
+
 void pin_thread_to_core(int core_id) {
     DWORD_PTR mask = (1ULL << core_id);
     SetThreadAffinityMask(GetCurrentThread(), mask);
 }
 
-// Step 5: C++ KV Cache
 struct KVCache {
-    std::vector<float> keys;
-    std::vector<float> values;
+    int num_layers;
     int max_seq_len;
+    int num_kv_heads;
     int head_dim;
-    int num_heads;
-    int current_seq_len;
-    
-    KVCache(int max_len, int heads, int dim) 
-        : max_seq_len(max_len), num_heads(heads), head_dim(dim), current_seq_len(0) {
-        keys.resize(max_len * heads * dim);
-        values.resize(max_len * heads * dim);
+    std::vector<float> k_cache;
+    std::vector<float> v_cache;
+
+    KVCache(int layers, int seq_len, int kv_heads, int dim)
+        : num_layers(layers), max_seq_len(seq_len), num_kv_heads(kv_heads), head_dim(dim) {
+        size_t size = (size_t)layers * seq_len * kv_heads * dim;
+        k_cache.resize(size, 0.0f);
+        v_cache.resize(size, 0.0f);
     }
-    
-    void append(const float* k, const float* v) {
-        if (current_seq_len >= max_seq_len) return; // overflow
-        size_t offset = current_seq_len * num_heads * head_dim;
-        memcpy(keys.data() + offset, k, num_heads * head_dim * sizeof(float));
-        memcpy(values.data() + offset, v, num_heads * head_dim * sizeof(float));
-        current_seq_len++;
+
+    inline size_t get_offset(int layer, int pos) const {
+        return ((size_t)layer * max_seq_len + pos) * num_kv_heads * head_dim;
+    }
+
+    void set_history(int layer, int pos, const float* k, const float* v) {
+        size_t off = get_offset(layer, pos);
+        memcpy(&k_cache[off], k, num_kv_heads * head_dim * sizeof(float));
+        memcpy(&v_cache[off], v, num_kv_heads * head_dim * sizeof(float));
     }
 };
 
+void compute_attention(float* out, const float* q, const float* k, const float* v, int layer_id, int seq_pos, int num_heads, KVCache& cache) {
+    int num_kv_heads = cache.num_kv_heads;
+    int head_dim = cache.head_dim;
+    float scale = 1.0f / std::sqrt((float)head_dim);
+    int groups = num_heads / num_kv_heads;
+
+    size_t cache_off = cache.get_offset(layer_id, seq_pos);
+    memcpy(&cache.k_cache[cache_off], k, num_kv_heads * head_dim * sizeof(float));      
+    memcpy(&cache.v_cache[cache_off], v, num_kv_heads * head_dim * sizeof(float));      
+
+    std::vector<float> scores(seq_pos + 1);
+
+    for (int h = 0; h < num_heads; ++h) {
+        int kv_h = h / groups;
+        const float* q_h = q + h * head_dim;
+        float* out_h = out + h * head_dim;
+        float max_score = -1e9f;
+
+        for (int p = 0; p <= seq_pos; ++p) {
+            const float* k_p = &cache.k_cache[cache.get_offset(layer_id, p) + kv_h * head_dim];
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                score += q_h[d] * k_p[d];
+            }
+            score *= scale;
+            scores[p] = score;
+            if (score > max_score) max_score = score;
+        }
+
+        float exp_sum = 0.0f;
+        for (int p = 0; p <= seq_pos; ++p) {
+            scores[p] = std::exp(scores[p] - max_score);
+            exp_sum += scores[p];
+        }
+        for (int p = 0; p <= seq_pos; ++p) {
+            scores[p] /= exp_sum;
+        }
+
+        for (int d = 0; d < head_dim; ++d) {
+            out_h[d] = 0.0f;
+        }
+        for (int p = 0; p <= seq_pos; ++p) {
+            float s = scores[p];
+            const float* v_p = &cache.v_cache[cache.get_offset(layer_id, p) + kv_h * head_dim];
+            for (int d = 0; d < head_dim; ++d) {
+                out_h[d] += s * v_p[d];
+            }
+        }
+    }
+}
+
+void forward_layer(float* x, const float* rms1_w, const float* qkv_w, const float* o_w, const float* rms2_w, 
+                  const float* gate_w, const float* up_w, const float* down_w,
+                  int dim, int hidden_dim, int num_heads, int num_kv_heads, int head_dim, 
+                  int layer_id, int seq_pos, KVCache& cache) {
+    
+    std::vector<float> res1(dim);
+    memcpy(res1.data(), x, dim * sizeof(float));
+
+    std::vector<float> h(dim);
+    memcpy(h.data(), x, dim * sizeof(float));
+    
+    apply_rmsnorm(h.data(), rms1_w, dim, 1e-5f);
+
+    int q_dim = num_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int qkv_dim = q_dim + 2 * kv_dim;
+    std::vector<float> qkv(qkv_dim, 0.0f);
+    
+    gemv_f32(qkv_w, h.data(), qkv.data(), qkv_dim, dim);
+    
+    float* q = qkv.data();
+    float* k = qkv.data() + q_dim;
+    float* v = qkv.data() + q_dim + kv_dim;
+
+    apply_rope(q, k, seq_pos, head_dim, num_heads, num_kv_heads, 10000.0f);
+
+    std::vector<float> attn_out(q_dim, 0.0f);
+    compute_attention(attn_out.data(), q, k, v, layer_id, seq_pos, num_heads, cache);
+
+    std::vector<float> o_out(dim, 0.0f);
+    gemv_f32(o_w, attn_out.data(), o_out.data(), dim, q_dim);
+
+    for(int i=0; i<dim; ++i) x[i] = res1[i] + o_out[i];
+    
+    std::vector<float> res2(dim);
+    memcpy(res2.data(), x, dim * sizeof(float));
+
+    memcpy(h.data(), x, dim * sizeof(float));
+    apply_rmsnorm(h.data(), rms2_w, dim, 1e-5f);
+
+    std::vector<float> gate(hidden_dim, 0.0f);
+    std::vector<float> up(hidden_dim, 0.0f);
+
+    gemv_f32(gate_w, h.data(), gate.data(), hidden_dim, dim);
+    gemv_f32(up_w, h.data(), up.data(), hidden_dim, dim);
+
+    for (int i=0; i<hidden_dim; ++i) {
+        float x_gate = gate[i];
+        float silu = x_gate / (1.0f + std::exp(-x_gate));
+        gate[i] = silu * up[i];
+    }
+
+    std::vector<float> down(dim, 0.0f);
+    gemv_f32(down_w, gate.data(), down.data(), dim, hidden_dim);
+
+    for(int i=0; i<dim; ++i) x[i] = res2[i] + down[i];
+}
+
+
+// Pybind wrappers
+void py_kvc_set_history(KVCache& cache, int layer, int pos, py::array_t<float> k, py::array_t<float> v) {
+    py::buffer_info k_buf = k.request();
+    py::buffer_info v_buf = v.request();
+    cache.set_history(layer, pos, (const float*)k_buf.ptr, (const float*)v_buf.ptr);    
+}
+
+py::array_t<float> py_compute_attention(py::array_t<float> q, py::array_t<float> k, py::array_t<float> v, int layer_id, int seq_pos, int num_heads, KVCache& cache) {
+    py::buffer_info q_buf = q.request();
+    py::buffer_info k_buf = k.request();
+    py::buffer_info v_buf = v.request();
+    auto out = py::array_t<float>(q_buf.size);
+    py::buffer_info out_buf = out.request();
+    compute_attention((float*)out_buf.ptr, (const float*)q_buf.ptr, (const float*)k_buf.ptr, (const float*)v_buf.ptr, layer_id, seq_pos, num_heads, cache);
+    return out;
+}
+
+void py_apply_rmsnorm(py::array_t<float> x, py::array_t<float> weight, float eps) {     
+    py::buffer_info x_buf = x.request();
+    py::buffer_info w_buf = weight.request();
+    apply_rmsnorm((float*)x_buf.ptr, (const float*)w_buf.ptr, x_buf.shape[0], eps);
+}
+
+void py_apply_rope(py::array_t<float> q, py::array_t<float> k, int seq_pos, int head_dim, int num_heads, int num_kv_heads, float theta) {
+    py::buffer_info q_buf = q.request();
+    py::buffer_info k_buf = k.request();
+    apply_rope((float*)q_buf.ptr, (float*)k_buf.ptr, seq_pos, head_dim, num_heads, num_kv_heads, theta);
+}
+
+void py_forward_layer(py::array_t<float> x, py::array_t<float> rms1_w, py::array_t<float> qkv_w, py::array_t<float> o_w, 
+                     py::array_t<float> rms2_w, py::array_t<float> gate_w, py::array_t<float> up_w, py::array_t<float> down_w, 
+                     int dim, int hidden_dim, int num_heads, int num_kv_heads, int head_dim, 
+                     int layer_id, int seq_pos, KVCache& cache) {
+    py::buffer_info x_buf = x.request();
+    py::buffer_info rms1_buf = rms1_w.request();
+    py::buffer_info qkv_buf = qkv_w.request();
+    py::buffer_info o_buf = o_w.request();
+    py::buffer_info rms2_buf = rms2_w.request();
+    py::buffer_info gate_buf = gate_w.request();
+    py::buffer_info up_buf = up_w.request();
+    py::buffer_info down_buf = down_w.request();
+
+    forward_layer(
+        (float*)x_buf.ptr, (const float*)rms1_buf.ptr, (const float*)qkv_buf.ptr, (const float*)o_buf.ptr,
+        (const float*)rms2_buf.ptr, (const float*)gate_buf.ptr, (const float*)up_buf.ptr, (const float*)down_buf.ptr,
+        dim, hidden_dim, num_heads, num_kv_heads, head_dim, layer_id, seq_pos, cache
+    );
+}
+
 PYBIND11_MODULE(_native_forward, m) {
     py::class_<MmapWeights>(m, "MmapWeights")
-        .def(py::init<const std::string&, py::dict>());
+        .def(py::init<const std::string&, py::dict>())
+        .def("test_gemv_q4", &MmapWeights::test_gemv_q4);
 
     py::class_<KVCache>(m, "KVCache")
-        .def(py::init<int, int, int>());
-        
+        .def(py::init<int, int, int, int>())
+        .def("set_history", &py_kvc_set_history);
+
+    m.def("compute_attention", &py_compute_attention, "Compute SDPA");
     m.def("set_thread_affinity", &pin_thread_to_core);
+    m.def("apply_rmsnorm", &py_apply_rmsnorm, "Apply RMSNorm in-place",
+          py::arg("x"), py::arg("weight"), py::arg("eps") = 1e-5f);
+    m.def("apply_rope", &py_apply_rope, "Apply RoPE in-place",
+          py::arg("q"), py::arg("k"), py::arg("seq_pos"), py::arg("head_dim"),  
+          py::arg("num_heads"), py::arg("num_kv_heads"), py::arg("theta") = 10000.0f);
+    m.def("forward_layer", &py_forward_layer, "Forward layer execution");
 }
