@@ -313,6 +313,34 @@ class MemoryManager:
             "num_nodes": len(self._numa_nodes),
         }
 
+    def allocate_q8_kv_cache(
+        self,
+        num_layers: int,
+        max_seq_len: int,
+        num_kv_heads: int,
+        head_dim: int,
+        scale_group_size: int = 64,
+    ) -> dict[str, np.ndarray]:
+        """Allocate a contiguous Q8 KV cache with per-group FP32 scales.
+
+        Returns dictionary with int8 key/value tensors plus per-group scales.
+        """
+        blocks_per_head = (head_dim + scale_group_size - 1) // scale_group_size
+
+        k_q = np.zeros((num_layers, max_seq_len, num_kv_heads, head_dim), dtype=np.int8)
+        v_q = np.zeros((num_layers, max_seq_len, num_kv_heads, head_dim), dtype=np.int8)
+
+        k_scales = np.ones((num_layers, max_seq_len, num_kv_heads, blocks_per_head), dtype=np.float32)
+        v_scales = np.ones((num_layers, max_seq_len, num_kv_heads, blocks_per_head), dtype=np.float32)
+
+        return {
+            "k_q": k_q,
+            "v_q": v_q,
+            "k_scales": k_scales,
+            "v_scales": v_scales,
+            "scale_group_size": np.array([scale_group_size], dtype=np.int32),
+        }
+
     @property
     def total_allocated_mb(self) -> float:
         return sum(r.size_bytes for r in self._regions.values()) / (1024 * 1024)

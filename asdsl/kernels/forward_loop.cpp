@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 #include <limits>
+#include <cmath>
 
 namespace py = pybind11;
 
@@ -433,14 +434,206 @@ private:
 };
 
 struct KVCache {
+    static constexpr int KV_QBLOCK = 64;
+
     KVCache(int layers, int max_seq_len, int num_kv_heads, int head_dim)
-        : layers(layers), max_seq_len(max_seq_len), num_kv_heads(num_kv_heads), head_dim(head_dim) {}
+        : layers(layers), max_seq_len(max_seq_len), num_kv_heads(num_kv_heads), head_dim(head_dim) {
+        blocks_per_head = (head_dim + KV_QBLOCK - 1) / KV_QBLOCK;
+        const size_t kv_size = static_cast<size_t>(layers) * max_seq_len * num_kv_heads * head_dim;
+        const size_t scale_size = static_cast<size_t>(layers) * max_seq_len * num_kv_heads * blocks_per_head;
+        k_cache_q8.assign(kv_size, 0);
+        v_cache_q8.assign(kv_size, 0);
+        k_scales.assign(scale_size, 1.0f);
+        v_scales.assign(scale_size, 1.0f);
+    }
+
+    inline size_t kv_base(int layer, int pos, int kv_head) const {
+        return ((((static_cast<size_t>(layer) * max_seq_len) + pos) * num_kv_heads) + kv_head) * head_dim;
+    }
+
+    inline size_t scale_base(int layer, int pos, int kv_head) const {
+        return ((((static_cast<size_t>(layer) * max_seq_len) + pos) * num_kv_heads) + kv_head) * blocks_per_head;
+    }
+
+    void set_history(int layer, int pos, const float* k, const float* v) {
+        if (layer < 0 || layer >= layers || pos < 0 || pos >= max_seq_len) {
+            return;
+        }
+        for (int h = 0; h < num_kv_heads; ++h) {
+            const float* kh = k + static_cast<size_t>(h) * head_dim;
+            const float* vh = v + static_cast<size_t>(h) * head_dim;
+            const size_t kvb = kv_base(layer, pos, h);
+            const size_t sb = scale_base(layer, pos, h);
+
+            for (int b = 0; b < blocks_per_head; ++b) {
+                const int off = b * KV_QBLOCK;
+                const int len = std::min(KV_QBLOCK, head_dim - off);
+                float k_absmax = 0.0f;
+                float v_absmax = 0.0f;
+                for (int i = 0; i < len; ++i) {
+                    k_absmax = std::max(k_absmax, std::fabs(kh[off + i]));
+                    v_absmax = std::max(v_absmax, std::fabs(vh[off + i]));
+                }
+                const float ks = (k_absmax > 1e-12f) ? (k_absmax / 127.0f) : 1e-12f;
+                const float vs = (v_absmax > 1e-12f) ? (v_absmax / 127.0f) : 1e-12f;
+                k_scales[sb + b] = ks;
+                v_scales[sb + b] = vs;
+
+                const float kinv = 1.0f / ks;
+                const float vinv = 1.0f / vs;
+                for (int i = 0; i < len; ++i) {
+                    int qk = static_cast<int>(std::nearbyint(kh[off + i] * kinv));
+                    int qv = static_cast<int>(std::nearbyint(vh[off + i] * vinv));
+                    qk = std::max(-127, std::min(127, qk));
+                    qv = std::max(-127, std::min(127, qv));
+                    k_cache_q8[kvb + off + i] = static_cast<int8_t>(qk);
+                    v_cache_q8[kvb + off + i] = static_cast<int8_t>(qv);
+                }
+            }
+        }
+    }
 
     int layers;
     int max_seq_len;
     int num_kv_heads;
     int head_dim;
+    int blocks_per_head;
+    std::vector<int8_t> k_cache_q8;
+    std::vector<int8_t> v_cache_q8;
+    std::vector<float> k_scales;
+    std::vector<float> v_scales;
 };
+
+static constexpr int BLOCK_Q = 32;
+static constexpr int BLOCK_K = 64;
+
+static py::array_t<float> compute_attention_flash_q8(
+    py::array_t<float, py::array::c_style | py::array::forcecast> q,
+    py::array_t<float, py::array::c_style | py::array::forcecast> k,
+    py::array_t<float, py::array::c_style | py::array::forcecast> v,
+    int layer_id,
+    int seq_pos,
+    int num_heads,
+    KVCache& cache) {
+    py::buffer_info q_buf = q.request();
+    py::buffer_info k_buf = k.request();
+    py::buffer_info v_buf = v.request();
+
+    if (q_buf.ndim != 2 || k_buf.ndim != 2 || v_buf.ndim != 2) {
+        throw std::runtime_error("q, k, v must be 2D arrays");
+    }
+
+    const int head_dim = cache.head_dim;
+    const int num_kv_heads = cache.num_kv_heads;
+    const int q_heads = static_cast<int>(q_buf.shape[0]);
+    if (q_heads != num_heads || q_buf.shape[1] != head_dim) {
+        throw std::runtime_error("q shape mismatch");
+    }
+    if (k_buf.shape[0] != num_kv_heads || k_buf.shape[1] != head_dim ||
+        v_buf.shape[0] != num_kv_heads || v_buf.shape[1] != head_dim) {
+        throw std::runtime_error("k/v shape mismatch");
+    }
+
+    cache.set_history(layer_id, seq_pos, static_cast<const float*>(k_buf.ptr), static_cast<const float*>(v_buf.ptr));
+
+    auto out = py::array_t<float>({num_heads, head_dim});
+    py::buffer_info out_buf = out.request();
+    float* out_ptr = static_cast<float*>(out_buf.ptr);
+    const float* q_ptr = static_cast<const float*>(q_buf.ptr);
+
+    const int groups = std::max(1, num_heads / num_kv_heads);
+    const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    #pragma omp parallel for schedule(static)
+    for (int h = 0; h < num_heads; ++h) {
+        const int kv_h = h / groups;
+        const float* qh = q_ptr + static_cast<size_t>(h) * head_dim;
+        std::vector<float> num(head_dim, 0.0f);
+        float m = -std::numeric_limits<float>::infinity();
+        float l = 0.0f;
+
+        for (int tk = 0; tk <= seq_pos; tk += BLOCK_K) {
+            const int kend = std::min(seq_pos + 1, tk + BLOCK_K);
+            const int span = kend - tk;
+            float scores[BLOCK_K];
+            float tile_max = -std::numeric_limits<float>::infinity();
+
+            for (int p = 0; p < span; ++p) {
+                const int pos = tk + p;
+                const size_t kb = cache.kv_base(layer_id, pos, kv_h);
+                const size_t sb = cache.scale_base(layer_id, pos, kv_h);
+                float dot = 0.0f;
+                for (int b = 0; b < cache.blocks_per_head; ++b) {
+                    const int off = b * KVCache::KV_QBLOCK;
+                    const int len = std::min(KVCache::KV_QBLOCK, head_dim - off);
+                    const float ks = cache.k_scales[sb + b];
+                    const int8_t* kq = cache.k_cache_q8.data() + kb + off;
+                    for (int i = 0; i < len; ++i) {
+                        dot += qh[off + i] * (static_cast<float>(kq[i]) * ks);
+                    }
+                }
+                const float s = dot * inv_sqrt_d;
+                scores[p] = s;
+                tile_max = std::max(tile_max, s);
+            }
+
+            const float new_m = std::max(m, tile_max);
+            const float old_scale = (l > 0.0f) ? std::exp(m - new_m) : 0.0f;
+            float tile_l = 0.0f;
+            std::vector<float> tile_num(head_dim, 0.0f);
+
+            for (int p = 0; p < span; ++p) {
+                const int pos = tk + p;
+                const float w = std::exp(scores[p] - new_m);
+                tile_l += w;
+
+                const size_t vb = cache.kv_base(layer_id, pos, kv_h);
+                const size_t sb = cache.scale_base(layer_id, pos, kv_h);
+                for (int b = 0; b < cache.blocks_per_head; ++b) {
+                    const int off = b * KVCache::KV_QBLOCK;
+                    const int len = std::min(KVCache::KV_QBLOCK, head_dim - off);
+                    const float vs = cache.v_scales[sb + b];
+                    const int8_t* vq = cache.v_cache_q8.data() + vb + off;
+                    for (int i = 0; i < len; ++i) {
+                        tile_num[off + i] += w * (static_cast<float>(vq[i]) * vs);
+                    }
+                }
+            }
+
+            for (int i = 0; i < head_dim; ++i) {
+                num[i] = num[i] * old_scale + tile_num[i];
+            }
+            l = l * old_scale + tile_l;
+            m = new_m;
+        }
+
+        const float inv_l = (l > 1e-30f) ? (1.0f / l) : 0.0f;
+        float* oh = out_ptr + static_cast<size_t>(h) * head_dim;
+        for (int i = 0; i < head_dim; ++i) {
+            oh[i] = num[i] * inv_l;
+        }
+    }
+
+    return out;
+}
+
+void py_kvc_set_history(
+    KVCache& cache,
+    int layer,
+    int pos,
+    py::array_t<float, py::array::c_style | py::array::forcecast> k,
+    py::array_t<float, py::array::c_style | py::array::forcecast> v) {
+    py::buffer_info k_buf = k.request();
+    py::buffer_info v_buf = v.request();
+    if (k_buf.ndim != 2 || v_buf.ndim != 2) {
+        throw std::runtime_error("k and v must be 2D");
+    }
+    if (k_buf.shape[0] != cache.num_kv_heads || k_buf.shape[1] != cache.head_dim ||
+        v_buf.shape[0] != cache.num_kv_heads || v_buf.shape[1] != cache.head_dim) {
+        throw std::runtime_error("k/v shape mismatch for cache");
+    }
+    cache.set_history(layer, pos, static_cast<const float*>(k_buf.ptr), static_cast<const float*>(v_buf.ptr));
+}
 
 py::array_t<float> gemv_q4k_row_py(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> row_bytes,
@@ -666,7 +859,8 @@ PYBIND11_MODULE(_native_forward, m) {
         .def("test_gemv_q4", &MmapWeights::test_gemv_q4);
 
     py::class_<KVCache>(m, "KVCache")
-        .def(py::init<int, int, int, int>());
+        .def(py::init<int, int, int, int>())
+        .def("set_history", &py_kvc_set_history);
 
     m.def("set_thread_affinity", &pin_thread_to_core);
     m.def("pin_openmp_threads_to_pcores", &pin_openmp_threads_to_pcores, py::arg("enabled") = true);
@@ -678,6 +872,9 @@ PYBIND11_MODULE(_native_forward, m) {
         py::arg("num_layers"), py::arg("dim"), py::arg("hidden_dim"),
         py::arg("num_heads"), py::arg("num_kv_heads"), py::arg("head_dim"),
         py::arg("vocab_size"), py::arg("cache"));
+    m.def("compute_attention", &compute_attention_flash_q8,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("layer_id"),
+        py::arg("seq_pos"), py::arg("num_heads"), py::arg("cache"));
     m.def("generate_token", &generate_token_stub);
     m.def("generate_token", &generate_token_mmap_stub,
         py::arg("token_id"), py::arg("seq_pos"), py::arg("store"),
