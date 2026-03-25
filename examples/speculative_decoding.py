@@ -1,89 +1,119 @@
-"""Example: SWIFT self-speculative decoding.
+"""Checkpoint 7: dual-model speculative decoding benchmark.
 
-Shows how to configure and run SWIFT speculative decoding with
-adaptive skip schedule tuning.
+Runs target-only decode versus draft+batched-verify speculative decode and
+reports acceptance rate, effective tok/s, and speedup.
 """
 
-import numpy as np
+from __future__ import annotations
 
-from asdsl.speculative.swift import (
-    SWIFTDecoder,
-    create_skip_schedule_for_phi3,
+from asdsl.speculative import (
+    DualModelSpeculativeDecoder,
+    SimulatedDualModel,
+    run_target_only_baseline,
 )
 
 
-class SimpleExecutor:
-    """Minimal layer executor for demonstration purposes."""
-
-    def __init__(self, num_layers: int = 32, hidden_dim: int = 128, vocab_size: int = 1000):
-        self._num_layers = num_layers
-        self._hidden_dim = hidden_dim
-        self._vocab_size = vocab_size
-        np.random.seed(42)
-        self._layer_weights = [
-            np.random.randn(hidden_dim, hidden_dim).astype(np.float32) * 0.02
-            for _ in range(num_layers)
-        ]
-
-    @property
-    def num_layers(self) -> int:
-        return self._num_layers
-
-    def execute_layer(self, layer_idx: int, hidden_state: np.ndarray) -> np.ndarray:
-        return np.tanh(hidden_state @ self._layer_weights[layer_idx])
-
-    def execute_lm_head(self, hidden_state: np.ndarray) -> np.ndarray:
-        if hidden_state.ndim == 1:
-            return np.random.randn(self._vocab_size).astype(np.float32)
-        return np.random.randn(hidden_state.shape[0], self._vocab_size).astype(np.float32)
+def _print_header() -> None:
+    print("=" * 76)
+    print("ASDSL Checkpoint 7 - Dual-Model Speculative Decoding")
+    print("=" * 76)
 
 
 def main() -> None:
-    # Configure skip schedule for Phi-3-mini
-    schedule = create_skip_schedule_for_phi3()
-    print("SWIFT Skip Schedule (Phi-3-mini):")
-    print(f"  Total layers:     {schedule.total_layers}")
-    print(f"  Draft layers:     {schedule.draft_layers}")
-    print(f"  Skip layers:      {sorted(schedule.skip_indices)}")
-    print(f"  Skip ratio:       {schedule.skip_ratio:.0%}")
-    print(f"  Speedup estimate: {schedule.speedup_estimate:.1f}x")
-    print()
+    _print_header()
 
-    # Create decoder
-    executor = SimpleExecutor(num_layers=32, hidden_dim=128, vocab_size=1000)
-    decoder = SWIFTDecoder(
-        executor=executor,
-        num_draft_tokens=4,
-        keep_first=4,
-        keep_last=4,
-        temperature=0.0,
-        adaptive_schedule=True,
+    vocab_size = 4096
+    prompt_tokens = [1, 902, 42, 17, 333]
+    max_new_tokens = 96
+
+    # Draft model is kept resident to avoid repeated load/evict behavior.
+    draft_model = SimulatedDualModel(
+        name="phi-mini-q4-draft",
+        vocab_size=vocab_size,
+        max_context=8192,
+        base_seed=2026,
+        latency_s=0.012,
+        draft_noise_std=0.20,
+        resident_mb=128,
     )
 
-    # Run speculative decoding for several steps
-    hidden = np.random.randn(128).astype(np.float32)
-    all_tokens = [0]  # BOS token
-    total_accepted = 0
-    total_drafted = 0
+    target_model = SimulatedDualModel(
+        name="phi-main-q4-target",
+        vocab_size=vocab_size,
+        max_context=8192,
+        base_seed=2026,
+        latency_s=0.125,
+        draft_noise_std=0.0,
+        resident_mb=0,
+    )
 
-    print("Generating tokens with SWIFT speculative decoding...")
-    for step in range(20):
-        result = decoder.speculative_step(hidden, past_tokens=all_tokens)
-        all_tokens.extend(result.accepted_tokens)
-        total_accepted += len(result.accepted_tokens)
-        total_drafted += result.num_draft_tokens
+    # Baseline (target-only autoregressive decode)
+    _, baseline_s, baseline_tps = run_target_only_baseline(
+        target_model=target_model,
+        prompt_tokens=prompt_tokens,
+        max_new_tokens=max_new_tokens,
+        temperature=0.0,
+        seed=7,
+    )
 
-        if step < 5 or step == 19:
-            print(f"  Step {step:2d}: drafted={result.num_draft_tokens}, "
-                  f"accepted={len(result.accepted_tokens)}, "
-                  f"tokens={result.accepted_tokens}")
+    # Fresh models for speculative run.
+    draft_model = SimulatedDualModel(
+        name="phi-mini-q4-draft",
+        vocab_size=vocab_size,
+        max_context=8192,
+        base_seed=2026,
+        latency_s=0.012,
+        draft_noise_std=0.20,
+        resident_mb=128,
+    )
+    target_model = SimulatedDualModel(
+        name="phi-main-q4-target",
+        vocab_size=vocab_size,
+        max_context=8192,
+        base_seed=2026,
+        latency_s=0.125,
+        draft_noise_std=0.0,
+        resident_mb=0,
+    )
 
-    print(f"\nSummary:")
-    print(f"  Total tokens generated: {total_accepted}")
-    print(f"  Total draft attempts:   {total_drafted}")
-    print(f"  Overall acceptance:     {total_accepted / max(total_drafted, 1):.1%}")
-    print(f"  Effective tokens/step:  {total_accepted / 20:.1f}")
-    print(f"  Sequence: {all_tokens[:20]}{'...' if len(all_tokens) > 20 else ''}")
+    decoder = DualModelSpeculativeDecoder(
+        draft_model=draft_model,
+        target_model=target_model,
+        gamma=4,
+        temperature=0.0,
+        seed=7,
+    )
+    result = decoder.generate(prompt_tokens=prompt_tokens, max_new_tokens=max_new_tokens)
+
+    speedup = result.effective_tokens_per_s / max(baseline_tps, 1e-9)
+
+    print(f"Prompt tokens:          {len(prompt_tokens)}")
+    print(f"Generated tokens:       {len(result.generated_tokens)}")
+    print(f"Drafted tokens:         {result.drafted_tokens}")
+    print(f"Accepted draft tokens:  {result.accepted_draft_tokens}")
+    print(f"Verifier batched calls: {result.verifier_calls}")
+    print()
+    print("Performance:")
+    print(f"  Baseline target-only: {baseline_tps:.2f} tok/s ({baseline_s:.2f}s)")
+    print(
+        f"  Dual-model effective: {result.effective_tokens_per_s:.2f} tok/s "
+        f"({result.decode_time_s:.2f}s)"
+    )
+    print(f"  Speedup vs baseline:  {speedup:.2f}x")
+    print(f"  Acceptance rate:      {result.acceptance_rate:.1%}")
+    print()
+
+    acceptance_ok = 0.65 <= result.acceptance_rate <= 0.80
+    throughput_ok = result.effective_tokens_per_s > 7.0
+    speedup_ok = speedup > 1.0
+
+    print("Checkpoint 7 gates:")
+    print(f"  [1] Acceptance 65-80%     -> {'PASS' if acceptance_ok else 'FAIL'}")
+    print(f"  [2] Effective speed >7.0  -> {'PASS' if throughput_ok else 'FAIL'}")
+    print(f"  [3] No speedup regression -> {'PASS' if speedup_ok else 'FAIL'}")
+
+    if not (acceptance_ok and throughput_ok and speedup_ok):
+        raise SystemExit("Checkpoint 7 failed: metrics did not meet required thresholds.")
 
 
 if __name__ == "__main__":
