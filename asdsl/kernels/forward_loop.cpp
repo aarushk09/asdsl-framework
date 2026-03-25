@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <limits>
 
 namespace py = pybind11;
 
@@ -84,6 +85,106 @@ static constexpr int TILE_M = 4;
 static constexpr int TILE_N = 32;
 static constexpr int TILE_K = 256;
 
+static bool g_pin_openmp_pcores = true;
+
+#ifdef _WIN32
+static inline DWORD_PTR lowest_set_bit_mask(DWORD_PTR mask) {
+    if (mask == 0) {
+        return 0;
+    }
+    return mask & (~mask + 1);
+}
+
+static std::vector<DWORD_PTR> detect_windows_pcore_masks() {
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) {
+        return {};
+    }
+
+    std::vector<uint8_t> buf(len);
+    auto* base = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) {
+        return {};
+    }
+
+    uint8_t min_eff = std::numeric_limits<uint8_t>::max();
+    std::vector<std::pair<uint8_t, DWORD_PTR>> core_masks;
+
+    uint8_t* ptr = buf.data();
+    uint8_t* end = buf.data() + len;
+    while (ptr < end) {
+        auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(ptr);
+        if (info->Relationship == RelationProcessorCore && info->Processor.GroupCount > 0) {
+            // SetThreadAffinityMask is group-local. Keep group 0 masks for this process group.
+            const GROUP_AFFINITY& ga = info->Processor.GroupMask[0];
+            if (ga.Group == 0 && ga.Mask != 0) {
+                uint8_t eff = info->Processor.EfficiencyClass;
+                min_eff = std::min(min_eff, eff);
+                core_masks.push_back({eff, lowest_set_bit_mask(ga.Mask)});
+            }
+        }
+        ptr += info->Size;
+    }
+
+    std::vector<DWORD_PTR> pcores;
+    for (const auto& e : core_masks) {
+        if (e.first == min_eff && e.second != 0) {
+            pcores.push_back(e.second);
+        }
+    }
+    if (!pcores.empty()) {
+        return pcores;
+    }
+
+    // Fallback: pin across all detected cores if efficiency classes were unavailable.
+    for (const auto& e : core_masks) {
+        if (e.second != 0) {
+            pcores.push_back(e.second);
+        }
+    }
+    return pcores;
+}
+
+static const std::vector<DWORD_PTR>& get_pcore_masks() {
+    static std::vector<DWORD_PTR> masks = detect_windows_pcore_masks();
+    return masks;
+}
+
+static void bind_omp_thread_to_pcore_if_enabled() {
+    if (!g_pin_openmp_pcores) {
+        return;
+    }
+    const auto& masks = get_pcore_masks();
+    if (masks.empty()) {
+        return;
+    }
+    const int tid = omp_get_thread_num();
+    const DWORD_PTR mask = masks[static_cast<size_t>(tid) % masks.size()];
+    if (mask != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+    }
+}
+
+static void configure_openmp_for_pcores() {
+    if (!g_pin_openmp_pcores) {
+        return;
+    }
+    const auto& masks = get_pcore_masks();
+    if (masks.empty()) {
+        return;
+    }
+    omp_set_dynamic(0);
+    const int target_threads = static_cast<int>(masks.size());
+    if (target_threads > 0) {
+        omp_set_num_threads(target_threads);
+    }
+}
+#else
+static void bind_omp_thread_to_pcore_if_enabled() {}
+static void configure_openmp_for_pcores() {}
+#endif
+
 // Q4_K_M GEMV: rows are parallelized with OpenMP.
 // Each row is laid out as (in_dim / 256) BlockQ4K blocks.
 void gemv_q4k_avx2_rows(const BlockQ4K* weights, const float* x, float* out, int out_dim, int in_dim) {
@@ -96,65 +197,71 @@ void gemv_q4k_avx2_rows(const BlockQ4K* weights, const float* x, float* out, int
     const __m256i idx_even_hi = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
     const __m256i idx_odd_hi = _mm256_setr_epi32(17, 19, 21, 23, 25, 27, 29, 31);
 
-    #pragma omp parallel for schedule(static)
-    for (int r = 0; r < out_dim; ++r) {
-        const BlockQ4K* row = weights + static_cast<size_t>(r) * blocks_per_row;
-        __m256 vacc = _mm256_setzero_ps();
+    configure_openmp_for_pcores();
+    #pragma omp parallel
+    {
+        bind_omp_thread_to_pcore_if_enabled();
 
-        for (int b = 0; b < blocks_per_row; ++b) {
-            const BlockQ4K& blk = row[b];
-            const float d = f16_to_f32(blk.d);
-            const float dmin = f16_to_f32(blk.dmin);
+        #pragma omp for schedule(static) nowait
+        for (int r = 0; r < out_dim; ++r) {
+            const BlockQ4K* row = weights + static_cast<size_t>(r) * blocks_per_row;
+            __m256 vacc = _mm256_setzero_ps();
 
-            uint8_t scales[8];
-            unpack_scales_8x6(blk.scales, scales);
+            for (int b = 0; b < blocks_per_row; ++b) {
+                const BlockQ4K& blk = row[b];
+                const float d = f16_to_f32(blk.d);
+                const float dmin = f16_to_f32(blk.dmin);
 
-            const float* x_block = x + b * 256;
+                uint8_t scales[8];
+                unpack_scales_8x6(blk.scales, scales);
 
-            for (int sb = 0; sb < 8; ++sb) {
-                const float sub_scale = (static_cast<float>(scales[sb]) * d) * (1.0f / 15.0f);
-                const __m256 v_scale = _mm256_set1_ps(sub_scale);
-                const __m256 v_bias = _mm256_set1_ps(dmin);
+                const float* x_block = x + b * 256;
 
-                const uint8_t* qptr = blk.qs + sb * 16;
-                const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qptr));
-                const __m128i mask0f = _mm_set1_epi8(0x0F);
-                const __m128i lo_nib = _mm_and_si128(packed, mask0f);
-                const __m128i hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), mask0f);
+                for (int sb = 0; sb < 8; ++sb) {
+                    const float sub_scale = (static_cast<float>(scales[sb]) * d) * (1.0f / 15.0f);
+                    const __m256 v_scale = _mm256_set1_ps(sub_scale);
+                    const __m256 v_bias = _mm256_set1_ps(dmin);
 
-                const __m128i lo0 = lo_nib;
-                const __m128i hi0 = hi_nib;
-                const __m128i lo1 = _mm_srli_si128(lo_nib, 8);
-                const __m128i hi1 = _mm_srli_si128(hi_nib, 8);
+                    const uint8_t* qptr = blk.qs + sb * 16;
+                    const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qptr));
+                    const __m128i mask0f = _mm_set1_epi8(0x0F);
+                    const __m128i lo_nib = _mm_and_si128(packed, mask0f);
+                    const __m128i hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), mask0f);
 
-                // Keep decoded float lanes in-register throughout the MAC chain.
-                __m256i i_lo0 = _mm256_cvtepu8_epi32(lo0);
-                __m256 fq_lo0 = _mm256_cvtepi32_ps(i_lo0);
-                fq_lo0 = _mm256_fmadd_ps(fq_lo0, v_scale, v_bias);
-                __m256 vx0 = _mm256_i32gather_ps(x_block + sb * 32, idx_even, 4);
-                vacc = _mm256_fmadd_ps(fq_lo0, vx0, vacc);
+                    const __m128i lo0 = lo_nib;
+                    const __m128i hi0 = hi_nib;
+                    const __m128i lo1 = _mm_srli_si128(lo_nib, 8);
+                    const __m128i hi1 = _mm_srli_si128(hi_nib, 8);
 
-                __m256i i_hi0 = _mm256_cvtepu8_epi32(hi0);
-                __m256 fq_hi0 = _mm256_cvtepi32_ps(i_hi0);
-                fq_hi0 = _mm256_fmadd_ps(fq_hi0, v_scale, v_bias);
-                __m256 vx1 = _mm256_i32gather_ps(x_block + sb * 32, idx_odd, 4);
-                vacc = _mm256_fmadd_ps(fq_hi0, vx1, vacc);
+                    // Keep decoded float lanes in-register throughout the MAC chain.
+                    __m256i i_lo0 = _mm256_cvtepu8_epi32(lo0);
+                    __m256 fq_lo0 = _mm256_cvtepi32_ps(i_lo0);
+                    fq_lo0 = _mm256_fmadd_ps(fq_lo0, v_scale, v_bias);
+                    __m256 vx0 = _mm256_i32gather_ps(x_block + sb * 32, idx_even, 4);
+                    vacc = _mm256_fmadd_ps(fq_lo0, vx0, vacc);
 
-                __m256i i_lo1 = _mm256_cvtepu8_epi32(lo1);
-                __m256 fq_lo1 = _mm256_cvtepi32_ps(i_lo1);
-                fq_lo1 = _mm256_fmadd_ps(fq_lo1, v_scale, v_bias);
-                __m256 vx2 = _mm256_i32gather_ps(x_block + sb * 32, idx_even_hi, 4);
-                vacc = _mm256_fmadd_ps(fq_lo1, vx2, vacc);
+                    __m256i i_hi0 = _mm256_cvtepu8_epi32(hi0);
+                    __m256 fq_hi0 = _mm256_cvtepi32_ps(i_hi0);
+                    fq_hi0 = _mm256_fmadd_ps(fq_hi0, v_scale, v_bias);
+                    __m256 vx1 = _mm256_i32gather_ps(x_block + sb * 32, idx_odd, 4);
+                    vacc = _mm256_fmadd_ps(fq_hi0, vx1, vacc);
 
-                __m256i i_hi1 = _mm256_cvtepu8_epi32(hi1);
-                __m256 fq_hi1 = _mm256_cvtepi32_ps(i_hi1);
-                fq_hi1 = _mm256_fmadd_ps(fq_hi1, v_scale, v_bias);
-                __m256 vx3 = _mm256_i32gather_ps(x_block + sb * 32, idx_odd_hi, 4);
-                vacc = _mm256_fmadd_ps(fq_hi1, vx3, vacc);
+                    __m256i i_lo1 = _mm256_cvtepu8_epi32(lo1);
+                    __m256 fq_lo1 = _mm256_cvtepi32_ps(i_lo1);
+                    fq_lo1 = _mm256_fmadd_ps(fq_lo1, v_scale, v_bias);
+                    __m256 vx2 = _mm256_i32gather_ps(x_block + sb * 32, idx_even_hi, 4);
+                    vacc = _mm256_fmadd_ps(fq_lo1, vx2, vacc);
+
+                    __m256i i_hi1 = _mm256_cvtepu8_epi32(hi1);
+                    __m256 fq_hi1 = _mm256_cvtepi32_ps(i_hi1);
+                    fq_hi1 = _mm256_fmadd_ps(fq_hi1, v_scale, v_bias);
+                    __m256 vx3 = _mm256_i32gather_ps(x_block + sb * 32, idx_odd_hi, 4);
+                    vacc = _mm256_fmadd_ps(fq_hi1, vx3, vacc);
+                }
             }
-        }
 
-        out[r] = hsum256_ps(vacc);
+            out[r] = hsum256_ps(vacc);
+        }
     }
 }
 
@@ -167,9 +274,19 @@ void gemm_q4k_tiled_prefill(const BlockQ4K* weights, const float* x, float* y, i
     const int blocks_per_row = in_dim / TILE_K;
     std::memset(y, 0, static_cast<size_t>(t_rows) * out_dim * sizeof(float));
 
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int m0 = 0; m0 < t_rows; m0 += TILE_M) {
-        for (int n0 = 0; n0 < out_dim; n0 += TILE_N) {
+    configure_openmp_for_pcores();
+    #pragma omp parallel
+    {
+        bind_omp_thread_to_pcore_if_enabled();
+
+        #pragma omp for schedule(static) nowait
+        for (int tile_idx = 0; tile_idx < ((t_rows + TILE_M - 1) / TILE_M) * ((out_dim + TILE_N - 1) / TILE_N); ++tile_idx) {
+            const int tiles_n = (out_dim + TILE_N - 1) / TILE_N;
+            const int tile_m_idx = tile_idx / tiles_n;
+            const int tile_n_idx = tile_idx % tiles_n;
+            const int m0 = tile_m_idx * TILE_M;
+            const int n0 = tile_n_idx * TILE_N;
+
             const int m_lim = std::min(TILE_M, t_rows - m0);
             const int n_lim = std::min(TILE_N, out_dim - n0);
             float acc[TILE_M][TILE_N] = {};
@@ -528,6 +645,21 @@ void pin_thread_to_core(int core_id) {
     SetThreadAffinityMask(GetCurrentThread(), mask);
 }
 
+void pin_openmp_threads_to_pcores(bool enabled) {
+    g_pin_openmp_pcores = enabled;
+    if (enabled) {
+        configure_openmp_for_pcores();
+    }
+}
+
+int detected_pcore_count() {
+#ifdef _WIN32
+    return static_cast<int>(get_pcore_masks().size());
+#else
+    return 0;
+#endif
+}
+
 PYBIND11_MODULE(_native_forward, m) {
     py::class_<MmapWeights>(m, "MmapWeights")
         .def(py::init<const std::string&, py::dict>())
@@ -537,6 +669,8 @@ PYBIND11_MODULE(_native_forward, m) {
         .def(py::init<int, int, int, int>());
 
     m.def("set_thread_affinity", &pin_thread_to_core);
+    m.def("pin_openmp_threads_to_pcores", &pin_openmp_threads_to_pcores, py::arg("enabled") = true);
+    m.def("detected_pcore_count", &detected_pcore_count);
     m.def("gemv_q4k_row", &gemv_q4k_row_py, py::arg("row_bytes"), py::arg("x"), py::arg("out_dim"), py::arg("in_dim"));
     m.def("gemm_q4k_prefill", &gemm_q4k_prefill_py, py::arg("weights_bytes"), py::arg("x"), py::arg("t_rows"), py::arg("out_dim"), py::arg("in_dim"));
     m.def("prefill_prompt_tokens", &prefill_prompt_tokens_mmap,

@@ -99,6 +99,10 @@ class InferenceConfig:
     kv_cache_quantize: bool = True
     # Thread affinity: pin to physical cores (avoids HT overlap)
     thread_affinity_cores: list[int] = field(default_factory=list)
+    # Hybrid CPU optimization: pin OpenMP workers to detected P-cores only.
+    pin_openmp_to_pcores: bool = os.environ.get("ASDSL_PIN_OPENMP_PCORES", "1") == "1"
+    # 0 => auto from detected P-core count.
+    openmp_num_threads: int = int(os.environ.get("ASDSL_OPENMP_THREADS", "0"))
     # QCSD speculative decoding
     qcsd_enabled: bool = False
     qcsd_draft_bits: int = 2

@@ -37,6 +37,14 @@ def main():
 
     mmap_store = native_forward.MmapWeights("models/phi4_q4.bin", metadata)
 
+    try:
+        native_forward.pin_openmp_threads_to_pcores(True)
+        pcores = native_forward.detected_pcore_count()
+        if pcores > 0:
+            print(f"[*] OpenMP pinned to {pcores} detected P-cores")
+    except Exception:
+        pass
+
     print("[*] Initialization complete. C++ Engine Ready.")
     print("==================================================\n")
 
