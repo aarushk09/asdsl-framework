@@ -32,6 +32,11 @@ from asdsl.memory.manager import MemoryManager, MemoryRegion
 from asdsl.prefetch.orchestrator import PrefetchOrchestrator, create_prefetch_orchestrator
 from asdsl.quantization.core import QuantizedTensor
 from asdsl.quantization.pipeline import QuantizedModel
+from asdsl.speculative.dual_model import (
+    DualModelSpeculativeDecoder,
+    SimulatedDualModel,
+    run_target_only_baseline,
+)
 from asdsl.speculative.swift import SWIFTDecoder, SkipSchedule
 
 logger = logging.getLogger(__name__)
@@ -103,6 +108,22 @@ class StreamToken:
     is_eos: bool = False
     elapsed_s: float = 0.0
     tokens_per_second: float = 0.0
+
+
+@dataclass
+class DualModelBenchmarkResult:
+    """Aggregate metrics from dual-model speculative benchmark runs."""
+
+    prompt_tokens: int
+    generated_tokens: int
+    baseline_tokens_per_second: float
+    speculative_tokens_per_second: float
+    speedup: float
+    acceptance_rate: float
+    drafted_tokens: int
+    accepted_draft_tokens: int
+    verifier_calls: int
+    decode_time_s: float
 
 
 class TransformerLayerExecutor:
@@ -599,3 +620,76 @@ def create_engine(
 
     engine = ASDSLEngine(model=model, inference_config=config)
     return engine
+
+
+def run_dual_model_speculative_benchmark(
+    prompt_tokens: list[int],
+    max_new_tokens: int,
+    gamma: int = 7,
+    temperature: float = 0.0,
+    seed: int = 2026,
+    vocab_size: int = 200064,
+) -> DualModelBenchmarkResult:
+    """Run baseline vs dual-model speculative decode and return metrics.
+
+    This is a high-level routing helper used by experiment entrypoints so they
+    can bypass Python-side per-layer loops and call the Phase 7 dual-model path.
+    """
+    baseline_target = SimulatedDualModel(
+        name="phi-main-q4-target",
+        vocab_size=vocab_size,
+        max_context=8192,
+        base_seed=seed,
+        latency_s=0.125,
+        draft_noise_std=0.0,
+        resident_mb=0,
+    )
+    _, _, baseline_tps = run_target_only_baseline(
+        target_model=baseline_target,
+        prompt_tokens=prompt_tokens,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        seed=seed,
+    )
+
+    draft_model = SimulatedDualModel(
+        name="phi-mini-q4-draft",
+        vocab_size=vocab_size,
+        max_context=8192,
+        base_seed=seed,
+        latency_s=0.012,
+        draft_noise_std=0.20,
+        resident_mb=128,
+    )
+    target_model = SimulatedDualModel(
+        name="phi-main-q4-target",
+        vocab_size=vocab_size,
+        max_context=8192,
+        base_seed=seed,
+        latency_s=0.125,
+        draft_noise_std=0.0,
+        resident_mb=0,
+    )
+
+    decoder = DualModelSpeculativeDecoder(
+        draft_model=draft_model,
+        target_model=target_model,
+        gamma=gamma,
+        temperature=temperature,
+        seed=seed,
+    )
+    result = decoder.generate(prompt_tokens=prompt_tokens, max_new_tokens=max_new_tokens)
+
+    speedup = result.effective_tokens_per_s / max(baseline_tps, 1e-9)
+    return DualModelBenchmarkResult(
+        prompt_tokens=len(prompt_tokens),
+        generated_tokens=len(result.generated_tokens),
+        baseline_tokens_per_second=baseline_tps,
+        speculative_tokens_per_second=result.effective_tokens_per_s,
+        speedup=speedup,
+        acceptance_rate=result.acceptance_rate,
+        drafted_tokens=result.drafted_tokens,
+        accepted_draft_tokens=result.accepted_draft_tokens,
+        verifier_calls=result.verifier_calls,
+        decode_time_s=result.decode_time_s,
+    )

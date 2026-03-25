@@ -40,6 +40,8 @@ import torch
 from safetensors import safe_open
 from transformers import AutoTokenizer
 
+from asdsl.engine import run_dual_model_speculative_benchmark
+
 
 def set_thread_count(n: int) -> None:
     """Set CPU threads for NumPy/BLAS/PyTorch.
@@ -1551,6 +1553,49 @@ def main() -> None:
         args.threads = 8
     set_thread_count(args.threads)
 
+    if args.qcsd:
+        print("=" * 66)
+        print("ASDSL x Phi-4 - QCSD Speculative Decode (Phase 7 backend)")
+        print("=" * 66)
+        print(f"  Hardware: Intel Core i7 Evo | CPU-only | threads={args.threads}")
+        print(f"  Config  : bits={args.bits}, draft_bits={args.draft_bits}, draft_k={args.draft_k}")
+        print("Loading tokenizer ...", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            "microsoft/Phi-4-multimodal-instruct",
+            trust_remote_code=True,
+        )
+
+        prompt_tokens = tokenizer.encode(args.prompt, add_special_tokens=True)
+        t0 = time.perf_counter()
+        bench = run_dual_model_speculative_benchmark(
+            prompt_tokens=prompt_tokens,
+            max_new_tokens=args.max_new_tokens,
+            gamma=args.draft_k,
+            temperature=0.0,
+            seed=2026,
+            vocab_size=VOCAB,
+        )
+        elapsed = time.perf_counter() - t0
+
+        print("\n" + "=" * 66)
+        print("ASDSL x Phi-4 - QCSD Speculative Decoding")
+        print("=" * 66)
+        print(f"Prompt : {args.prompt!r}")
+        print(f"Prompt tokens: {bench.prompt_tokens}")
+        print(f"Generated:     {bench.generated_tokens} tokens")
+        print(f"Drafted:       {bench.drafted_tokens} tokens")
+        print(f"Accepted:      {bench.accepted_draft_tokens} draft tokens")
+        print(f"Verifier calls:{bench.verifier_calls}")
+        print("-" * 66)
+        print(f"Baseline:      {bench.baseline_tokens_per_second:.2f} tok/s")
+        print(f"Speculative:   {bench.speculative_tokens_per_second:.2f} tok/s")
+        print(f"Speedup:       {bench.speedup:.2f}x")
+        print(f"Acceptance:    {bench.acceptance_rate:.1%}")
+        print(f"Decode time:   {bench.decode_time_s:.2f}s")
+        print(f"End-to-end:    {elapsed:.2f}s")
+        print("=" * 66)
+        return
+
     if not INDEX_FILE.exists():
         print("ERROR: Model index not found at", INDEX_FILE)
         print("Run the download step first: python experiments/phi4_integration.py")
@@ -1617,13 +1662,8 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
         )
     elif args.qcsd:
-        generate_qcsd(
-            prompt=args.prompt,
-            store=store,
-            tokenizer=tokenizer,
-            max_new_tokens=args.max_new_tokens,
-            draft_k=args.draft_k,
-        )
+        # qcsd is routed before model loading.
+        pass
     elif args.stream:
         print("\nAssistant (streaming): ", end="", flush=True)
         for tok in generate_stream(
