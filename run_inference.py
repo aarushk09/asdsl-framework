@@ -33,33 +33,12 @@ def main():
     vocab_size = cfg.vocab_size
 
     print(f"[*] Architecture: {num_layers} Layers | Dim: {dim} | Heads: {num_heads} | KV-Heads: {num_kv_heads}")
-    print("[*] Extracting raw float32 weights from PyTorch to NumPy for C++ Engine...")
+    print("[*] Memory-mapping Q4 model weights (zero-copy)...")
 
-    # Extract weights to contiguous numpy arrays
-    layers_w_cpp = []
-    for l in range(num_layers):
-        layer = model.model.layers[l]
-        rms1_w = layer.input_layernorm.weight.detach().numpy().astype(np.float32)
-        
-        q_w = layer.self_attn.q_proj.weight.detach()
-        k_w = layer.self_attn.k_proj.weight.detach()
-        v_w = layer.self_attn.v_proj.weight.detach()
-        qkv_w = torch.cat([q_w, k_w, v_w], dim=0).numpy().flatten().astype(np.float32)
-        
-        o_w = layer.self_attn.o_proj.weight.detach().numpy().flatten().astype(np.float32)
-        
-        rms2_w = layer.post_attention_layernorm.weight.detach().numpy().astype(np.float32)
-        
-        gate_w = layer.mlp.gate_proj.weight.detach().numpy().flatten().astype(np.float32)
-        up_w = layer.mlp.up_proj.weight.detach().numpy().flatten().astype(np.float32)
-        down_w = layer.mlp.down_proj.weight.detach().numpy().flatten().astype(np.float32)
-        
-        layers_w_cpp.append((rms1_w, qkv_w, o_w, rms2_w, gate_w, up_w, down_w))
-        
-    token_emb = model.model.embed_tokens.weight.detach().numpy().flatten().astype(np.float32)
-    final_rms_w = model.model.norm.weight.detach().numpy().astype(np.float32)
-    lm_head_w = model.lm_head.weight.detach().numpy().flatten().astype(np.float32)
-    
+    import json
+    with open("models/tinyllama_q4_metadata.json", "r") as f:
+        metadata = json.load(f)
+    mmap_store = native_forward.MmapWeights("models/tinyllama_q4.bin", metadata)
     # Clean up massive torch model object if possible to free RAM
     del model
     import gc
@@ -83,8 +62,7 @@ def main():
     # Feed prompt tokens sequentially to build KV cache history
     for i in range(len(input_ids) - 1):
         native_forward.generate_token(
-            input_ids[i], seq_pos, token_emb, layers_w_cpp,
-            final_rms_w, lm_head_w,
+            input_ids[i], seq_pos, mmap_store,
             num_layers, dim, hidden_dim, num_heads, num_kv_heads, head_dim, vocab_size,
             cache
         )
@@ -93,8 +71,7 @@ def main():
     # The last token in the prompt generates our first new token!
     last_prompt_token = input_ids[-1]
     next_token = native_forward.generate_token(
-        last_prompt_token, seq_pos, token_emb, layers_w_cpp,
-        final_rms_w, lm_head_w,
+        last_prompt_token, seq_pos, mmap_store,
         num_layers, dim, hidden_dim, num_heads, num_kv_heads, head_dim, vocab_size,
         cache
     )
@@ -115,8 +92,7 @@ def main():
             break
             
         next_token = native_forward.generate_token(
-            next_token, seq_pos, token_emb, layers_w_cpp,
-            final_rms_w, lm_head_w,
+            next_token, seq_pos, mmap_store,
             num_layers, dim, hidden_dim, num_heads, num_kv_heads, head_dim, vocab_size,
             cache
         )
