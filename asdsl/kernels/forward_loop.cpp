@@ -17,6 +17,9 @@
 #include <vector>
 #include <limits>
 #include <cmath>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 namespace py = pybind11;
 
@@ -85,6 +88,21 @@ static inline float hsum256_ps(__m256 v) {
 static constexpr int TILE_M = 4;
 static constexpr int TILE_N = 32;
 static constexpr int TILE_K = 256;
+static constexpr int INTERLEAVE_ROWS = 4;
+
+static inline const BlockQ4K* q4k_block_ptr(
+    const BlockQ4K* base,
+    int row,
+    int block_idx,
+    int blocks_per_row,
+    bool interleaved4) {
+    if (!interleaved4) {
+        return base + static_cast<size_t>(row) * blocks_per_row + block_idx;
+    }
+    const int grp = row / INTERLEAVE_ROWS;
+    const int lane = row % INTERLEAVE_ROWS;
+    return base + ((static_cast<size_t>(grp) * blocks_per_row + block_idx) * INTERLEAVE_ROWS + lane);
+}
 
 static bool g_pin_openmp_pcores = true;
 
@@ -188,7 +206,7 @@ static void configure_openmp_for_pcores() {}
 
 // Q4_K_M GEMV: rows are parallelized with OpenMP.
 // Each row is laid out as (in_dim / 256) BlockQ4K blocks.
-void gemv_q4k_avx2_rows(const BlockQ4K* weights, const float* x, float* out, int out_dim, int in_dim) {
+void gemv_q4k_avx2_rows(const BlockQ4K* weights, const float* x, float* out, int out_dim, int in_dim, bool interleaved4) {
     if (in_dim % 256 != 0) {
         throw std::runtime_error("in_dim must be divisible by 256 for BlockQ4K");
     }
@@ -204,71 +222,82 @@ void gemv_q4k_avx2_rows(const BlockQ4K* weights, const float* x, float* out, int
         bind_omp_thread_to_pcore_if_enabled();
 
         #pragma omp for schedule(static) nowait
-        for (int r = 0; r < out_dim; ++r) {
-            const BlockQ4K* row = weights + static_cast<size_t>(r) * blocks_per_row;
-            __m256 vacc = _mm256_setzero_ps();
+        for (int r0 = 0; r0 < out_dim; r0 += INTERLEAVE_ROWS) {
+            __m256 vacc[INTERLEAVE_ROWS] = {
+                _mm256_setzero_ps(), _mm256_setzero_ps(),
+                _mm256_setzero_ps(), _mm256_setzero_ps()
+            };
 
             for (int b = 0; b < blocks_per_row; ++b) {
-                const BlockQ4K& blk = row[b];
-                const float d = f16_to_f32(blk.d);
-                const float dmin = f16_to_f32(blk.dmin);
-
-                uint8_t scales[8];
-                unpack_scales_8x6(blk.scales, scales);
-
                 const float* x_block = x + b * 256;
 
-                for (int sb = 0; sb < 8; ++sb) {
-                    const float sub_scale = (static_cast<float>(scales[sb]) * d) * (1.0f / 15.0f);
-                    const __m256 v_scale = _mm256_set1_ps(sub_scale);
-                    const __m256 v_bias = _mm256_set1_ps(dmin);
+                for (int lane = 0; lane < INTERLEAVE_ROWS; ++lane) {
+                    const int r = r0 + lane;
+                    if (r >= out_dim) {
+                        continue;
+                    }
+                    const BlockQ4K& blk = *q4k_block_ptr(weights, r, b, blocks_per_row, interleaved4);
+                    const float d = f16_to_f32(blk.d);
+                    const float dmin = f16_to_f32(blk.dmin);
+                    uint8_t scales[8];
+                    unpack_scales_8x6(blk.scales, scales);
 
-                    const uint8_t* qptr = blk.qs + sb * 16;
-                    const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qptr));
-                    const __m128i mask0f = _mm_set1_epi8(0x0F);
-                    const __m128i lo_nib = _mm_and_si128(packed, mask0f);
-                    const __m128i hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), mask0f);
+                    for (int sb = 0; sb < 8; ++sb) {
+                        const float sub_scale = (static_cast<float>(scales[sb]) * d) * (1.0f / 15.0f);
+                        const __m256 v_scale = _mm256_set1_ps(sub_scale);
+                        const __m256 v_bias = _mm256_set1_ps(dmin);
 
-                    const __m128i lo0 = lo_nib;
-                    const __m128i hi0 = hi_nib;
-                    const __m128i lo1 = _mm_srli_si128(lo_nib, 8);
-                    const __m128i hi1 = _mm_srli_si128(hi_nib, 8);
+                        const uint8_t* qptr = blk.qs + sb * 16;
+                        const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qptr));
+                        const __m128i mask0f = _mm_set1_epi8(0x0F);
+                        const __m128i lo_nib = _mm_and_si128(packed, mask0f);
+                        const __m128i hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), mask0f);
 
-                    // Keep decoded float lanes in-register throughout the MAC chain.
-                    __m256i i_lo0 = _mm256_cvtepu8_epi32(lo0);
-                    __m256 fq_lo0 = _mm256_cvtepi32_ps(i_lo0);
-                    fq_lo0 = _mm256_fmadd_ps(fq_lo0, v_scale, v_bias);
-                    __m256 vx0 = _mm256_i32gather_ps(x_block + sb * 32, idx_even, 4);
-                    vacc = _mm256_fmadd_ps(fq_lo0, vx0, vacc);
+                        const __m128i lo0 = lo_nib;
+                        const __m128i hi0 = hi_nib;
+                        const __m128i lo1 = _mm_srli_si128(lo_nib, 8);
+                        const __m128i hi1 = _mm_srli_si128(hi_nib, 8);
 
-                    __m256i i_hi0 = _mm256_cvtepu8_epi32(hi0);
-                    __m256 fq_hi0 = _mm256_cvtepi32_ps(i_hi0);
-                    fq_hi0 = _mm256_fmadd_ps(fq_hi0, v_scale, v_bias);
-                    __m256 vx1 = _mm256_i32gather_ps(x_block + sb * 32, idx_odd, 4);
-                    vacc = _mm256_fmadd_ps(fq_hi0, vx1, vacc);
+                        __m256i i_lo0 = _mm256_cvtepu8_epi32(lo0);
+                        __m256 fq_lo0 = _mm256_cvtepi32_ps(i_lo0);
+                        fq_lo0 = _mm256_fmadd_ps(fq_lo0, v_scale, v_bias);
+                        __m256 vx0 = _mm256_i32gather_ps(x_block + sb * 32, idx_even, 4);
+                        vacc[lane] = _mm256_fmadd_ps(fq_lo0, vx0, vacc[lane]);
 
-                    __m256i i_lo1 = _mm256_cvtepu8_epi32(lo1);
-                    __m256 fq_lo1 = _mm256_cvtepi32_ps(i_lo1);
-                    fq_lo1 = _mm256_fmadd_ps(fq_lo1, v_scale, v_bias);
-                    __m256 vx2 = _mm256_i32gather_ps(x_block + sb * 32, idx_even_hi, 4);
-                    vacc = _mm256_fmadd_ps(fq_lo1, vx2, vacc);
+                        __m256i i_hi0 = _mm256_cvtepu8_epi32(hi0);
+                        __m256 fq_hi0 = _mm256_cvtepi32_ps(i_hi0);
+                        fq_hi0 = _mm256_fmadd_ps(fq_hi0, v_scale, v_bias);
+                        __m256 vx1 = _mm256_i32gather_ps(x_block + sb * 32, idx_odd, 4);
+                        vacc[lane] = _mm256_fmadd_ps(fq_hi0, vx1, vacc[lane]);
 
-                    __m256i i_hi1 = _mm256_cvtepu8_epi32(hi1);
-                    __m256 fq_hi1 = _mm256_cvtepi32_ps(i_hi1);
-                    fq_hi1 = _mm256_fmadd_ps(fq_hi1, v_scale, v_bias);
-                    __m256 vx3 = _mm256_i32gather_ps(x_block + sb * 32, idx_odd_hi, 4);
-                    vacc = _mm256_fmadd_ps(fq_hi1, vx3, vacc);
+                        __m256i i_lo1 = _mm256_cvtepu8_epi32(lo1);
+                        __m256 fq_lo1 = _mm256_cvtepi32_ps(i_lo1);
+                        fq_lo1 = _mm256_fmadd_ps(fq_lo1, v_scale, v_bias);
+                        __m256 vx2 = _mm256_i32gather_ps(x_block + sb * 32, idx_even_hi, 4);
+                        vacc[lane] = _mm256_fmadd_ps(fq_lo1, vx2, vacc[lane]);
+
+                        __m256i i_hi1 = _mm256_cvtepu8_epi32(hi1);
+                        __m256 fq_hi1 = _mm256_cvtepi32_ps(i_hi1);
+                        fq_hi1 = _mm256_fmadd_ps(fq_hi1, v_scale, v_bias);
+                        __m256 vx3 = _mm256_i32gather_ps(x_block + sb * 32, idx_odd_hi, 4);
+                        vacc[lane] = _mm256_fmadd_ps(fq_hi1, vx3, vacc[lane]);
+                    }
                 }
             }
 
-            out[r] = hsum256_ps(vacc);
+            for (int lane = 0; lane < INTERLEAVE_ROWS; ++lane) {
+                const int r = r0 + lane;
+                if (r < out_dim) {
+                    out[r] = hsum256_ps(vacc[lane]);
+                }
+            }
         }
     }
 }
 
 // Prefill path: tiled GEMM over prompt batch X[T, in_dim] and quantized weights W[out_dim, in_dim].
 // W is loaded once per (N, K) tile and reused for TILE_M prompt rows.
-void gemm_q4k_tiled_prefill(const BlockQ4K* weights, const float* x, float* y, int t_rows, int out_dim, int in_dim) {
+void gemm_q4k_tiled_prefill(const BlockQ4K* weights, const float* x, float* y, int t_rows, int out_dim, int in_dim, bool interleaved4) {
     if (in_dim % TILE_K != 0) {
         throw std::runtime_error("in_dim must be divisible by TILE_K (256)");
     }
@@ -295,32 +324,52 @@ void gemm_q4k_tiled_prefill(const BlockQ4K* weights, const float* x, float* y, i
             for (int k0 = 0; k0 < in_dim; k0 += TILE_K) {
                 const int block_idx = k0 / TILE_K;
 
-                for (int nn = 0; nn < n_lim; ++nn) {
-                    const BlockQ4K& blk = weights[static_cast<size_t>(n0 + nn) * blocks_per_row + block_idx];
-                    const float d = f16_to_f32(blk.d);
-                    const float dmin = f16_to_f32(blk.dmin);
-                    uint8_t scales[8];
-                    unpack_scales_8x6(blk.scales, scales);
+                for (int nn0 = 0; nn0 < n_lim; nn0 += INTERLEAVE_ROWS) {
+                    const int row_cnt = std::min(INTERLEAVE_ROWS, n_lim - nn0);
+                    const BlockQ4K* blks[INTERLEAVE_ROWS] = {nullptr, nullptr, nullptr, nullptr};
+                    float d[INTERLEAVE_ROWS] = {0, 0, 0, 0};
+                    float dmin[INTERLEAVE_ROWS] = {0, 0, 0, 0};
+                    uint8_t scales[INTERLEAVE_ROWS][8] = {};
+
+                    for (int rr = 0; rr < row_cnt; ++rr) {
+                        const int out_row = n0 + nn0 + rr;
+                        blks[rr] = q4k_block_ptr(weights, out_row, block_idx, blocks_per_row, interleaved4);
+                        d[rr] = f16_to_f32(blks[rr]->d);
+                        dmin[rr] = f16_to_f32(blks[rr]->dmin);
+                        unpack_scales_8x6(blks[rr]->scales, scales[rr]);
+                    }
 
                     for (int sb = 0; sb < 8; ++sb) {
-                        const float sub_scale = (static_cast<float>(scales[sb]) * d) * (1.0f / 15.0f);
-                        float wtmp[32];
-                        const uint8_t* qptr = blk.qs + sb * 16;
-                        for (int i = 0; i < 16; ++i) {
-                            const uint8_t p = qptr[i];
-                            wtmp[2 * i] = static_cast<float>(p & 0x0F) * sub_scale + dmin;
-                            wtmp[2 * i + 1] = static_cast<float>((p >> 4) & 0x0F) * sub_scale + dmin;
+                        float wtmp[INTERLEAVE_ROWS][32] = {};
+                        for (int rr = 0; rr < row_cnt; ++rr) {
+                            const float sub_scale = (static_cast<float>(scales[rr][sb]) * d[rr]) * (1.0f / 15.0f);
+                            const uint8_t* qptr = blks[rr]->qs + sb * 16;
+                            for (int i = 0; i < 16; ++i) {
+                                const uint8_t p = qptr[i];
+                                wtmp[rr][2 * i] = static_cast<float>(p & 0x0F) * sub_scale + dmin[rr];
+                                wtmp[rr][2 * i + 1] = static_cast<float>((p >> 4) & 0x0F) * sub_scale + dmin[rr];
+                            }
                         }
 
                         for (int mm = 0; mm < m_lim; ++mm) {
                             const float* xptr = x + static_cast<size_t>(m0 + mm) * in_dim + k0 + sb * 32;
-                            __m256 vsum = _mm256_setzero_ps();
-                            for (int j = 0; j < 32; j += 8) {
-                                __m256 vw = _mm256_loadu_ps(wtmp + j);
-                                __m256 vx = _mm256_loadu_ps(xptr + j);
-                                vsum = _mm256_fmadd_ps(vw, vx, vsum);
+                            __m256 vx0 = _mm256_loadu_ps(xptr + 0);
+                            __m256 vx1 = _mm256_loadu_ps(xptr + 8);
+                            __m256 vx2 = _mm256_loadu_ps(xptr + 16);
+                            __m256 vx3 = _mm256_loadu_ps(xptr + 24);
+
+                            for (int rr = 0; rr < row_cnt; ++rr) {
+                                __m256 vsum = _mm256_setzero_ps();
+                                __m256 vw0 = _mm256_loadu_ps(wtmp[rr] + 0);
+                                __m256 vw1 = _mm256_loadu_ps(wtmp[rr] + 8);
+                                __m256 vw2 = _mm256_loadu_ps(wtmp[rr] + 16);
+                                __m256 vw3 = _mm256_loadu_ps(wtmp[rr] + 24);
+                                vsum = _mm256_fmadd_ps(vw0, vx0, vsum);
+                                vsum = _mm256_fmadd_ps(vw1, vx1, vsum);
+                                vsum = _mm256_fmadd_ps(vw2, vx2, vsum);
+                                vsum = _mm256_fmadd_ps(vw3, vx3, vsum);
+                                acc[mm][nn0 + rr] += hsum256_ps(vsum);
                             }
-                            acc[mm][nn] += hsum256_ps(vsum);
                         }
                     }
                 }
@@ -342,6 +391,8 @@ public:
         uint8_t* ptr;
         int rows;
         int cols;
+        std::string dtype;
+        bool interleaved4;
     };
 
     MmapWeights(const std::string& filepath, py::dict metadata)
@@ -374,6 +425,7 @@ public:
             size_t offset = py::cast<size_t>(info["offset"]);
             int rows = 0;
             int cols = 0;
+            std::string dtype = "";
             if (info.contains("shape")) {
                 py::list shape = py::cast<py::list>(info["shape"]);
                 if (shape.size() >= 2) {
@@ -381,11 +433,26 @@ public:
                     cols = py::cast<int>(shape[1]);
                 }
             }
-            tensors[key] = TensorInfo{data + offset, rows, cols};
+            if (info.contains("dtype")) {
+                dtype = py::cast<std::string>(info["dtype"]);
+            }
+            const bool interleaved4 = (dtype.find("i4") != std::string::npos) || (dtype.find("interleaved") != std::string::npos);
+            tensors[key] = TensorInfo{data + offset, rows, cols, dtype, interleaved4};
         }
+
+        prefetch_thread = std::thread(&MmapWeights::prefetch_worker, this);
     }
 
     ~MmapWeights() {
+        {
+            std::lock_guard<std::mutex> lg(prefetch_mu);
+            prefetch_shutdown = true;
+        }
+        prefetch_cv.notify_all();
+        if (prefetch_thread.joinable()) {
+            prefetch_thread.join();
+        }
+
         if (data) {
             UnmapViewOfFile(data);
         }
@@ -413,7 +480,7 @@ public:
         }
 
         float out = 0.0f;
-        gemv_q4k_avx2_rows(reinterpret_cast<const BlockQ4K*>(it->second.ptr), static_cast<const float*>(xbuf.ptr), &out, 1, in_dim);
+        gemv_q4k_avx2_rows(reinterpret_cast<const BlockQ4K*>(it->second.ptr), static_cast<const float*>(xbuf.ptr), &out, 1, in_dim, it->second.interleaved4);
         return out;
     }
 
@@ -425,12 +492,73 @@ public:
         return &it->second;
     }
 
+    void enqueue_prefetch_tensor(const std::string& key, size_t bytes_hint = 0) const {
+        auto it = tensors.find(key);
+        if (it == tensors.end()) {
+            return;
+        }
+        size_t sz = bytes_hint;
+        if (sz == 0 && it->second.rows > 0 && it->second.cols > 0) {
+            const size_t blocks_per_row = static_cast<size_t>(it->second.cols) / 256;
+            const size_t blocks = static_cast<size_t>(it->second.rows) * blocks_per_row;
+            const size_t row_factor = it->second.interleaved4 ? 4 : 1;
+            sz = (blocks * 140 * row_factor) / row_factor;
+        }
+        if (sz == 0) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lg(prefetch_mu);
+            prefetch_queue.push_back({it->second.ptr, sz});
+        }
+        prefetch_cv.notify_one();
+    }
+
 private:
+    struct PrefetchTask {
+        void* addr;
+        size_t size;
+    };
+
+    void prefetch_worker() {
+        for (;;) {
+            PrefetchTask task{nullptr, 0};
+            {
+                std::unique_lock<std::mutex> lk(prefetch_mu);
+                prefetch_cv.wait(lk, [&] { return prefetch_shutdown || !prefetch_queue.empty(); });
+                if (prefetch_shutdown && prefetch_queue.empty()) {
+                    break;
+                }
+                task = prefetch_queue.front();
+                prefetch_queue.erase(prefetch_queue.begin());
+            }
+
+#ifdef _WIN32
+            WIN32_MEMORY_RANGE_ENTRY range;
+            range.VirtualAddress = task.addr;
+            range.NumberOfBytes = task.size;
+            PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+#else
+            volatile uint8_t s = 0;
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(task.addr);
+            for (size_t i = 0; i < task.size; i += 4096) {
+                s ^= p[i];
+            }
+            (void)s;
+#endif
+        }
+    }
+
     HANDLE hFile;
     HANDLE hMapping;
     uint8_t* data;
     size_t size;
     std::unordered_map<std::string, TensorInfo> tensors;
+    mutable std::mutex prefetch_mu;
+    mutable std::condition_variable prefetch_cv;
+    mutable std::vector<PrefetchTask> prefetch_queue;
+    mutable bool prefetch_shutdown = false;
+    mutable std::thread prefetch_thread;
 };
 
 struct KVCache {
@@ -664,7 +792,8 @@ py::array_t<float> gemv_q4k_row_py(
         static_cast<const float*>(xbuf.ptr),
         static_cast<float*>(obuf.ptr),
         out_dim,
-        in_dim);
+        in_dim,
+        false);
 
     return out;
 }
@@ -795,7 +924,15 @@ void prefill_prompt_tokens_mmap(
         if (!lw || lw->cols != in_dim || lw->rows != out_dim) {
             lw = t;
         }
-        gemm_q4k_tiled_prefill(reinterpret_cast<const BlockQ4K*>(lw->ptr), x.data(), y.data(), t_rows, out_dim, in_dim);
+
+        if (l + 1 < num_layers) {
+            std::string npfx = "l" + std::to_string(l + 1) + "_o";
+            store.enqueue_prefetch_tensor(npfx);
+        }
+
+        gemm_q4k_tiled_prefill(
+            reinterpret_cast<const BlockQ4K*>(lw->ptr),
+            x.data(), y.data(), t_rows, out_dim, in_dim, lw->interleaved4);
         if (in_dim == out_dim) {
             x.swap(y);
         }
@@ -807,7 +944,8 @@ py::array_t<float> gemm_q4k_prefill_py(
     py::array_t<float, py::array::c_style | py::array::forcecast> x,
     int t_rows,
     int out_dim,
-    int in_dim) {
+    int in_dim,
+    bool interleaved4) {
     py::buffer_info wbuf = weights_bytes.request();
     py::buffer_info xbuf = x.request();
     if (xbuf.ndim != 2) {
@@ -829,7 +967,8 @@ py::array_t<float> gemm_q4k_prefill_py(
         static_cast<float*>(obuf.ptr),
         t_rows,
         out_dim,
-        in_dim);
+        in_dim,
+        interleaved4);
     return out;
 }
 
@@ -856,7 +995,8 @@ int detected_pcore_count() {
 PYBIND11_MODULE(_native_forward, m) {
     py::class_<MmapWeights>(m, "MmapWeights")
         .def(py::init<const std::string&, py::dict>())
-        .def("test_gemv_q4", &MmapWeights::test_gemv_q4);
+        .def("test_gemv_q4", &MmapWeights::test_gemv_q4)
+        .def("prefetch_tensor", &MmapWeights::enqueue_prefetch_tensor, py::arg("key"), py::arg("bytes_hint") = 0);
 
     py::class_<KVCache>(m, "KVCache")
         .def(py::init<int, int, int, int>())
@@ -866,7 +1006,7 @@ PYBIND11_MODULE(_native_forward, m) {
     m.def("pin_openmp_threads_to_pcores", &pin_openmp_threads_to_pcores, py::arg("enabled") = true);
     m.def("detected_pcore_count", &detected_pcore_count);
     m.def("gemv_q4k_row", &gemv_q4k_row_py, py::arg("row_bytes"), py::arg("x"), py::arg("out_dim"), py::arg("in_dim"));
-    m.def("gemm_q4k_prefill", &gemm_q4k_prefill_py, py::arg("weights_bytes"), py::arg("x"), py::arg("t_rows"), py::arg("out_dim"), py::arg("in_dim"));
+    m.def("gemm_q4k_prefill", &gemm_q4k_prefill_py, py::arg("weights_bytes"), py::arg("x"), py::arg("t_rows"), py::arg("out_dim"), py::arg("in_dim"), py::arg("interleaved4") = false);
     m.def("prefill_prompt_tokens", &prefill_prompt_tokens_mmap,
         py::arg("prompt_ids"), py::arg("seq_start"), py::arg("store"),
         py::arg("num_layers"), py::arg("dim"), py::arg("hidden_dim"),

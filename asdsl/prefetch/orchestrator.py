@@ -284,6 +284,8 @@ class PrefetchOrchestrator:
         try:
             if self.enable_os_hints and platform.system() == "Linux":
                 self._linux_prefetch(request.data_ptr, request.size_bytes)
+            elif platform.system() == "Windows":
+                self._windows_prefetch(request.data_ptr, request.size_bytes)
             else:
                 # Portable fallback: sequential read to pull into cache
                 self._sequential_touch(request.data_ptr, request.size_bytes)
@@ -332,6 +334,36 @@ class PrefetchOrchestrator:
             libc.madvise(ctypes.c_void_p(aligned_ptr), ctypes.c_size_t(aligned_size), MADV_WILLNEED)
         except (OSError, AttributeError):
             # Fallback to sequential touch
+            self._sequential_touch(data_ptr, size_bytes)
+
+    def _windows_prefetch(self, data_ptr: int, size_bytes: int) -> None:
+        """Use Windows PrefetchVirtualMemory to page mapped weights ahead of compute."""
+        try:
+            class WIN32_MEMORY_RANGE_ENTRY(ctypes.Structure):
+                _fields_ = [
+                    ("VirtualAddress", ctypes.c_void_p),
+                    ("NumberOfBytes", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            prefetch = kernel32.PrefetchVirtualMemory
+            prefetch.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.POINTER(WIN32_MEMORY_RANGE_ENTRY),
+                ctypes.c_ulong,
+            ]
+            prefetch.restype = ctypes.c_int
+
+            current_process = kernel32.GetCurrentProcess()
+            rng = WIN32_MEMORY_RANGE_ENTRY(
+                VirtualAddress=ctypes.c_void_p(data_ptr),
+                NumberOfBytes=ctypes.c_size_t(size_bytes),
+            )
+            ok = prefetch(current_process, 1, ctypes.byref(rng), 0)
+            if not ok:
+                self._sequential_touch(data_ptr, size_bytes)
+        except Exception:
             self._sequential_touch(data_ptr, size_bytes)
 
 

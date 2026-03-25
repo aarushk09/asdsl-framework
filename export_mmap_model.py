@@ -12,6 +12,51 @@ MODEL_DIR = ROOT / "models" / "phi4-multimodal-instruct"
 INDEX_FILE = MODEL_DIR / "model.safetensors.index.json"
 
 GROUP_SIZE = 32
+Q4K_BLOCK_BYTES = 140
+
+
+def repack_q4k_interleaved(
+    q4k_row_major_bytes: bytes,
+    rows: int,
+    cols: int,
+    block_k: int = 256,
+) -> bytes:
+    """Repack Q4_K_M blocks into 4-row interleaved layout.
+
+    Input layout (row-major):
+      row0[b0..bn], row1[b0..bn], row2..., row3...
+
+    Output layout (4-row interleaved):
+      group0:b0(row0,row1,row2,row3), b1(row0,row1,row2,row3), ...
+      group1:...
+
+    Each row-block is Q4K_BLOCK_BYTES (140 bytes).
+    """
+    if cols % block_k != 0:
+        raise ValueError("cols must be divisible by 256 for q4_k_m repack")
+
+    blocks_per_row = cols // block_k
+    total_blocks = rows * blocks_per_row
+    expected = total_blocks * Q4K_BLOCK_BYTES
+    if len(q4k_row_major_bytes) != expected:
+        raise ValueError(f"byte length mismatch: got={len(q4k_row_major_bytes)} expected={expected}")
+
+    src = np.frombuffer(q4k_row_major_bytes, dtype=np.uint8).reshape(total_blocks, Q4K_BLOCK_BYTES)
+    groups = (rows + 3) // 4
+
+    out_blocks = np.zeros((groups * blocks_per_row * 4, Q4K_BLOCK_BYTES), dtype=np.uint8)
+
+    for g in range(groups):
+        for b in range(blocks_per_row):
+            dst_base = (g * blocks_per_row + b) * 4
+            for lane in range(4):
+                r = g * 4 + lane
+                if r >= rows:
+                    continue
+                src_idx = r * blocks_per_row + b
+                out_blocks[dst_base + lane, :] = src[src_idx, :]
+
+    return out_blocks.reshape(-1).tobytes()
 
 def quantize_and_pack_q4_32(tensor: torch.Tensor) -> np.ndarray:
     """Returns a flattened uint8 numpy array containing the 18-byte packed blocks."""
