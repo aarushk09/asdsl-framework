@@ -156,7 +156,7 @@ class MemoryManager:
 
     def allocate_for_weights(
         self,
-        name_or_data,
+        name_or_data: str | np.ndarray,
         shape: tuple | None = None,
         dtype: np.dtype | type = np.float32,
         numa_node: int = -1,
@@ -183,9 +183,23 @@ class MemoryManager:
             # New-style: allocate_for_weights("layer0_q", shape=(64,), dtype=np.float16)
             name = name_or_data
             dtype = np.dtype(dtype)
-            buffer = np.empty(shape, dtype=dtype)
-
+            
+            # Use pre-allocation path if specified
+            is_huge = False
             is_pinned = False
+            
+            if self.use_huge_pages and self._can_huge_pages and shape is not None:
+                # Calculate size
+                num_elements = np.prod(shape)
+                buffer = self._allocate_huge_pages(num_elements, dtype)
+                if buffer is not None:
+                    buffer = buffer.reshape(shape)
+                    is_huge = True
+                else:
+                    buffer = np.empty(shape, dtype=dtype)
+            else:
+                buffer = np.empty(shape, dtype=dtype)
+
             if self.pin_memory and self._can_pin:
                 if self._pin_buffer(buffer):
                     is_pinned = True
@@ -196,23 +210,69 @@ class MemoryManager:
                 buffer=buffer,
                 size_bytes=buffer.nbytes,
                 is_pinned=is_pinned,
+                is_huge_page=is_huge,
                 numa_node=numa_node,
             )
-        else:
-            # Legacy: allocate_for_weights(packed_data)
-            packed_data: np.ndarray = name_or_data
-            name = ""
-            region = self.allocate(
-                size_bytes=packed_data.nbytes,
-                dtype=packed_data.dtype,
-                numa_node=numa_node,
-            )
-            region.name = name
-            np.copyto(region.buffer[: len(packed_data)], packed_data)
+            self._regions[name] = region
+            logger.debug("Registered weight region '%s': %.2f KB (pinned=%s, huge=%s)", name, region.size_bytes / 1024, is_pinned, is_huge)
+            return region
 
-        self._regions[name] = region
-        logger.debug("Registered weight region '%s': %.2f KB", name, region.size_bytes / 1024)
-        return region
+        else:
+            # Legacy style: allocate_for_weights(numpy_array)
+            data = name_or_data
+            if not isinstance(data, np.ndarray):
+                raise TypeError("Expected numpy array")
+
+            # Try to allocate a new optimized buffer
+            is_huge = False
+            is_pinned = False
+            
+            if self.use_huge_pages and self._can_huge_pages:
+                buffer = self._allocate_huge_pages(data.size, data.dtype)
+                if buffer is not None:
+                    buffer = buffer.reshape(data.shape)
+                    is_huge = True
+                else:
+                    buffer = np.empty_like(data)
+            else:
+                buffer = np.empty_like(data)
+
+            # Copy data over
+            np.copyto(buffer, data)
+
+            if self.pin_memory and self._can_pin:
+                if self._pin_buffer(buffer):
+                    is_pinned = True
+                    self._total_pinned_bytes += buffer.nbytes
+
+            region = MemoryRegion(
+                name=f"weight_{id(data)}", # Generate a unique name for legacy style
+                buffer=buffer,
+                size_bytes=buffer.nbytes,
+                is_pinned=is_pinned,
+                is_huge_page=is_huge,
+                numa_node=numa_node,
+            )
+            self._regions[region.name] = region
+            logger.debug("Registered weight region '%s': %.2f KB (pinned=%s, huge=%s)", region.name, region.size_bytes / 1024, is_pinned, is_huge)
+            return region
+
+    def get_raw_pointer(self, name_or_region: str | MemoryRegion) -> int:
+        """Get the raw memory address for zero-copy C++ interop.
+        
+        Args:
+            name_or_region: The string name of the region, or the MemoryRegion object.
+            
+        Returns:
+            Raw memory address as an integer.
+        """
+        if isinstance(name_or_region, MemoryRegion):
+            return name_or_region.base_address
+        
+        region = self._regions.get(name_or_region)
+        if region is None:
+            raise KeyError(f"Memory region '{name_or_region}' not found")
+        return region.base_address
 
     def release(self, name: str) -> None:
         """Release a named memory region."""

@@ -97,6 +97,14 @@ def get_native_extensions():
             define_macros=[("PYBIND11_DETAILED_ERROR_MESSAGES", "1")],
             language="c++",
         ),
+        Pybind11Extension(
+            "asdsl.kernels._native_inference",
+            ["asdsl/kernels/native/inference_engine.cpp"],
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
+            define_macros=[("PYBIND11_DETAILED_ERROR_MESSAGES", "1")],
+            language="c++",
+        ),
     ]
 
     return ext_modules, {"build_ext": build_ext}
