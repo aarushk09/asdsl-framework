@@ -6,6 +6,7 @@
 #include <vector>
 #include <iostream>
 #include <cmath>
+#include <omp.h>
 
 namespace py = pybind11;
 
@@ -64,6 +65,7 @@ void gemv_q4_avx2(const BlockQ4_32* weights, const float* activations, float* ou
 }
 
 void gemv_f32(const float* weights, const float* activations, float* output, int out_dim, int in_dim) {
+    #pragma omp parallel for
     for (int i = 0; i < out_dim; ++i) {
         float sum = 0.0f;
         for (int j = 0; j < in_dim; ++j) {
@@ -151,9 +153,9 @@ void compute_attention(float* out, const float* q, const float* k, const float* 
     memcpy(&cache.k_cache[cache_off], k, num_kv_heads * head_dim * sizeof(float));      
     memcpy(&cache.v_cache[cache_off], v, num_kv_heads * head_dim * sizeof(float));      
 
-    std::vector<float> scores(seq_pos + 1);
-
+    #pragma omp parallel for
     for (int h = 0; h < num_heads; ++h) {
+        std::vector<float> scores(seq_pos + 1);
         int kv_h = h / groups;
         const float* q_h = q + h * head_dim;
         float* out_h = out + h * head_dim;
@@ -238,6 +240,7 @@ void forward_layer(float* x, const float* rms1_w, const float* qkv_w, const floa
     gemv_f32(gate_w, h.data(), gate.data(), hidden_dim, dim);
     gemv_f32(up_w, h.data(), up.data(), hidden_dim, dim);
 
+    #pragma omp parallel for
     for (int i=0; i<hidden_dim; ++i) {
         float x_gate = gate[i];
         float silu = x_gate / (1.0f + std::exp(-x_gate));
