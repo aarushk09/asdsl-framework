@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Literal
 
+USE_ACTIVATION_SPARSE_GEMV = os.environ.get("ASDSL_SPARSE_GEMV", "0") == "1"
 
 class QuantBits(IntEnum):
     """Supported quantization bit-widths."""

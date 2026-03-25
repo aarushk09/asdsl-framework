@@ -484,43 +484,14 @@ class WeightStore:
 
     def _matmul_quant_batch(self, layer_idx: int, name: str,
                             X_batch: torch.Tensor) -> torch.Tensor:
-        """Batched dequant+matmul: Y = W @ X^T, loading W once for K tokens.
-
-        This is the key to QCSD verify speedup: weight data is read from DRAM
-        once and applied to K activation vectors via BLAS GEMM.
-
-        Args:
-            X_batch: (K, hidden_dim) — K activation vectors stacked.
-        Returns:
-            (K, output_dim) — K output vectors.
-        """
         key = (layer_idx, name)
-        u8 = self._quant_u8[key]
-        sc = self._quant_sc[key]
-        bi = self._quant_bi[key]
-        rows, cols = self._quant_shapes[key]
-        groups_per_row = cols // self.group_size
+        
+        q_weights = self._quant_w_f32[key]
+        x_flat = X_batch.reshape(-1, X_batch.shape[-1]).float()
+        res = torch.mm(x_flat, q_weights.t())
+        
+        return res.view(*X_batch.shape[:-1], -1)
 
-        K_batch = X_batch.shape[0]
-        X_flat = X_batch.reshape(K_batch, cols)
-
-        chunk_rows = max(1, _TARGET_CHUNK_BYTES // (cols * 4))
-        result = torch.empty(rows, K_batch, dtype=torch.float32)
-
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
-            n = end - start
-            flat_len = n * cols
-            buf = self._pool[:flat_len]
-            buf.copy_(u8[start * cols:end * cols])
-            vals = buf.view(n, groups_per_row, self.group_size)
-            gs = start * groups_per_row
-            ge = end * groups_per_row
-            vals.mul_(sc[gs:ge].float().view(n, groups_per_row, 1))
-            vals.add_(bi[gs:ge].float().view(n, groups_per_row, 1))
-            torch.mm(vals.view(n, cols), X_flat.T, out=result[start:end, :])
-
-        return result.T
 
     def _matmul_f16_batch(self, layer_idx: int, name: str,
                           X_batch: torch.Tensor) -> torch.Tensor:

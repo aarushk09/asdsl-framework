@@ -5,6 +5,17 @@ Provides SIMD kernel stubs (simd.py) and fused GEMV extensions
 acceleration.
 """
 
+try:
+    import cpufeature
+    if cpufeature.CPUFeature.get('AVX512f', False):
+        KERNEL_TIER = 'AVX512'
+    elif cpufeature.CPUFeature.get('AVX2', False):
+        KERNEL_TIER = 'AVX2'
+    else:
+        KERNEL_TIER = 'BASIC'
+except ImportError:
+    KERNEL_TIER = 'BASIC'
+
 from asdsl.kernels.gemv_q4 import (
     gemv_q4,
     gemv_q4_packed,
@@ -32,6 +43,7 @@ from asdsl.kernels.gemv_sparse import (
 )
 
 __all__ = [
+    "KERNEL_TIER",
     "gemv_q4",
     "gemv_q4_packed",
     "gemv_q4_unpacked",

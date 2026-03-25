@@ -1,0 +1,41 @@
+    def matvec_sparse(self, layer_idx: int, name: str, x: torch.Tensor,
+                      bitmask: np.ndarray, active_indices: np.ndarray) -> torch.Tensor:
+        """Activation-sparse GEMV: skip near-zero activation columns (Tier 3)."""
+        key = (layer_idx, name)
+        u8_weights = self._quant_u8[key].numpy()
+        sc = self._quant_sc[key].float().numpy()
+        bi = self._quant_bi[key].float().numpy()
+        rows, cols = self._quant_shapes[key]
+        x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+
+        try:
+            from asdsl.kernels import gemv_sparse_with_indices
+            out_np = gemv_sparse_with_indices(
+                u8_weights, x_np, sc, bi, active_indices, rows, cols, self.group_size
+            )
+        except ImportError:
+            from asdsl.kernels import gemv_sparse_unpacked
+            out_np = gemv_sparse_unpacked(
+                u8_weights, x_np, sc, bi, bitmask, rows, cols, self.group_size
+            )
+
+        result = torch.from_numpy(out_np).unsqueeze(0)
+
+        # Outlier correction
+        if key in self._outlier_values and len(self._outlier_values[key]) > 0:
+            ov = self._outlier_values[key].astype(np.float32)
+            oc = self._outlier_coords[key]
+            col_mask = np.isin(oc[:, 1], active_indices)
+            if col_mask.any():
+                ov_act = ov[col_mask]
+                oc_act = oc[col_mask]
+                x_sel = x_np[oc_act[:, 1]]
+                contributions = ov_act * x_sel
+                out_corr = np.zeros(rows, dtype=np.float32)
+                np.add.at(out_corr, oc_act[:, 0], contributions)
+                result = result + torch.from_numpy(out_corr).unsqueeze(0)
+
+        return result
+
+    def _matmul_quant_batch(self, layer_idx: int, name: str,
+                            X_batch: torch.Tensor) -> torch.Tensor:

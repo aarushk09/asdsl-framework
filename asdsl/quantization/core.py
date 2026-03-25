@@ -8,6 +8,7 @@ bit allocation builds upon.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -73,7 +74,7 @@ def compute_scale_zero(
 
     if symmetric:
         # Symmetric: scale based on max absolute value
-        abs_max = np.maximum(np.abs(weights).max(axis=-1, keepdims=True), 1e-10)
+        abs_max = np.maximum(np.abs(weights).max(axis=-1, keepdims=True), 1e-5)
         half_range = (qmax - qmin) / 2
         scales = abs_max / half_range
         return scales.astype(np.float16), None
@@ -81,7 +82,7 @@ def compute_scale_zero(
         # Asymmetric: use full range [min, max]
         w_min = weights.min(axis=-1, keepdims=True)
         w_max = weights.max(axis=-1, keepdims=True)
-        w_range = np.maximum(w_max - w_min, 1e-10)
+        w_range = np.maximum(w_max - w_min, 1e-5)
         scales = w_range / qmax
         zeros = -w_min / scales
         return scales.astype(np.float16), zeros.astype(np.float16)
@@ -103,20 +104,25 @@ def _find_optimal_scales(
     qmax = (1 << bits) - 1
     n_groups = grouped.shape[0]
 
-    ratios = np.array([0.85, 0.90, 0.93, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0],
-                      dtype=np.float32)
+    # Quick test flag to bypass grid search for faster loading
+    if os.environ.get("ASDSL_FAST_TEST") == "1":
+        ratios = np.array([1.0], dtype=np.float32)
+    else:
+        ratios = np.array([0.85, 0.90, 0.93, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0],
+                          dtype=np.float32)
+    
     best_mse = np.full(n_groups, np.inf, dtype=np.float32)
-    best_scales = np.ones((n_groups, 1), dtype=np.float32) * 1e-10
+    best_scales = np.ones((n_groups, 1), dtype=np.float32) * 1e-5
     best_zeros = None if symmetric else np.zeros((n_groups, 1), dtype=np.float32)
 
     if symmetric:
-        abs_max = np.maximum(np.abs(grouped).max(axis=1, keepdims=True), 1e-10)
+        abs_max = np.maximum(np.abs(grouped).max(axis=1, keepdims=True), 1e-5)
         half_range = (qmax - qmin) / 2.0
         for r in ratios:
             clip_val = abs_max * r
             # Round scale to float16 to match actual storage precision
-            scale = np.maximum(clip_val / half_range, 1e-10)
-            scale_f16 = scale.astype(np.float16).astype(np.float32)
+            scale = np.maximum(clip_val / half_range, 1e-5)
+            scale_f16 = np.maximum(scale.astype(np.float16).astype(np.float32), 1e-4)
             quantized = np.clip(np.round(grouped / scale_f16 + half_range), qmin, qmax)
             dequantized = (quantized - half_range) * scale_f16
             mse = np.mean((grouped - dequantized) ** 2, axis=1)
@@ -126,16 +132,16 @@ def _find_optimal_scales(
     else:
         w_min = grouped.min(axis=1, keepdims=True)
         w_max = grouped.max(axis=1, keepdims=True)
-        w_range = np.maximum(w_max - w_min, 1e-10)
+        w_range = np.maximum(w_max - w_min, 1e-5)
         for r in ratios:
             margin = w_range * (1.0 - r) / 2.0
             clip_min = w_min + margin
             clip_max = w_max - margin
-            clip_range = np.maximum(clip_max - clip_min, 1e-10)
+            clip_range = np.maximum(clip_max - clip_min, 1e-5)
             scale = clip_range / qmax
-            zero = np.clip(-clip_min / np.maximum(scale, 1e-10), 0, qmax)
+            zero = np.clip(-clip_min / np.maximum(scale, 1e-5), 0, qmax)
             # Evaluate MSE at float16 precision (matching storage)
-            scale_f16 = scale.astype(np.float16).astype(np.float32)
+            scale_f16 = np.maximum(scale.astype(np.float16).astype(np.float32), 1e-4)
             zero_f16 = zero.astype(np.float16).astype(np.float32)
             quantized = np.clip(np.round(grouped / scale_f16 + zero_f16), qmin, qmax)
             dequantized = (quantized - zero_f16) * scale_f16
@@ -199,9 +205,9 @@ def quantize_weights(
     if symmetric:
         half_range = (qmax - qmin) / 2
         offset = half_range
-        quantized = np.round(grouped / scales.astype(np.float32) + offset)
+        quantized = np.round(grouped / np.maximum(scales.astype(np.float32), 1e-4) + offset)
     else:
-        quantized = np.round(grouped / scales.astype(np.float32) + zeros.astype(np.float32))
+        quantized = np.round(grouped / np.maximum(scales.astype(np.float32), 1e-4) + zeros.astype(np.float32))
 
     quantized = np.clip(quantized, qmin, qmax).astype(np.uint8)
 
@@ -445,7 +451,7 @@ def quantize_weights_with_outliers(
     # Per-group stats with group_size=16 have ~35% CV and flag far too many values.
     row_std = weights.std(axis=1, keepdims=True)
     row_mean = weights.mean(axis=1, keepdims=True)
-    row_std = np.maximum(row_std, 1e-10)
+    row_std = np.maximum(row_std, 1e-5)
 
     outlier_mask = np.abs(weights - row_mean) > (outlier_threshold_sigma * row_std)
 

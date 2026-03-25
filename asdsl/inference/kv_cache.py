@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+import torch
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,40 @@ class BlockSparseKVCache:
         values: np.ndarray,
         is_pivot: bool = False,
     ) -> None:
+        pass
+
+
+class ContiguousKVCache:
+    """Contiguous mapped KV cache directly matching the prompt's Phase 3D."""
+    
+    def __init__(self, num_layers: int, num_heads: int, head_dim: int, max_seq_len: int, dtype=torch.float16):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.dtype = dtype
+        
+        # Preallocate contiguous flat tensors and pin them
+        self.k_cache = torch.zeros(
+            (num_layers, max_seq_len, num_heads, head_dim),
+            dtype=self.dtype
+        ).pin_memory()
+        
+        self.v_cache = torch.zeros(
+            (num_layers, max_seq_len, num_heads, head_dim),
+            dtype=self.dtype
+        ).pin_memory()
+        
+        self.seq_len = 0
+        
+    def append(self, k: torch.Tensor, v: torch.Tensor):
+        """Append new k, v representations."""
+        batch_seq_len = k.shape[1]
+        assert self.seq_len + batch_seq_len <= self.max_seq_len, "KV cache capacity exceeded"
+        
+        self.k_cache[:, self.seq_len:self.seq_len + batch_seq_len, :, :] = k
+        self.v_cache[:, self.seq_len:self.seq_len + batch_seq_len, :, :] = v
+        self.seq_len += batch_seq_len
         """Append a single token's KV state for all layers.
 
         Args:

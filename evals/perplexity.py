@@ -118,44 +118,45 @@ def compute_perplexity(
 
     num_windows = max(1, (len(tokens) - 1) // stride)
 
-    for win_idx in range(num_windows):
-        begin = win_idx * stride
-        end = min(begin + stride + 1, len(tokens))
-        window = tokens[begin:end]
-        if len(window) < 2:
-            break
+    with torch.inference_mode():
+        for win_idx in range(num_windows):
+            begin = win_idx * stride
+            end = min(begin + stride + 1, len(tokens))
+            window = tokens[begin:end]
+            if len(window) < 2:
+                break
 
-        # Fresh KV cache per window
-        kv_hist = KVHistory()
+            # Fresh KV cache per window
+            kv_hist = KVHistory()
 
-        # Run forward pass for each token in the window
-        logits = None
-        for i, tid in enumerate(window[:-1]):
-            hidden = store.embed_f16[tid].float().unsqueeze(0)
-            for layer in range(NUM_LAYERS):
-                hidden = forward_layer(
-                    hidden, layer, store, kv_hist, rope_cos, rope_sin, pos=i,
-                )
-            # LM head (final norm + projection)
-            hidden = rms_norm(hidden, store.final_norm)
-            logits = store.lm_head_matvec(hidden)
+            # Run forward pass for each token in the window
+            logits = None
+            for i, tid in enumerate(window[:-1]):
+                hidden = store.embed_f16[tid].float().unsqueeze(0)
+                for layer in range(NUM_LAYERS):
+                    hidden = forward_layer(
+                        hidden, layer, store, kv_hist, rope_cos, rope_sin, pos=i,
+                    )
+                # LM head (final norm + projection)
+                hidden = rms_norm(hidden, store.final_norm)
+                logits = store.lm_head_matvec(hidden)
 
-            # Compute cross-entropy loss for the NEXT token
-            target = window[i + 1]
-            log_probs = torch.log_softmax(logits.float(), dim=-1)
-            nll = -log_probs[target].item()
-            nll_sum += nll
-            n_scored += 1
+                # Compute cross-entropy loss for the NEXT token
+                target = window[i + 1]
+                log_probs = torch.log_softmax(logits.float(), dim=-1)
+                nll = -log_probs[target].item()
+                nll_sum += nll
+                n_scored += 1
 
-        elapsed = time.perf_counter() - t_start
-        avg_nll = nll_sum / max(n_scored, 1)
-        ppl = math.exp(min(avg_nll, 50))  # cap to avoid overflow
-        tps = n_scored / elapsed if elapsed > 0 else 0
+            elapsed = time.perf_counter() - t_start
+            avg_nll = nll_sum / max(n_scored, 1)
+            ppl = math.exp(min(avg_nll, 50))  # cap to avoid overflow
+            tps = n_scored / elapsed if elapsed > 0 else 0
 
-        print(f"  Window {win_idx+1}/{num_windows}: "
-              f"tokens={n_scored}, NLL={avg_nll:.4f}, PPL={ppl:.2f}, "
-              f"{tps:.2f} eval-tok/s",
-              flush=True)
+            print(f"  Window {win_idx+1}/{num_windows}: "
+                  f"tokens={n_scored}, NLL={avg_nll:.4f}, PPL={ppl:.2f}, "
+                  f"{tps:.2f} eval-tok/s",
+                  flush=True)
 
     elapsed = time.perf_counter() - t_start
     avg_nll = nll_sum / max(n_scored, 1)
