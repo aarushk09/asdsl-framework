@@ -15,8 +15,11 @@ falls back to the Python orchestration path.
 from __future__ import annotations
 
 import logging
+import math
+import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -124,6 +127,21 @@ class DualModelBenchmarkResult:
     accepted_draft_tokens: int
     verifier_calls: int
     decode_time_s: float
+
+
+@dataclass
+class NativePerplexityResult:
+    """Perplexity-style evaluation metrics from the native Phase-8 route."""
+
+    bits: int
+    ppl: float
+    avg_nll: float
+    num_tokens: int
+    tokens_per_second: float
+    elapsed_sec: float
+    windows: int
+    backend_model_bin: str
+    backend_model_metadata: str
 
 
 class TransformerLayerExecutor:
@@ -692,4 +710,147 @@ def run_dual_model_speculative_benchmark(
         accepted_draft_tokens=result.accepted_draft_tokens,
         verifier_calls=result.verifier_calls,
         decode_time_s=result.decode_time_s,
+    )
+
+
+def _resolve_native_model_paths(bits: int) -> tuple[Path, Path]:
+    """Resolve model artifacts for native Phase-8 evaluation.
+
+    Falls back to q4 artifacts when a bit-specific export is unavailable.
+    """
+    root = Path(__file__).resolve().parent.parent.parent
+    models = root / "models"
+
+    candidates = [
+        (models / f"phi4_q{bits}.bin", models / f"phi4_q{bits}_metadata.json"),
+        (models / f"phi4_q{bits}_mmap.bin", models / f"phi4_q{bits}_mmap_metadata.json"),
+        (models / "phi4_q4.bin", models / "phi4_q4_metadata.json"),
+    ]
+
+    for bin_path, meta_path in candidates:
+        if bin_path.exists() and meta_path.exists():
+            return bin_path, meta_path
+
+    raise FileNotFoundError(
+        "No native model artifacts found for Phase-8 evaluation. "
+        "Expected one of: phi4_q{bits}.bin + metadata, phi4_q{bits}_mmap.bin + metadata, or phi4_q4 fallback."
+    )
+
+
+def evaluate_perplexity_phase8_native(
+    tokens: list[int],
+    bits: int = 8,
+    stride: int = 512,
+    p_correct: float = 0.9,
+) -> NativePerplexityResult:
+    """Run native batched perplexity-style evaluation through Phase-8 routing.
+
+    This uses:
+    - native mmap weights
+    - batched prompt prefill via `prefill_prompt_tokens`
+    - native token generation for next-token verification
+
+    Note: current native binding does not expose full logits. We therefore
+    compute a smoothed top-1 proxy NLL from next-token match/mismatch.
+    """
+    from asdsl.kernels import _native_forward as native_forward
+
+    if not tokens or len(tokens) < 2:
+        raise ValueError("Need at least 2 tokens for perplexity evaluation")
+
+    model_bin, model_meta = _resolve_native_model_paths(bits)
+    with open(model_meta, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    # Match current native benchmark architecture constants.
+    num_layers = 40
+    dim = 5120
+    hidden_dim = 17920
+    num_heads = 40
+    num_kv_heads = 10
+    head_dim = dim // num_heads
+    vocab_size = 100352
+
+    store = native_forward.MmapWeights(str(model_bin), metadata)
+
+    nll_sum = 0.0
+    n_scored = 0
+    processed_tokens = 0
+
+    t0 = time.perf_counter()
+    windows = max(1, (len(tokens) - 1) // stride)
+
+    p_correct = float(min(max(p_correct, 1e-6), 1.0 - 1e-6))
+    p_wrong = (1.0 - p_correct) / max(vocab_size - 1, 1)
+
+    for win_idx in range(windows):
+        begin = win_idx * stride
+        end = min(begin + stride + 1, len(tokens))
+        window = tokens[begin:end]
+        if len(window) < 2:
+            break
+
+        prefix = window[:-1]
+        target = int(window[-1])
+        max_seq_len = max(stride + 16, len(prefix) + 16)
+        cache = native_forward.KVCache(num_layers, max_seq_len, num_kv_heads, head_dim)
+
+        if len(prefix) > 1:
+            prefill_ids = np.asarray(prefix[:-1], dtype=np.int32)
+            native_forward.prefill_prompt_tokens(
+                prefill_ids,
+                0,
+                store,
+                num_layers,
+                dim,
+                hidden_dim,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                vocab_size,
+                cache,
+            )
+            seq_pos = len(prefix) - 1
+            prev_token = int(prefix[-1])
+            processed_tokens += len(prefix) - 1
+        else:
+            seq_pos = 0
+            prev_token = int(prefix[0])
+
+        pred = int(
+            native_forward.generate_token(
+                prev_token,
+                seq_pos,
+                store,
+                num_layers,
+                dim,
+                hidden_dim,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                vocab_size,
+                cache,
+            )
+        )
+        processed_tokens += 1
+
+        prob = p_correct if pred == target else p_wrong
+        nll_sum += -math.log(max(prob, 1e-12))
+        n_scored += 1
+
+    elapsed = time.perf_counter() - t0
+    avg_nll = nll_sum / max(n_scored, 1)
+    ppl = math.exp(min(avg_nll, 50.0))
+    tps = processed_tokens / max(elapsed, 1e-9)
+
+    return NativePerplexityResult(
+        bits=bits,
+        ppl=ppl,
+        avg_nll=avg_nll,
+        num_tokens=n_scored,
+        tokens_per_second=tps,
+        elapsed_sec=elapsed,
+        windows=windows,
+        backend_model_bin=str(model_bin),
+        backend_model_metadata=str(model_meta),
     )

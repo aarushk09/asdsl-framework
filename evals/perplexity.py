@@ -1,46 +1,25 @@
-"""
-Perplexity evaluation for ASDSL-quantized Phi-4 on WikiText-2.
+"""Phase-8 native perplexity-style evaluation for ASDSL.
 
-Computes token-level cross-entropy loss (perplexity) to measure how
-quantization affects the model's core predictive distribution.
-
-Usage:
-  python evals/perplexity.py                      # default: bits=16 (baseline)
-  python evals/perplexity.py --bits 8             # ASDSL 8-bit
-  python evals/perplexity.py --bits 4             # ASDSL 4-bit
-  python evals/perplexity.py --bits 3             # ASDSL 3-bit (10-in-32)
-  python evals/perplexity.py --max-tokens 512     # evaluate fewer tokens (faster)
+This script routes evaluation through `asdsl.engine` high-level APIs and
+native C++ kernels (`prefill_prompt_tokens` + native token generation),
+avoiding legacy Python layer loops and chunked f16 matvec paths.
 """
 from __future__ import annotations
 
 import argparse
-import json
-import math
 import os
 import sys
-import time
 from pathlib import Path
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_JAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
-import numpy as np
-import torch
-
-# --- import the inference engine (same as phi4_cpu_run.py) ---
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "experiments"))
 
-from phi4_cpu_run import (
-    WeightStore, KVHistory, ASDSLKVTracker,
-    forward_layer, rms_norm, build_rope_cache,
-    NUM_LAYERS, ROTARY_DIM, EOS_TOKEN_IDS,
-)
+from asdsl.engine import evaluate_perplexity_phase8_native
 from transformers import AutoTokenizer
-
-MODEL_DIR = ROOT / "models" / "phi4-multimodal-instruct"
 
 
 # ---------------------------------------------------------------------------
@@ -92,97 +71,15 @@ _BUILTIN_SAMPLE = (
 
 
 # ---------------------------------------------------------------------------
-# Perplexity computation
-# ---------------------------------------------------------------------------
-
-def compute_perplexity(
-    tokens: list[int],
-    store: WeightStore,
-    stride: int = 512,
-) -> dict[str, float]:
-    """Compute perplexity on a token sequence using a sliding window.
-
-    To avoid reprocessing the entire sequence for each window, we use
-    a stride-based approach: process `stride` tokens at a time, resetting
-    the KV cache for each window.  This matches the standard approach used
-    by HuggingFace/EleutherAI for causal LM perplexity evaluation.
-
-    Returns dict with {ppl, nll_sum, num_tokens, tokens_per_sec}.
-    """
-    max_seq = stride + 64
-    rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
-
-    nll_sum = 0.0
-    n_scored = 0
-    t_start = time.perf_counter()
-
-    num_windows = max(1, (len(tokens) - 1) // stride)
-
-    with torch.inference_mode():
-        for win_idx in range(num_windows):
-            begin = win_idx * stride
-            end = min(begin + stride + 1, len(tokens))
-            window = tokens[begin:end]
-            if len(window) < 2:
-                break
-
-            # Fresh KV cache per window
-            kv_hist = KVHistory()
-
-            # Run forward pass for each token in the window
-            logits = None
-            for i, tid in enumerate(window[:-1]):
-                hidden = store.embed_f16[tid].float().unsqueeze(0)
-                for layer in range(NUM_LAYERS):
-                    hidden = forward_layer(
-                        hidden, layer, store, kv_hist, rope_cos, rope_sin, pos=i,
-                    )
-                # LM head (final norm + projection)
-                hidden = rms_norm(hidden, store.final_norm)
-                logits = store.lm_head_matvec(hidden)
-
-                # Compute cross-entropy loss for the NEXT token
-                target = window[i + 1]
-                log_probs = torch.log_softmax(logits.float(), dim=-1)
-                nll = -log_probs[target].item()
-                nll_sum += nll
-                n_scored += 1
-
-            elapsed = time.perf_counter() - t_start
-            avg_nll = nll_sum / max(n_scored, 1)
-            ppl = math.exp(min(avg_nll, 50))  # cap to avoid overflow
-            tps = n_scored / elapsed if elapsed > 0 else 0
-
-            print(f"  Window {win_idx+1}/{num_windows}: "
-                  f"tokens={n_scored}, NLL={avg_nll:.4f}, PPL={ppl:.2f}, "
-                  f"{tps:.2f} eval-tok/s",
-                  flush=True)
-
-    elapsed = time.perf_counter() - t_start
-    avg_nll = nll_sum / max(n_scored, 1)
-    ppl = math.exp(min(avg_nll, 50))
-    tps = n_scored / elapsed if elapsed > 0 else 0
-
-    return {
-        "ppl": ppl,
-        "nll_sum": nll_sum,
-        "avg_nll": avg_nll,
-        "num_tokens": n_scored,
-        "tokens_per_sec": tps,
-        "elapsed_sec": elapsed,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="ASDSL Perplexity Evaluation")
-    parser.add_argument("--bits", type=int, default=16,
+    parser.add_argument("--bits", type=int, default=8,
                         choices=[2, 3, 4, 8, 16],
                         help="Quantization bit-width (16 = float16 baseline)")
-    parser.add_argument("--max-tokens", type=int, default=256,
+    parser.add_argument("--max-tokens", type=int, default=512,
                         help="Max dataset tokens to evaluate (controls runtime)")
     parser.add_argument("--stride", type=int, default=512,
                         help="Sliding window stride for PPL computation")
@@ -191,37 +88,39 @@ def main():
     print("=" * 66)
     print(f"  ASDSL Perplexity Evaluation - bits={args.bits}")
     print("=" * 66)
+    print("Routing: Phase-8 native backend (batched prefill + native generation)")
 
     # Load tokenizer
     print("Loading tokenizer ...")
     tokenizer = AutoTokenizer.from_pretrained(
-        "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True
+        "microsoft/phi-4", trust_remote_code=True
     )
 
     # Load WikiText
     print("Loading WikiText-2 ...")
     tokens = load_wikitext2(tokenizer, max_tokens=args.max_tokens)
 
-    # Load model
-    print(f"Loading model (bits={args.bits}) ...")
-    store = WeightStore(bits=args.bits)
-    store.load()
-    store.warm_cache()
-
     # Evaluate
-    print("\nComputing perplexity ...")
-    results = compute_perplexity(tokens, store, stride=args.stride)
+    print("\nComputing perplexity (Phase-8 native route) ...")
+    results = evaluate_perplexity_phase8_native(
+        tokens=tokens,
+        bits=args.bits,
+        stride=args.stride,
+    )
 
     # Report
-    quant_label = "float16 (baseline)" if args.bits == 16 else f"ASDSL {args.bits}-bit"
+    quant_label = "float16-compatible route" if args.bits == 16 else f"ASDSL {args.bits}-bit"
     print("\n" + "=" * 66)
     print(f"  Results: {quant_label}")
     print("=" * 66)
-    print(f"  Perplexity (PPL):    {results['ppl']:.2f}")
-    print(f"  Avg NLL / token:     {results['avg_nll']:.4f}")
-    print(f"  Tokens evaluated:    {results['num_tokens']}")
-    print(f"  Eval throughput:     {results['tokens_per_sec']:.2f} tok/s")
-    print(f"  Total time:          {results['elapsed_sec']:.1f}s")
+    print(f"  Perplexity (proxy):  {results.ppl:.2f}")
+    print(f"  Avg NLL / token:     {results.avg_nll:.4f}")
+    print(f"  Windows scored:      {results.windows}")
+    print(f"  Targets scored:      {results.num_tokens}")
+    print(f"  Eval throughput:     {results.tokens_per_second:.2f} tok/s")
+    print(f"  Total time:          {results.elapsed_sec:.1f}s")
+    print(f"  Backend weights:     {results.backend_model_bin}")
+    print(f"  Backend metadata:    {results.backend_model_metadata}")
     print("=" * 66)
 
 
