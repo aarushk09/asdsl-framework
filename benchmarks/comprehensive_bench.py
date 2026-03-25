@@ -19,21 +19,38 @@ import os
 import sys
 import time
 from pathlib import Path
+import psutil
 
-# Thread control BEFORE importing numpy/torch
-# Intel i7 Evo: default to 8 threads (P-cores), prefer MKL
-os.environ["OMP_NUM_THREADS"] = "8"
-os.environ["MKL_NUM_THREADS"] = "8"
-os.environ["OPENBLAS_NUM_THREADS"] = "8"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "8"
-os.environ["NUMEXPR_NUM_THREADS"] = "8"
+# ---------------------------------------------------------------------------
+# Early Thread Control (must run before numpy/torch import)
+# ---------------------------------------------------------------------------
+
+_MAX_RESOURCES = "--max-resources" in sys.argv
+
+if _MAX_RESOURCES:
+    _num_threads = psutil.cpu_count(logical=True)
+else:
+    # Extract --threads if provided, otherwise default to 8
+    _num_threads = 8
+    if "--threads" in sys.argv:
+        try:
+            _idx = sys.argv.index("--threads")
+            _num_threads = int(sys.argv[_idx + 1])
+        except (ValueError, IndexError):
+            pass
+
+os.environ["OMP_NUM_THREADS"] = str(_num_threads)
+os.environ["MKL_NUM_THREADS"] = str(_num_threads)
+os.environ["OPENBLAS_NUM_THREADS"] = str(_num_threads)
+os.environ["VECLIB_MAXIMUM_THREADS"] = str(_num_threads)
+os.environ["NUMEXPR_NUM_THREADS"] = str(_num_threads)
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_JAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 import numpy as np
 import torch
-torch.set_num_threads(8)
+torch.set_num_threads(_num_threads)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -461,9 +478,11 @@ def main():
                         help="CPU threads (default: 8 for Intel i7 Evo P-cores)")
     parser.add_argument("--sparse", action="store_true",
                         help="Enable activation-sparse GEMV (Tier 3)")
+    parser.add_argument("--max-resources", action="store_true",
+                        help="Use all available logical CPU cores and skip resource limiting")
     args = parser.parse_args()
 
-    set_thread_count(args.threads)
+    set_thread_count(_num_threads)
 
     bits_list = args.bits or [16, 8, 4, 3, 2]
 
@@ -472,7 +491,7 @@ def main():
     print("=" * 66)
     print(f"  CPU: {psutil.cpu_count(logical=False)} cores / {psutil.cpu_count()} threads")
     print(f"  RAM: {psutil.virtual_memory().total / (1024**3):.1f} GB total")
-    print(f"  Threads limited to: {args.threads}")
+    print(f"  Threads limited to: {'MAX' if args.max_resources else _num_threads}")
     print(f"  Bit-widths: {bits_list}")
     print(f"  Max tokens: {args.max_tokens}")
 
