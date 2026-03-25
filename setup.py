@@ -50,6 +50,14 @@ def get_native_extensions():
 
     ext_modules = [
         Pybind11Extension(
+            "asdsl.kernels._native_forward",
+            ["asdsl/kernels/forward_loop.cpp"],
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
+            language="c++",
+        ),
+
+        Pybind11Extension(
             "asdsl.kernels._native_gemv",
             ["asdsl/kernels/native/gemv_q4_avx2.cpp"],
             extra_compile_args=extra_compile_args,
@@ -116,3 +124,4 @@ setup(
     ext_modules=ext_modules,
     cmdclass=cmdclass,
 )
+
