@@ -446,14 +446,15 @@ class ASDSLEngine:
             prefetcher=self.prefetcher,
         )
 
-        # 4. KV cache (INT8 quantized for 4x memory savings)
+        # 4. KV cache (Q4 packed KV by default for long-context memory)
         head_dim = self.model.config.hidden_dim // self.model.config.num_attention_heads
         self.kv_cache = BlockSparseKVCache(
             KVCacheConfig(
                 max_context_length=self.model.config.max_context_length,
                 num_kv_heads=self.model.config.num_kv_heads,
                 head_dim=head_dim,
-                quantize_kv=True,  # INT8 KV cache
+                quantize_kv=True,
+                kv_bits=4,
             )
         )
 
@@ -480,7 +481,7 @@ class ASDSLEngine:
         self.prefetcher.start()
         self._is_initialized = True
         logger.info(
-            "ASDSL engine initialized (native_engine=%s, kv_cache=INT8)",
+            "ASDSL engine initialized (native_engine=%s, kv_cache=Q4)",
             _native_engine_available,
         )
 
