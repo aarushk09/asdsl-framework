@@ -29,6 +29,7 @@
 #include <pybind11/numpy.h>
 
 #include <immintrin.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstddef>
 #include <stdexcept>
@@ -42,6 +43,11 @@
 #endif
 
 namespace py = pybind11;
+
+namespace {
+// ~16KB float slice of x per K-tile (plus weights); multiple tiles when K is large.
+constexpr int CACHE_K_BLOCK_FLOATS = 4096;
+}  // namespace
 
 /* ===================================================================
  * AVX2 Utility Functions
@@ -58,6 +64,44 @@ static inline float hsum256_ps(__m256 v) {
     return _mm_cvtss_f32(lo);
 }
 
+static inline void q8_fused_accum_group(
+    int g,
+    int group_size,
+    const uint8_t* __restrict w_row,
+    const float* __restrict x,
+    const float* __restrict sc_row,
+    const float* __restrict bi_row,
+    float& row_sum) {
+    const int k_start = g * group_size;
+    __m256 v_sum = _mm256_setzero_ps();
+    float g_sum_x = 0.0f;
+
+    int kk = 0;
+    for (; kk <= group_size - 8; kk += 8) {
+        __m256 v_x = _mm256_loadu_ps(x + k_start + kk);
+        g_sum_x += x[k_start + kk + 0] + x[k_start + kk + 1] +
+                   x[k_start + kk + 2] + x[k_start + kk + 3] +
+                   x[k_start + kk + 4] + x[k_start + kk + 5] +
+                   x[k_start + kk + 6] + x[k_start + kk + 7];
+
+        __m128i raw_bytes =
+            _mm_loadl_epi64((const __m128i*)(w_row + k_start + kk));
+        __m256i v_w_i32 = _mm256_cvtepu8_epi32(raw_bytes);
+        __m256 v_w = _mm256_cvtepi32_ps(v_w_i32);
+        v_sum = _mm256_fmadd_ps(v_w, v_x, v_sum);
+    }
+
+    float dot_val = hsum256_ps(v_sum);
+    for (; kk < group_size; ++kk) {
+        const float x_k = x[k_start + kk];
+        const float w_k = static_cast<float>(w_row[k_start + kk]);
+        dot_val += w_k * x_k;
+        g_sum_x += x_k;
+    }
+
+    row_sum += sc_row[g] * dot_val + bi_row[g] * g_sum_x;
+}
+
 /* ===================================================================
  * Core Kernel: 8-bit GEMV (uint8 unpacked)
  * =================================================================== */
@@ -68,9 +112,13 @@ static void fused_dequant_gemv_q8_impl(
     const float*   __restrict scales,
     const float*   __restrict biases,
     float*         __restrict y,
-    int M, int K, int group_size
-) {
+    int M,
+    int K,
+    int group_size,
+    bool cache_tiling) {
     const int groups_per_row = K / group_size;
+    const int tile_groups =
+        cache_tiling ? std::max(1, CACHE_K_BLOCK_FLOATS / std::max(group_size, 1)) : groups_per_row;
 
     asdsl_omp_pinning::configure_openmp_for_pcores();
 #pragma omp parallel
@@ -78,53 +126,25 @@ static void fused_dequant_gemv_q8_impl(
         asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
 #pragma omp for schedule(static)
         for (int m = 0; m < M; ++m) {
-        float row_sum = 0.0f;
-        const uint8_t* w_row = w + m * K;
-        const float* sc_row = scales + m * groups_per_row;
-        const float* bi_row = biases + m * groups_per_row;
+            float row_sum = 0.0f;
+            const uint8_t* w_row = w + static_cast<size_t>(m) * K;
+            const float* sc_row = scales + static_cast<size_t>(m) * groups_per_row;
+            const float* bi_row = biases + static_cast<size_t>(m) * groups_per_row;
 
-        for (int g = 0; g < groups_per_row; ++g) {
-            const int k_start = g * group_size;
-            __m256 v_sum = _mm256_setzero_ps();
-            float g_sum_x = 0.0f;
-
-            // Process 8 elements per iteration
-            int k = 0;
-            for (; k <= group_size - 8; k += 8) {
-                // Load 8 float32 activations
-                __m256 v_x = _mm256_loadu_ps(x + k_start + k);
-                
-                // Keep track of sum(x) for the bias correction: sum += sum(x) * bias
-                g_sum_x += x[k_start + k + 0] + x[k_start + k + 1] +
-                           x[k_start + k + 2] + x[k_start + k + 3] +
-                           x[k_start + k + 4] + x[k_start + k + 5] +
-                           x[k_start + k + 6] + x[k_start + k + 7];
-
-                // Load 8 uint8 weights: extend 8 bytes -> 8 int32 -> 8 float32
-                __m128i raw_bytes = _mm_loadl_epi64((const __m128i*)(w_row + k_start + k));
-                __m256i v_w_i32 = _mm256_cvtepu8_epi32(raw_bytes);
-                __m256 v_w = _mm256_cvtepi32_ps(v_w_i32);
-
-                // dot += w * x
-                v_sum = _mm256_fmadd_ps(v_w, v_x, v_sum);
+            if (!cache_tiling || tile_groups >= groups_per_row) {
+                for (int g = 0; g < groups_per_row; ++g) {
+                    q8_fused_accum_group(g, group_size, w_row, x, sc_row, bi_row, row_sum);
+                }
+            } else {
+                for (int g_base = 0; g_base < groups_per_row; g_base += tile_groups) {
+                    const int g_end = std::min(g_base + tile_groups, groups_per_row);
+                    for (int g = g_base; g < g_end; ++g) {
+                        q8_fused_accum_group(g, group_size, w_row, x, sc_row, bi_row, row_sum);
+                    }
+                }
             }
 
-            // Horizontal sum for the 8-wide FMA
-            float dot_val = hsum256_ps(v_sum);
-
-            // Tail cleanup if group_size isn't a multiple of 8
-            for (; k < group_size; ++k) {
-                float x_k = x[k_start + k];
-                float w_k = (float)w_row[k_start + k];
-                dot_val += w_k * x_k;
-                g_sum_x += x_k;
-            }
-
-            // Apply per-group scale and bias
-            row_sum += sc_row[g] * dot_val + bi_row[g] * g_sum_x;
-        }
-
-        y[m] = row_sum;
+            y[m] = row_sum;
         }
     }
 }
@@ -138,8 +158,10 @@ static py::array_t<float> py_gemv_q8_unpacked(
     py::array_t<float> x_in,
     py::array_t<float> scales_in,
     py::array_t<float> biases_in,
-    int M, int K, int group_size
-) {
+    int M,
+    int K,
+    int group_size,
+    bool cache_tiling = true) {
     if (K % group_size != 0) {
         throw std::invalid_argument("K must be a multiple of group_size");
     }
@@ -160,8 +182,8 @@ static py::array_t<float> py_gemv_q8_unpacked(
     fused_dequant_gemv_q8_impl(
         w.data(), x.data(), s.data(), b.data(),
         y.mutable_data(),
-        M, K, group_size
-    );
+        M, K, group_size,
+        cache_tiling);
 
     return y;
 }
@@ -171,9 +193,11 @@ static py::array_t<float> py_fused_dequant_gemv(
     py::array_t<float> x_in,
     py::array_t<float> scales_in,
     py::array_t<float> biases_in,
-    int M, int K, int group_size
-) {
-    return py_gemv_q8_unpacked(w_in, x_in, scales_in, biases_in, M, K, group_size);
+    int M,
+    int K,
+    int group_size,
+    bool cache_tiling = true) {
+    return py_gemv_q8_unpacked(w_in, x_in, scales_in, biases_in, M, K, group_size, cache_tiling);
 }
 
 static void py_set_pin_openmp_pcores(bool enabled) {
@@ -184,11 +208,7 @@ static void py_set_pin_openmp_pcores(bool enabled) {
 }
 
 static int py_detected_pcore_count() {
-#ifdef _WIN32
-    return static_cast<int>(asdsl_omp_pinning::get_pcore_masks().size());
-#else
-    return 0;
-#endif
+    return asdsl_omp_pinning::detected_pcore_count();
 }
 
 static bool has_avx2() {
@@ -218,8 +238,19 @@ PYBIND11_MODULE(_native_gemv_q8, m) {
         py::arg("m"),
         py::arg("k"),
         py::arg("group_size") = 128,
+        py::arg("cache_tiling") = true,
         "Fused uint8 dequantization + GEMV (no materialized f32 weight matrix).");
-    m.def("gemv_q8_unpacked", &py_gemv_q8_unpacked, "Alias of fused path (legacy name).");
+    m.def(
+        "gemv_q8_unpacked",
+        &py_gemv_q8_unpacked,
+        py::arg("w_in"),
+        py::arg("x_in"),
+        py::arg("scales_in"),
+        py::arg("biases_in"),
+        py::arg("M"),
+        py::arg("K"),
+        py::arg("group_size"),
+        py::arg("cache_tiling") = true);
     m.def(
         "set_pin_openmp_pcores",
         &py_set_pin_openmp_pcores,

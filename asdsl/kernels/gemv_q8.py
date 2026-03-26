@@ -47,6 +47,8 @@ def fused_dequant_gemv(
     m: int,
     k: int,
     group_size: int = 128,
+    *,
+    cache_tiling: bool = True,
 ) -> "numpy.ndarray":
     """Fused uint8 dequantization + GEMV: ``y = (W * scale + bias) @ x`` per group.
 
@@ -71,7 +73,7 @@ def fused_dequant_gemv(
     b_np = _ensure_np(biases, np.float32)
 
     return _native_gemv_q8.fused_dequant_gemv(
-        w_np, x_np, s_np, b_np, m, k, group_size
+        w_np, x_np, s_np, b_np, m, k, group_size, cache_tiling
     )
 
 
@@ -83,6 +85,8 @@ def gemv_q8_unpacked(
     m: int,
     k: int,
     group_size: int = 128,
+    *,
+    cache_tiling: bool = True,
 ) -> "numpy.ndarray":
     """
     Computes y = dequant(W_q8) @ x.
@@ -98,12 +102,15 @@ def gemv_q8_unpacked(
         m: Number of output features (rows of W).
         k: Number of input features (cols of W).
         group_size: Quantization group size.
+        cache_tiling: K-direction cache blocking in the native kernel.
 
     Returns:
         Flat float32 output array of size `m`.
     """
     if _native_available:
-        return fused_dequant_gemv(w_u8, x, scales, biases, m, k, group_size)
+        return fused_dequant_gemv(
+            w_u8, x, scales, biases, m, k, group_size, cache_tiling=cache_tiling
+        )
 
     # -----------------------------------------------------------------------
     # PyTorch Fallback (SLOW)

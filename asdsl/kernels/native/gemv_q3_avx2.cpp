@@ -18,6 +18,7 @@
 #include <pybind11/numpy.h>
 
 #include <immintrin.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -33,6 +34,11 @@
 #endif
 
 namespace py = pybind11;
+
+namespace {
+// ~16KB float slice along K per tile (matches gemv_q8 cache blocking).
+constexpr int CACHE_K_BLOCK_FLOATS = 4096;
+}  // namespace
 
 static inline float hsum256_ps(__m256 v) {
     __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -234,6 +240,34 @@ static float dot_group_q3_blob(const uint8_t* blob, int blob_len, int group_size
     return dot;
 }
 
+static inline void mixed_accum_one_group(
+    int m,
+    int g,
+    int groups_per_row,
+    int group_size,
+    const uint8_t* __restrict w,
+    const uint32_t* __restrict group_off,
+    const uint8_t* __restrict bits_pg,
+    const float* __restrict x,
+    const float* __restrict scales,
+    const float* __restrict biases,
+    const float* __restrict group_sum_x,
+    float& row_sum) {
+    const int idx = m * groups_per_row + g;
+    const int k0 = g * group_size;
+    const uint32_t o0 = group_off[idx];
+    const uint32_t o1 = group_off[idx + 1];
+    const uint8_t* blob = w + o0;
+    const int blen = static_cast<int>(o1) - static_cast<int>(o0);
+    float dot = 0.0f;
+    if (bits_pg[idx] == 4) {
+        dot = dot_group_q4_nibbles(blob, group_size, x, k0);
+    } else {
+        dot = dot_group_q3_blob(blob, blen, group_size, x, k0);
+    }
+    row_sum += scales[idx] * dot + biases[idx] * group_sum_x[g];
+}
+
 static void gemv_q34_mixed_impl(
     const uint8_t* __restrict w,
     const uint32_t* __restrict group_off,
@@ -244,8 +278,11 @@ static void gemv_q34_mixed_impl(
     float* __restrict y,
     int M,
     int K,
-    int group_size) {
+    int group_size,
+    bool cache_tiling) {
     const int groups_per_row = K / group_size;
+    const int tile_groups =
+        cache_tiling ? std::max(1, CACHE_K_BLOCK_FLOATS / std::max(group_size, 1)) : groups_per_row;
 
     std::vector<float> group_sum_x(groups_per_row);
     for (int g = 0; g < groups_per_row; ++g) {
@@ -269,20 +306,43 @@ static void gemv_q34_mixed_impl(
 #pragma omp for schedule(static)
         for (int m = 0; m < M; ++m) {
             float row_sum = 0.0f;
-            for (int g = 0; g < groups_per_row; ++g) {
-                const int idx = m * groups_per_row + g;
-                const int k0 = g * group_size;
-                const uint32_t o0 = group_off[idx];
-                const uint32_t o1 = group_off[idx + 1];
-                const uint8_t* blob = w + o0;
-                const int blen = static_cast<int>(o1) - static_cast<int>(o0);
-                float dot = 0.0f;
-                if (bits_pg[idx] == 4) {
-                    dot = dot_group_q4_nibbles(blob, group_size, x, k0);
-                } else {
-                    dot = dot_group_q3_blob(blob, blen, group_size, x, k0);
+            const float* gsx = group_sum_x.data();
+
+            if (!cache_tiling || tile_groups >= groups_per_row) {
+                for (int g = 0; g < groups_per_row; ++g) {
+                    mixed_accum_one_group(
+                        m,
+                        g,
+                        groups_per_row,
+                        group_size,
+                        w,
+                        group_off,
+                        bits_pg,
+                        x,
+                        scales,
+                        biases,
+                        gsx,
+                        row_sum);
                 }
-                row_sum += scales[idx] * dot + biases[idx] * group_sum_x[g];
+            } else {
+                for (int g_base = 0; g_base < groups_per_row; g_base += tile_groups) {
+                    const int g_end = std::min(g_base + tile_groups, groups_per_row);
+                    for (int g = g_base; g < g_end; ++g) {
+                        mixed_accum_one_group(
+                            m,
+                            g,
+                            groups_per_row,
+                            group_size,
+                            w,
+                            group_off,
+                            bits_pg,
+                            x,
+                            scales,
+                            biases,
+                            gsx,
+                            row_sum);
+                    }
+                }
             }
             y[m] = row_sum;
         }
@@ -414,7 +474,8 @@ static py::array_t<float> py_gemv_q3_mixed(
     py::array_t<float, py::array::c_style | py::array::forcecast> biases,
     int M,
     int K,
-    int group_size) {
+    int group_size,
+    bool cache_tiling = true) {
     auto wb = w.request();
     auto ob = group_offsets.request();
     auto bb = bits_per_group.request();
@@ -457,7 +518,8 @@ static py::array_t<float> py_gemv_q3_mixed(
             static_cast<float*>(rb.ptr),
             M,
             K,
-            group_size);
+            group_size,
+            cache_tiling);
     }
 
     return result;
@@ -501,7 +563,8 @@ PYBIND11_MODULE(_native_gemv_q3, m) {
         py::arg("biases"),
         py::arg("M"),
         py::arg("K"),
-        py::arg("group_size"));
+        py::arg("group_size"),
+        py::arg("cache_tiling") = true);
 
     m.def(
         "set_pin_openmp_pcores",

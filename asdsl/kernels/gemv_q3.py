@@ -116,8 +116,17 @@ def gemv_q3_unpacked(
     return _gemv_q3_numpy_unpacked(w, x, scales, biases, M, K, group_size)
 
 
-def gemv_q3_mixed(packed: "MixedQ34Packed", x: np.ndarray) -> np.ndarray:
-    """Native fused GEMV for :class:`~asdsl.quantization.mixed_q34.MixedQ34Packed`."""
+def gemv_q3_mixed(
+    packed: "MixedQ34Packed",
+    x: np.ndarray,
+    *,
+    cache_tiling: bool = True,
+) -> np.ndarray:
+    """Native fused GEMV for :class:`~asdsl.quantization.mixed_q34.MixedQ34Packed`.
+
+    ``cache_tiling`` enables K-direction blocking (~32KB x slices per tile) for
+    large matrices. Set ``False`` only for micro-benchmarks of tiling overhead.
+    """
     if not _native_available:
         raise RuntimeError(
             "gemv_q3_mixed requires native _native_gemv_q3 (build extensions with OpenMP)."
@@ -141,5 +150,6 @@ def gemv_q3_mixed(packed: "MixedQ34Packed", x: np.ndarray) -> np.ndarray:
             packed.m,
             packed.k,
             packed.group_size,
+            cache_tiling,
         )
     )
