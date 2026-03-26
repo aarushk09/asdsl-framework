@@ -39,6 +39,42 @@ def has_native_kernel() -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
+def fused_dequant_gemv(
+    w_u8: torch.Tensor | "numpy.ndarray",
+    x: torch.Tensor | "numpy.ndarray",
+    scales: torch.Tensor | "numpy.ndarray",
+    biases: torch.Tensor | "numpy.ndarray",
+    m: int,
+    k: int,
+    group_size: int = 128,
+) -> "numpy.ndarray":
+    """Fused uint8 dequantization + GEMV: ``y = (W * scale + bias) @ x`` per group.
+
+    Uses the native AVX2/OpenMP kernel with P-core pinning when built; never
+    materializes a float32 weight matrix in DRAM.
+    """
+    if not _native_available:
+        raise RuntimeError(
+            "fused_dequant_gemv requires the native _native_gemv_q8 extension "
+            "(pip install pybind11 && python setup.py build_ext --inplace)"
+        )
+    import numpy as np
+
+    def _ensure_np(arr, dtype):
+        if isinstance(arr, torch.Tensor):
+            return arr.detach().cpu().contiguous().numpy()
+        return np.ascontiguousarray(arr, dtype=dtype)
+
+    w_np = _ensure_np(w_u8, np.uint8)
+    x_np = _ensure_np(x, np.float32)
+    s_np = _ensure_np(scales, np.float32)
+    b_np = _ensure_np(biases, np.float32)
+
+    return _native_gemv_q8.fused_dequant_gemv(
+        w_np, x_np, s_np, b_np, m, k, group_size
+    )
+
+
 def gemv_q8_unpacked(
     w_u8: torch.Tensor | "numpy.ndarray",
     x: torch.Tensor | "numpy.ndarray",
@@ -67,22 +103,7 @@ def gemv_q8_unpacked(
         Flat float32 output array of size `m`.
     """
     if _native_available:
-        import numpy as np
-        
-        # Ensure fast C-contiguous numpy arrays
-        def _ensure_np(arr, dtype):
-            if isinstance(arr, torch.Tensor):
-                return arr.detach().cpu().contiguous().numpy()
-            return np.ascontiguousarray(arr, dtype=dtype)
-
-        w_np = _ensure_np(w_u8, np.uint8)
-        x_np = _ensure_np(x, np.float32)
-        s_np = _ensure_np(scales, np.float32)
-        b_np = _ensure_np(biases, np.float32)
-
-        return _native_gemv_q8.gemv_q8_unpacked(
-            w_np, x_np, s_np, b_np, m, k, group_size
-        )
+        return fused_dequant_gemv(w_u8, x, scales, biases, m, k, group_size)
 
     # -----------------------------------------------------------------------
     # PyTorch Fallback (SLOW)

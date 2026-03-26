@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,7 +132,7 @@ class DualModelBenchmarkResult:
 
 @dataclass
 class NativePerplexityResult:
-    """Perplexity-style evaluation metrics from the native Phase-8 route."""
+    """Perplexity-style evaluation metrics (reference HF forward on CPU)."""
 
     bits: int
     ppl: float
@@ -142,6 +143,70 @@ class NativePerplexityResult:
     windows: int
     backend_model_bin: str
     backend_model_metadata: str
+    ppl_route: str = "huggingface_causal_lm"
+    hf_model_id: str = ""
+
+
+_hf_ppl_model = None
+_hf_ppl_model_id_loaded: str | None = None
+
+
+def resolve_hf_ppl_model_id(hf_model_id: str | None = None) -> str:
+    """Resolve the HuggingFace repo id used for PPL tokenizer + ``AutoModelForCausalLM``.
+
+    Order: non-empty ``hf_model_id`` argument, else environment variable
+    ``ASDSL_PPL_MODEL_ID``, else ``microsoft/phi-4``.
+    """
+    if hf_model_id is not None and str(hf_model_id).strip():
+        return str(hf_model_id).strip()
+    return os.environ.get("ASDSL_PPL_MODEL_ID", "microsoft/phi-4").strip()
+
+
+def clear_hf_causal_lm():
+    """Clear the cached Hugging Face causal LM to free up memory."""
+    global _hf_ppl_model, _hf_ppl_model_id_loaded
+    if _hf_ppl_model is not None:
+        del _hf_ppl_model
+        _hf_ppl_model = None
+        _hf_ppl_model_id_loaded = None
+    import gc
+    gc.collect()
+
+def _get_hf_causal_lm_for_ppl(model_id: str):
+    """Load and cache a HuggingFace causal LM for perplexity (CPU)."""
+    global _hf_ppl_model, _hf_ppl_model_id_loaded
+
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    if _hf_ppl_model is not None and _hf_ppl_model_id_loaded == model_id:
+        return _hf_ppl_model
+
+    torch.set_grad_enabled(False)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        )
+    except Exception:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+    model.eval()
+    model.to("cpu")
+    try:
+        model.config.use_cache = False
+    except Exception:
+        pass
+
+    _hf_ppl_model = model
+    _hf_ppl_model_id_loaded = model_id
+    return model
 
 
 class TransformerLayerExecutor:
@@ -205,6 +270,38 @@ class TransformerLayerExecutor:
             hidden_state = hidden_state.reshape(1, -1)
 
         if self.model.lm_head_weights is not None:
+            q = self.model.lm_head_weights
+            # Phase 2: fused INT8 dequant + GEMV (no float32 weight matrix in DRAM).
+            if (
+                q.bits == 8
+                and len(q.shape) == 2
+                and hidden_state.shape[0] == 1
+            ):
+                try:
+                    from asdsl.kernels.gemv_q8 import fused_dequant_gemv, has_native_kernel
+
+                    if has_native_kernel():
+                        m, k = int(q.shape[0]), int(q.shape[1])
+                        gs = int(q.group_size)
+                        if k % gs == 0 and q.data.size >= m * k:
+                            x = hidden_state.astype(np.float32).ravel()
+                            w_u8 = np.ascontiguousarray(q.data.reshape(-1)[: m * k], dtype=np.uint8)
+                            scales = q.scales.astype(np.float32).reshape(-1)
+                            ng = m * (k // gs)
+                            if scales.size == ng:
+                                if q.is_symmetric:
+                                    half = float((1 << q.bits) - 1) * 0.5
+                                    biases = (-half * scales.astype(np.float64)).astype(np.float32)
+                                else:
+                                    if q.zeros is None:
+                                        raise ValueError("asymmetric lm_head requires zeros")
+                                    z = q.zeros.astype(np.float32).reshape(-1)
+                                    biases = -(z * scales)
+                                out = fused_dequant_gemv(w_u8, x, scales, biases, m, k, gs)
+                                return out.reshape(1, -1)
+                except Exception:
+                    logger.debug("fused lm_head GEMV unavailable; falling back to dequantize_weights", exc_info=True)
+
             from asdsl.quantization.core import dequantize_weights
             lm_weights = dequantize_weights(self.model.lm_head_weights)
             logits = hidden_state @ lm_weights.T
@@ -742,36 +839,47 @@ def evaluate_perplexity_phase8_native(
     bits: int = 8,
     stride: int = 512,
     p_correct: float = 0.9,
+    hf_model_id: str | None = None,
 ) -> NativePerplexityResult:
-    """Run native batched perplexity-style evaluation through Phase-8 routing.
+    """Compute perplexity with a HuggingFace causal LM (CPU), using full next-token NLL.
 
-    This uses:
-    - native mmap weights
-    - batched prompt prefill via `prefill_prompt_tokens`
-    - native token generation for next-token verification
+    Sums cross-entropy over every valid position in each chunk: logits at index ``i``
+    predict token ``i+1`` (shifted labels). Native mmap weights are still resolved for
+    roofline reporting (``backend_model_bin`` / metadata paths).
 
-    Note: current native binding does not expose full logits. We therefore
-    compute a smoothed top-1 proxy NLL from next-token match/mismatch.
+    The Phase-8 ``generate_token`` mmap binding is a stub and cannot produce logits;
+    this function intentionally uses Transformers for mathematically valid PPL.
+
+    Args:
+        tokens: Token IDs (e.g. from the same tokenizer as ``hf_model_id``).
+        bits: Selects which on-disk quantized artifact to reference for roofline bytes.
+        stride: Max chunk length minus one for sliding windows (non-overlapping chunks).
+        p_correct: Unused; kept for call-site compatibility.
+        hf_model_id: HuggingFace model id; use :func:`resolve_hf_ppl_model_id` at the
+            call site so the tokenizer matches. If ``None`` or empty, uses
+            ``ASDSL_PPL_MODEL_ID`` or ``microsoft/phi-4``.
     """
-    from asdsl.kernels import _native_forward as native_forward
+    del p_correct
 
     if not tokens or len(tokens) < 2:
         raise ValueError("Need at least 2 tokens for perplexity evaluation")
 
+    import torch
+    import torch.nn.functional as F
+
+    model_id = resolve_hf_ppl_model_id(hf_model_id)
     model_bin, model_meta = _resolve_native_model_paths(bits)
-    with open(model_meta, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+    model = _get_hf_causal_lm_for_ppl(model_id)
 
-    # Match current native benchmark architecture constants.
-    num_layers = 40
-    dim = 5120
-    hidden_dim = 17920
-    num_heads = 40
-    num_kv_heads = 10
-    head_dim = dim // num_heads
-    vocab_size = 100352
-
-    store = native_forward.MmapWeights(str(model_bin), metadata)
+    vocab_size = int(model.get_input_embeddings().num_embeddings)
+    t_min, t_max = min(tokens), max(tokens)
+    if t_min < 0 or t_max >= vocab_size:
+        raise ValueError(
+            f"Token ID(s) out of range for model {model_id!r} (embedding rows={vocab_size}, "
+            f"observed range [{t_min}, {t_max}]). Encode text with "
+            f"AutoTokenizer.from_pretrained({model_id!r}, trust_remote_code=True) "
+            "and the same id as ``hf_model_id`` / ``ASDSL_PPL_MODEL_ID``."
+        )
 
     nll_sum = 0.0
     n_scored = 0
@@ -780,9 +888,6 @@ def evaluate_perplexity_phase8_native(
     t0 = time.perf_counter()
     windows = max(1, (len(tokens) - 1) // stride)
 
-    p_correct = float(min(max(p_correct, 1e-6), 1.0 - 1e-6))
-    p_wrong = (1.0 - p_correct) / max(vocab_size - 1, 1)
-
     for win_idx in range(windows):
         begin = win_idx * stride
         end = min(begin + stride + 1, len(tokens))
@@ -790,58 +895,31 @@ def evaluate_perplexity_phase8_native(
         if len(window) < 2:
             break
 
-        prefix = window[:-1]
-        target = int(window[-1])
-        max_seq_len = max(stride + 16, len(prefix) + 16)
-        cache = native_forward.KVCache(num_layers, max_seq_len, num_kv_heads, head_dim)
+        input_ids = torch.tensor([window], dtype=torch.long, device="cpu")
+        with torch.inference_mode():
+            out = model(input_ids, use_cache=False)
+            logits = out.logits[0]
 
-        if len(prefix) > 1:
-            prefill_ids = np.asarray(prefix[:-1], dtype=np.int32)
-            native_forward.prefill_prompt_tokens(
-                prefill_ids,
-                0,
-                store,
-                num_layers,
-                dim,
-                hidden_dim,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                vocab_size,
-                cache,
-            )
-            seq_pos = len(prefix) - 1
-            prev_token = int(prefix[-1])
-            processed_tokens += len(prefix) - 1
-        else:
-            seq_pos = 0
-            prev_token = int(prefix[0])
-
-        pred = int(
-            native_forward.generate_token(
-                prev_token,
-                seq_pos,
-                store,
-                num_layers,
-                dim,
-                hidden_dim,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                vocab_size,
-                cache,
-            )
+        shift_logits = logits[:-1].float()
+        shift_labels = input_ids[0, 1:]
+        chunk_nll = F.cross_entropy(
+            shift_logits,
+            shift_labels,
+            reduction="sum",
         )
-        processed_tokens += 1
-
-        prob = p_correct if pred == target else p_wrong
-        nll_sum += -math.log(max(prob, 1e-12))
-        n_scored += 1
+        n_tokens_chunk = int(shift_labels.numel())
+        nll_sum += float(chunk_nll.item())
+        n_scored += n_tokens_chunk
+        processed_tokens += n_tokens_chunk
 
     elapsed = time.perf_counter() - t0
     avg_nll = nll_sum / max(n_scored, 1)
     ppl = math.exp(min(avg_nll, 50.0))
     tps = processed_tokens / max(elapsed, 1e-9)
+
+    # Free up the 25GB+ of RAM immediately
+    del model
+    clear_hf_causal_lm()
 
     return NativePerplexityResult(
         bits=bits,
@@ -853,4 +931,6 @@ def evaluate_perplexity_phase8_native(
         windows=windows,
         backend_model_bin=str(model_bin),
         backend_model_metadata=str(model_meta),
+        ppl_route="huggingface_causal_lm",
+        hf_model_id=model_id,
     )

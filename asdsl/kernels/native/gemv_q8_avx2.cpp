@@ -1,17 +1,19 @@
 /**
- * 8-bit GEMV Kernel with AVX2 + FMA for ASDSL Framework
+ * 8-bit fused dequantization + GEMV (AVX2 + FMA + OpenMP).
  *
  * Computes y = dequant(W_q8) @ x where:
  *   dequant(w_int) = w_int * scale + bias      (per quantization group)
  *
- * Mathematically, for each output element y[m]:
+ * For each output element y[m]:
  *   y[m] = sum_g [ scale_g * dot(W_int_g, x_g) + bias_g * sum(x_g) ]
  *
- * This avoids ever materializing the full dequantized float32 weight matrix.
- * Instead we compute the float dot product in registers, then apply
- * the per-group scale/bias.
+ * There are zero intermediate writes of float32 weights to RAM: uint8 weights are
+ * widened to float in SIMD registers, FMA-accumulated with x, then scale/bias
+ * apply per group.
  *
- * Weight format: uint8, linear memory layout.
+ * OpenMP: same P-core pinning and thread cap as Phase 1 (omp_pcore_pinning.hpp).
+ *
+ * Weight format: uint8, linear memory layout (one byte per weight).
  *
  * SIMD strategy (per 32-value chunk):
  *   1. Load 32 uint8 weights (1 YMM register) using _mm256_loadu_si256
@@ -31,14 +33,12 @@
 #include <cstddef>
 #include <stdexcept>
 
+#include "omp_pcore_pinning.hpp"
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
-#endif
-
-#ifdef _OPENMP
-#include <omp.h>
 #endif
 
 namespace py = pybind11;
@@ -62,7 +62,7 @@ static inline float hsum256_ps(__m256 v) {
  * Core Kernel: 8-bit GEMV (uint8 unpacked)
  * =================================================================== */
 
-static void gemv_q8_unpacked_impl(
+static void fused_dequant_gemv_q8_impl(
     const uint8_t* __restrict w,
     const float*   __restrict x,
     const float*   __restrict scales,
@@ -72,8 +72,12 @@ static void gemv_q8_unpacked_impl(
 ) {
     const int groups_per_row = K / group_size;
 
-    #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; ++m) {
+    asdsl_omp_pinning::configure_openmp_for_pcores();
+#pragma omp parallel
+    {
+        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
+#pragma omp for schedule(static)
+        for (int m = 0; m < M; ++m) {
         float row_sum = 0.0f;
         const uint8_t* w_row = w + m * K;
         const float* sc_row = scales + m * groups_per_row;
@@ -121,6 +125,7 @@ static void gemv_q8_unpacked_impl(
         }
 
         y[m] = row_sum;
+        }
     }
 }
 
@@ -152,13 +157,38 @@ static py::array_t<float> py_gemv_q8_unpacked(
 
     auto y = py::array_t<float>(M);
 
-    gemv_q8_unpacked_impl(
+    fused_dequant_gemv_q8_impl(
         w.data(), x.data(), s.data(), b.data(),
         y.mutable_data(),
         M, K, group_size
     );
 
     return y;
+}
+
+static py::array_t<float> py_fused_dequant_gemv(
+    py::array_t<uint8_t> w_in,
+    py::array_t<float> x_in,
+    py::array_t<float> scales_in,
+    py::array_t<float> biases_in,
+    int M, int K, int group_size
+) {
+    return py_gemv_q8_unpacked(w_in, x_in, scales_in, biases_in, M, K, group_size);
+}
+
+static void py_set_pin_openmp_pcores(bool enabled) {
+    asdsl_omp_pinning::pin_openmp_pcores_enabled() = enabled;
+    if (enabled) {
+        asdsl_omp_pinning::configure_openmp_for_pcores();
+    }
+}
+
+static int py_detected_pcore_count() {
+#ifdef _WIN32
+    return static_cast<int>(asdsl_omp_pinning::get_pcore_masks().size());
+#else
+    return 0;
+#endif
 }
 
 static bool has_avx2() {
@@ -176,9 +206,26 @@ static bool has_avx2() {
 }
 
 PYBIND11_MODULE(_native_gemv_q8, m) {
-    m.doc() = "AVX2-accelerated 8-bit GEMV kernel";
+    m.doc() = "AVX2-accelerated fused 8-bit dequant + GEMV";
 
-    m.def("gemv_q8_unpacked", &py_gemv_q8_unpacked, "8-bit AVX2 GEMV (unpacked uint8)");
+    m.def(
+        "fused_dequant_gemv",
+        &py_fused_dequant_gemv,
+        py::arg("w_u8"),
+        py::arg("x"),
+        py::arg("scales"),
+        py::arg("biases"),
+        py::arg("m"),
+        py::arg("k"),
+        py::arg("group_size") = 128,
+        "Fused uint8 dequantization + GEMV (no materialized f32 weight matrix).");
+    m.def("gemv_q8_unpacked", &py_gemv_q8_unpacked, "Alias of fused path (legacy name).");
+    m.def(
+        "set_pin_openmp_pcores",
+        &py_set_pin_openmp_pcores,
+        py::arg("enabled") = true,
+        "Enable/disable P-core pinning for this module's OpenMP regions.");
+    m.def("detected_pcore_count", &py_detected_pcore_count, "Number of detected P-core affinity masks (Windows).");
 
     m.attr("has_avx2") = has_avx2();
 #ifdef _OPENMP
