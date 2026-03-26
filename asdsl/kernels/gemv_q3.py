@@ -13,6 +13,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from asdsl.quantization.core import QuantizedTensor
+    from asdsl.quantization.mixed_q34 import MixedQ34Packed
 
 logger = logging.getLogger(__name__)
 
@@ -113,3 +114,32 @@ def gemv_q3_unpacked(
         )
 
     return _gemv_q3_numpy_unpacked(w, x, scales, biases, M, K, group_size)
+
+
+def gemv_q3_mixed(packed: "MixedQ34Packed", x: np.ndarray) -> np.ndarray:
+    """Native fused GEMV for :class:`~asdsl.quantization.mixed_q34.MixedQ34Packed`."""
+    if not _native_available:
+        raise RuntimeError(
+            "gemv_q3_mixed requires native _native_gemv_q3 (build extensions with OpenMP)."
+        )
+    x = _ensure_f32(x).ravel()
+    if x.size != packed.k:
+        raise ValueError("x length must equal packed.k")
+    w = np.ascontiguousarray(packed.w_bytes, dtype=np.uint8)
+    goff = np.ascontiguousarray(packed.group_offsets, dtype=np.uint32)
+    bits = np.ascontiguousarray(packed.bits_per_group, dtype=np.uint8)
+    scales = _ensure_f32(packed.scales)
+    biases = _ensure_f32(packed.biases)
+    return np.asarray(
+        _native_q3.gemv_q3_mixed(
+            w,
+            goff,
+            bits,
+            x,
+            scales,
+            biases,
+            packed.m,
+            packed.k,
+            packed.group_size,
+        )
+    )

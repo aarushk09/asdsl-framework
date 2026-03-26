@@ -2,11 +2,12 @@
 #include <pybind11/pybind11.h>
 
 #include <immintrin.h>
-#include <omp.h>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+#include "native/omp_pcore_pinning.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -20,6 +21,8 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
+#include <random>
 
 namespace py = pybind11;
 
@@ -104,106 +107,6 @@ static inline const BlockQ4K* q4k_block_ptr(
     return base + ((static_cast<size_t>(grp) * blocks_per_row + block_idx) * INTERLEAVE_ROWS + lane);
 }
 
-static bool g_pin_openmp_pcores = true;
-
-#ifdef _WIN32
-static inline DWORD_PTR lowest_set_bit_mask(DWORD_PTR mask) {
-    if (mask == 0) {
-        return 0;
-    }
-    return mask & (~mask + 1);
-}
-
-static std::vector<DWORD_PTR> detect_windows_pcore_masks() {
-    DWORD len = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-    if (len == 0) {
-        return {};
-    }
-
-    std::vector<uint8_t> buf(len);
-    auto* base = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) {
-        return {};
-    }
-
-    uint8_t min_eff = std::numeric_limits<uint8_t>::max();
-    std::vector<std::pair<uint8_t, DWORD_PTR>> core_masks;
-
-    uint8_t* ptr = buf.data();
-    uint8_t* end = buf.data() + len;
-    while (ptr < end) {
-        auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(ptr);
-        if (info->Relationship == RelationProcessorCore && info->Processor.GroupCount > 0) {
-            // SetThreadAffinityMask is group-local. Keep group 0 masks for this process group.
-            const GROUP_AFFINITY& ga = info->Processor.GroupMask[0];
-            if (ga.Group == 0 && ga.Mask != 0) {
-                uint8_t eff = info->Processor.EfficiencyClass;
-                min_eff = std::min(min_eff, eff);
-                core_masks.push_back({eff, lowest_set_bit_mask(ga.Mask)});
-            }
-        }
-        ptr += info->Size;
-    }
-
-    std::vector<DWORD_PTR> pcores;
-    for (const auto& e : core_masks) {
-        if (e.first == min_eff && e.second != 0) {
-            pcores.push_back(e.second);
-        }
-    }
-    if (!pcores.empty()) {
-        return pcores;
-    }
-
-    // Fallback: pin across all detected cores if efficiency classes were unavailable.
-    for (const auto& e : core_masks) {
-        if (e.second != 0) {
-            pcores.push_back(e.second);
-        }
-    }
-    return pcores;
-}
-
-static const std::vector<DWORD_PTR>& get_pcore_masks() {
-    static std::vector<DWORD_PTR> masks = detect_windows_pcore_masks();
-    return masks;
-}
-
-static void bind_omp_thread_to_pcore_if_enabled() {
-    if (!g_pin_openmp_pcores) {
-        return;
-    }
-    const auto& masks = get_pcore_masks();
-    if (masks.empty()) {
-        return;
-    }
-    const int tid = omp_get_thread_num();
-    const DWORD_PTR mask = masks[static_cast<size_t>(tid) % masks.size()];
-    if (mask != 0) {
-        SetThreadAffinityMask(GetCurrentThread(), mask);
-    }
-}
-
-static void configure_openmp_for_pcores() {
-    if (!g_pin_openmp_pcores) {
-        return;
-    }
-    const auto& masks = get_pcore_masks();
-    if (masks.empty()) {
-        return;
-    }
-    omp_set_dynamic(0);
-    const int target_threads = static_cast<int>(masks.size());
-    if (target_threads > 0) {
-        omp_set_num_threads(target_threads);
-    }
-}
-#else
-static void bind_omp_thread_to_pcore_if_enabled() {}
-static void configure_openmp_for_pcores() {}
-#endif
-
 // Q4_K_M GEMV: rows are parallelized with OpenMP.
 // Each row is laid out as (in_dim / 256) BlockQ4K blocks.
 void gemv_q4k_avx2_rows(const BlockQ4K* weights, const float* x, float* out, int out_dim, int in_dim, bool interleaved4) {
@@ -216,10 +119,10 @@ void gemv_q4k_avx2_rows(const BlockQ4K* weights, const float* x, float* out, int
     const __m256i idx_even_hi = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
     const __m256i idx_odd_hi = _mm256_setr_epi32(17, 19, 21, 23, 25, 27, 29, 31);
 
-    configure_openmp_for_pcores();
+    asdsl_omp_pinning::configure_openmp_for_pcores();
     #pragma omp parallel
     {
-        bind_omp_thread_to_pcore_if_enabled();
+        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
 
         #pragma omp for schedule(static) nowait
         for (int r0 = 0; r0 < out_dim; r0 += INTERLEAVE_ROWS) {
@@ -304,10 +207,10 @@ void gemm_q4k_tiled_prefill(const BlockQ4K* weights, const float* x, float* y, i
     const int blocks_per_row = in_dim / TILE_K;
     std::memset(y, 0, static_cast<size_t>(t_rows) * out_dim * sizeof(float));
 
-    configure_openmp_for_pcores();
+    asdsl_omp_pinning::configure_openmp_for_pcores();
     #pragma omp parallel
     {
-        bind_omp_thread_to_pcore_if_enabled();
+        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
 
         #pragma omp for schedule(static) nowait
         for (int tile_idx = 0; tile_idx < ((t_rows + TILE_M - 1) / TILE_M) * ((out_dim + TILE_N - 1) / TILE_N); ++tile_idx) {
@@ -978,18 +881,165 @@ void pin_thread_to_core(int core_id) {
 }
 
 void pin_openmp_threads_to_pcores(bool enabled) {
-    g_pin_openmp_pcores = enabled;
+    asdsl_omp_pinning::pin_openmp_pcores_enabled() = enabled;
     if (enabled) {
-        configure_openmp_for_pcores();
+        asdsl_omp_pinning::configure_openmp_for_pcores();
     }
 }
 
 int detected_pcore_count() {
-#ifdef _WIN32
-    return static_cast<int>(get_pcore_masks().size());
-#else
-    return 0;
-#endif
+    return asdsl_omp_pinning::detected_pcore_count();
+}
+
+/** Multi-threaded STREAM Triad on float32 arrays — compiler vectorizes; use for DRAM roofline. */
+static py::dict stream_triad_f32_py(int array_mb, int runs, int warmup_runs) {
+    if (array_mb < 256) {
+        throw std::runtime_error("array_mb must be >= 256 to exceed CPU caches");
+    }
+    if (runs < 1) {
+        throw std::runtime_error("runs must be >= 1");
+    }
+    if (warmup_runs < 0) {
+        throw std::runtime_error("warmup_runs must be >= 0");
+    }
+
+    const size_t n = (static_cast<size_t>(array_mb) * 1024ull * 1024ull) / sizeof(float);
+    if (n == 0) {
+        throw std::runtime_error("array_mb too small for float32 buffers");
+    }
+
+    std::vector<float> a(n);
+    std::vector<float> b(n);
+    std::vector<float> c(n);
+
+    std::mt19937 rng(1234567);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (size_t i = 0; i < n; ++i) {
+        b[i] = dist(rng);
+        c[i] = dist(rng);
+    }
+
+    const float scalar = 3.0f;
+    asdsl_omp_pinning::configure_openmp_for_pcores();
+
+    auto run_triad = [&]() {
+#pragma omp parallel
+        {
+            asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
+#pragma omp for schedule(static)
+            for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
+                a[static_cast<size_t>(i)] =
+                    b[static_cast<size_t>(i)] + scalar * c[static_cast<size_t>(i)];
+            }
+        }
+    };
+
+    for (int w = 0; w < warmup_runs; ++w) {
+        run_triad();
+    }
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < runs; ++r) {
+        run_triad();
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+
+    if (elapsed <= 0.0) {
+        throw std::runtime_error("STREAM Triad timing produced non-positive elapsed time");
+    }
+
+    const double array_bytes = static_cast<double>(n) * static_cast<double>(sizeof(float));
+    const double bandwidth_gb_s = (3.0 * array_bytes * static_cast<double>(runs)) / elapsed / 1e9;
+
+    py::dict out;
+    out["bandwidth_gb_s"] = bandwidth_gb_s;
+    out["elapsed_sec"] = elapsed;
+    out["runs"] = runs;
+    out["warmup_runs"] = warmup_runs;
+    out["array_bytes"] = static_cast<int64_t>(array_bytes);
+    out["dtype"] = "float32";
+    out["omp_max_threads"] = omp_get_max_threads();
+    out["detected_pcores"] = detected_pcore_count();
+    out["pin_openmp_pcores"] = asdsl_omp_pinning::pin_openmp_pcores_enabled();
+    return out;
+}
+
+/** Multi-threaded STREAM Triad on int8 arrays (a = b + scalar * c) for DRAM bandwidth probing. */
+static py::dict stream_triad_int8_py(int array_mb, int runs, int warmup_runs) {
+    if (array_mb < 256) {
+        throw std::runtime_error("array_mb must be >= 256 to exceed CPU caches");
+    }
+    if (runs < 1) {
+        throw std::runtime_error("runs must be >= 1");
+    }
+    if (warmup_runs < 0) {
+        throw std::runtime_error("warmup_runs must be >= 0");
+    }
+
+    const size_t n = static_cast<size_t>(array_mb) * 1024ull * 1024ull;
+    std::vector<int8_t> a(n);
+    std::vector<int8_t> b(n);
+    std::vector<int8_t> c(n);
+
+    std::mt19937 rng(1234567);
+    std::uniform_int_distribution<int> dist(-127, 127);
+    for (size_t i = 0; i < n; ++i) {
+        b[i] = static_cast<int8_t>(dist(rng));
+        c[i] = static_cast<int8_t>(dist(rng));
+    }
+
+    const int scalar = 3;
+    // Match GEMV path: fixed thread count + per-thread affinity to P-cores before the timed region.
+    asdsl_omp_pinning::configure_openmp_for_pcores();
+
+    auto run_triad = [&]() {
+#pragma omp parallel
+        {
+            asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
+#pragma omp for schedule(static)
+            for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
+                int v = static_cast<int>(b[static_cast<size_t>(i)])
+                    + scalar * static_cast<int>(c[static_cast<size_t>(i)]);
+                if (v > 127) {
+                    v = 127;
+                } else if (v < -128) {
+                    v = -128;
+                }
+                a[static_cast<size_t>(i)] = static_cast<int8_t>(v);
+            }
+        }
+    };
+
+    for (int w = 0; w < warmup_runs; ++w) {
+        run_triad();
+    }
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < runs; ++r) {
+        run_triad();
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+
+    if (elapsed <= 0.0) {
+        throw std::runtime_error("STREAM Triad timing produced non-positive elapsed time");
+    }
+
+    const double array_bytes = static_cast<double>(n);
+    const double bandwidth_gb_s = (3.0 * array_bytes * static_cast<double>(runs)) / elapsed / 1e9;
+
+    py::dict out;
+    out["bandwidth_gb_s"] = bandwidth_gb_s;
+    out["elapsed_sec"] = elapsed;
+    out["runs"] = runs;
+    out["warmup_runs"] = warmup_runs;
+    out["array_bytes"] = static_cast<int64_t>(n);
+    out["dtype"] = "int8";
+    out["omp_max_threads"] = omp_get_max_threads();
+    out["detected_pcores"] = detected_pcore_count();
+    out["pin_openmp_pcores"] = asdsl_omp_pinning::pin_openmp_pcores_enabled();
+    return out;
 }
 
 PYBIND11_MODULE(_native_forward, m) {
@@ -1021,4 +1071,19 @@ PYBIND11_MODULE(_native_forward, m) {
         py::arg("num_layers"), py::arg("dim"), py::arg("hidden_dim"),
         py::arg("num_heads"), py::arg("num_kv_heads"), py::arg("head_dim"),
         py::arg("vocab_size"), py::arg("cache"));
+
+    m.def(
+        "stream_triad_f32",
+        &stream_triad_f32_py,
+        py::arg("array_mb"),
+        py::arg("runs"),
+        py::arg("warmup_runs") = 2,
+        "OpenMP-parallel STREAM Triad on float32 arrays (vectorized; preferred DRAM roofline probe).");
+    m.def(
+        "stream_triad_int8",
+        &stream_triad_int8_py,
+        py::arg("array_mb"),
+        py::arg("runs"),
+        py::arg("warmup_runs") = 2,
+        "OpenMP-parallel STREAM Triad on int8 arrays (measures DRAM read/write volume).");
 }

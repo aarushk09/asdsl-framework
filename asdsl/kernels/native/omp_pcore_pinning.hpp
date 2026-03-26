@@ -1,6 +1,6 @@
 /**
  * P-core OpenMP thread count cap + per-thread affinity (Windows).
- * Matches Phase 1 STREAM / Q4K GEMV behavior in forward_loop.cpp.
+ * Shared by forward_loop.cpp, gemv_q8_avx2.cpp, gemv_q3_avx2.cpp (single inline config).
  */
 #pragma once
 
@@ -19,9 +19,13 @@
 
 namespace asdsl_omp_pinning {
 
+struct PinningConfig {
+    bool pin_openmp_pcores = true;
+};
+inline PinningConfig g_pinning_config;
+
 inline bool& pin_openmp_pcores_enabled() {
-    static bool v = true;
-    return v;
+    return g_pinning_config.pin_openmp_pcores;
 }
 
 inline DWORD_PTR lowest_set_bit_mask(DWORD_PTR mask) {
@@ -115,20 +119,32 @@ inline void configure_openmp_for_pcores() {
     }
 }
 
+inline int detected_pcore_count() {
+    return static_cast<int>(get_pcore_masks().size());
+}
+
 }  // namespace asdsl_omp_pinning
 
 #else
 
 namespace asdsl_omp_pinning {
 
+struct PinningConfig {
+    bool pin_openmp_pcores = true;
+};
+inline PinningConfig g_pinning_config;
+
 inline bool& pin_openmp_pcores_enabled() {
-    static bool v = true;
-    return v;
+    return g_pinning_config.pin_openmp_pcores;
 }
 
 inline void bind_omp_thread_to_pcore_if_enabled() {}
 
 inline void configure_openmp_for_pcores() {}
+
+inline int detected_pcore_count() {
+    return 0;
+}
 
 }  // namespace asdsl_omp_pinning
 

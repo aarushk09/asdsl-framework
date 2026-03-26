@@ -269,6 +269,18 @@ class TransformerLayerExecutor:
         if hidden_state.ndim == 1:
             hidden_state = hidden_state.reshape(1, -1)
 
+        mixed = getattr(self.model, "lm_head_mixed_q34", None)
+        if mixed is not None and hidden_state.shape[0] == 1:
+            try:
+                from asdsl.kernels.gemv_q3 import gemv_q3_mixed, has_native_kernel as _has_q3
+
+                if _has_q3():
+                    x = hidden_state.astype(np.float32).ravel()
+                    out = gemv_q3_mixed(mixed, x)
+                    return out.reshape(1, -1)
+            except Exception:
+                logger.debug("lm_head_mixed_q34 native path failed", exc_info=True)
+
         if self.model.lm_head_weights is not None:
             q = self.model.lm_head_weights
             # Phase 2: fused INT8 dequant + GEMV (no float32 weight matrix in DRAM).

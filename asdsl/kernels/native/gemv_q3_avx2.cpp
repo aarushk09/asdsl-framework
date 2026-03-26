@@ -24,14 +24,12 @@
 #include <vector>
 #include <stdexcept>
 
+#include "omp_pcore_pinning.hpp"
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
-#endif
-
-#ifdef _OPENMP
-#include <omp.h>
 #endif
 
 namespace py = pybind11;
@@ -77,8 +75,12 @@ static void gemv_q3_unpacked_impl(
         group_sum_x[g] = sum;
     }
 
-    #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; ++m) {
+    asdsl_omp_pinning::configure_openmp_for_pcores();
+#pragma omp parallel
+    {
+        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
+#pragma omp for schedule(static)
+        for (int m = 0; m < M; ++m) {
         const uint8_t* row = w + static_cast<size_t>(m) * K;
         float row_sum = 0.0f;
 
@@ -116,6 +118,7 @@ static void gemv_q3_unpacked_impl(
         }
 
         y[m] = row_sum;
+        }
     }
 }
 
@@ -151,8 +154,12 @@ static void gemv_q3_packed_impl(
         group_sum_x[g] = sum;
     }
 
-    #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; ++m) {
+    asdsl_omp_pinning::configure_openmp_for_pcores();
+#pragma omp parallel
+    {
+        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
+#pragma omp for schedule(static)
+        for (int m = 0; m < M; ++m) {
         const uint32_t* row = w_packed + static_cast<size_t>(m) * words_per_row;
         float row_sum = 0.0f;
 
@@ -187,6 +194,98 @@ static void gemv_q3_packed_impl(
         }
 
         y[m] = row_sum;
+        }
+    }
+}
+
+/* ===================================================================
+ * Mixed Q4 (nibbles) / Q3 (10-in-32 per group) fused GEMV
+ * =================================================================== */
+
+static float dot_group_q4_nibbles(const uint8_t* blob, int group_size, const float* x, int k0) {
+    float dot = 0.0f;
+    for (int j = 0; j < group_size; j += 2) {
+        const uint8_t byte = blob[j / 2];
+        const float lo = static_cast<float>(byte & 0x0F);
+        const float hi = static_cast<float>(byte >> 4);
+        dot += lo * x[k0 + j] + hi * x[k0 + j + 1];
+    }
+    return dot;
+}
+
+static float dot_group_q3_blob(const uint8_t* blob, int blob_len, int group_size, const float* x, int k0) {
+    float dot = 0.0f;
+    int t = 0;
+    int off = 0;
+    while (t < group_size) {
+        if (off + 4 > blob_len) {
+            throw std::runtime_error("mixed Q3 group blob too short");
+        }
+        uint32_t word = 0;
+        std::memcpy(&word, blob + off, 4);
+        off += 4;
+        const int nvals = std::min(10, group_size - t);
+        for (int j = 0; j < nvals; ++j) {
+            const float v = static_cast<float>((word >> (j * 3)) & 0x07);
+            dot += v * x[k0 + t + j];
+        }
+        t += nvals;
+    }
+    return dot;
+}
+
+static void gemv_q34_mixed_impl(
+    const uint8_t* __restrict w,
+    const uint32_t* __restrict group_off,
+    const uint8_t* __restrict bits_pg,
+    const float* __restrict x,
+    const float* __restrict scales,
+    const float* __restrict biases,
+    float* __restrict y,
+    int M,
+    int K,
+    int group_size) {
+    const int groups_per_row = K / group_size;
+
+    std::vector<float> group_sum_x(groups_per_row);
+    for (int g = 0; g < groups_per_row; ++g) {
+        __m256 acc = _mm256_setzero_ps();
+        const float* xg = x + g * group_size;
+        int j = 0;
+        for (; j <= group_size - 8; j += 8) {
+            acc = _mm256_add_ps(acc, _mm256_loadu_ps(xg + j));
+        }
+        float sum = hsum256_ps(acc);
+        for (; j < group_size; ++j) {
+            sum += xg[j];
+        }
+        group_sum_x[g] = sum;
+    }
+
+    asdsl_omp_pinning::configure_openmp_for_pcores();
+#pragma omp parallel
+    {
+        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
+#pragma omp for schedule(static)
+        for (int m = 0; m < M; ++m) {
+            float row_sum = 0.0f;
+            for (int g = 0; g < groups_per_row; ++g) {
+                const int idx = m * groups_per_row + g;
+                const int k0 = g * group_size;
+                const uint32_t o0 = group_off[idx];
+                const uint32_t o1 = group_off[idx + 1];
+                const uint8_t* blob = w + o0;
+                const int blen = static_cast<int>(o1) - static_cast<int>(o0);
+                float dot = 0.0f;
+                if (bits_pg[idx] == 4) {
+                    dot = dot_group_q4_nibbles(blob, group_size, x, k0);
+                } else {
+                    dot = dot_group_q3_blob(blob, blen, group_size, x, k0);
+                }
+                row_sum += scales[idx] * dot + biases[idx] * group_sum_x[g];
+            }
+            y[m] = row_sum;
+        }
     }
 }
 
@@ -306,6 +405,75 @@ static py::array_t<float> py_gemv_q3_packed(
     return result;
 }
 
+static py::array_t<float> py_gemv_q3_mixed(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> w,
+    py::array_t<uint32_t, py::array::c_style | py::array::forcecast> group_offsets,
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> bits_per_group,
+    py::array_t<float, py::array::c_style | py::array::forcecast> x,
+    py::array_t<float, py::array::c_style | py::array::forcecast> scales,
+    py::array_t<float, py::array::c_style | py::array::forcecast> biases,
+    int M,
+    int K,
+    int group_size) {
+    auto wb = w.request();
+    auto ob = group_offsets.request();
+    auto bb = bits_per_group.request();
+    auto xb = x.request();
+    auto sb = scales.request();
+    auto bib = biases.request();
+
+    if (M <= 0 || K <= 0 || group_size <= 0) {
+        throw std::invalid_argument("M, K, group_size must be positive");
+    }
+    if (K % group_size != 0) {
+        throw std::invalid_argument("K must be divisible by group_size");
+    }
+    if (xb.size != K) {
+        throw std::invalid_argument("x length must equal K");
+    }
+    const int64_t G = static_cast<int64_t>(M) * (K / group_size);
+    if (ob.size != G + 1) {
+        throw std::invalid_argument("group_offsets must have shape M * (K/group_size) + 1");
+    }
+    if (bb.size != G) {
+        throw std::invalid_argument("bits_per_group must have length M * (K/group_size)");
+    }
+    if (sb.size != G || bib.size != G) {
+        throw std::invalid_argument("scales/biases length mismatch");
+    }
+
+    auto result = py::array_t<float>(M);
+    auto rb = result.request();
+
+    {
+        py::gil_scoped_release release;
+        gemv_q34_mixed_impl(
+            static_cast<const uint8_t*>(wb.ptr),
+            static_cast<const uint32_t*>(ob.ptr),
+            static_cast<const uint8_t*>(bb.ptr),
+            static_cast<const float*>(xb.ptr),
+            static_cast<const float*>(sb.ptr),
+            static_cast<const float*>(bib.ptr),
+            static_cast<float*>(rb.ptr),
+            M,
+            K,
+            group_size);
+    }
+
+    return result;
+}
+
+static void py_set_pin_openmp_pcores_q3(bool enabled) {
+    asdsl_omp_pinning::pin_openmp_pcores_enabled() = enabled;
+    if (enabled) {
+        asdsl_omp_pinning::configure_openmp_for_pcores();
+    }
+}
+
+static int py_detected_pcore_count_q3() {
+    return asdsl_omp_pinning::detected_pcore_count();
+}
+
 PYBIND11_MODULE(_native_gemv_q3, m) {
     m.doc() = "Fused 3-bit GEMV kernels with AVX2 + FMA for ASDSL";
 
@@ -320,6 +488,27 @@ PYBIND11_MODULE(_native_gemv_q3, m) {
         py::arg("w_packed"), py::arg("x"),
         py::arg("scales"), py::arg("biases"),
         py::arg("M"), py::arg("K"), py::arg("group_size"));
+
+    m.def(
+        "gemv_q3_mixed",
+        &py_gemv_q3_mixed,
+        "Fused mixed per-group Q4 nibbles / Q3 10-in-32 GEMV (imatrix-driven packer).",
+        py::arg("w_bytes"),
+        py::arg("group_offsets"),
+        py::arg("bits_per_group"),
+        py::arg("x"),
+        py::arg("scales"),
+        py::arg("biases"),
+        py::arg("M"),
+        py::arg("K"),
+        py::arg("group_size"));
+
+    m.def(
+        "set_pin_openmp_pcores",
+        &py_set_pin_openmp_pcores_q3,
+        py::arg("enabled") = true,
+        "Share global P-core pinning with other native modules (forward_loop, gemv_q8).");
+    m.def("detected_pcore_count", &py_detected_pcore_count_q3);
 
     m.def("check_avx2", &check_avx2_support,
         "Runtime check: does this CPU support AVX2?");

@@ -20,6 +20,7 @@ from asdsl.quantization.core import (
     compute_quantization_error,
     quantize_weights,
 )
+from asdsl.quantization.mixed_q34 import MixedQ34Packed
 from asdsl.quantization.salience import (
     BitAllocation,
     SalienceMap,
@@ -62,6 +63,7 @@ class QuantizedModel:
     layers: list[QuantizedLayer] = field(default_factory=list)
     embedding_weights: QuantizedTensor | None = None
     lm_head_weights: QuantizedTensor | None = None
+    lm_head_mixed_q34: MixedQ34Packed | None = None
     metadata: dict = field(default_factory=dict)
 
     @property
