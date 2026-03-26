@@ -17,6 +17,8 @@ Usage:
   python experiments/phi4_cpu_run.py
   python experiments/phi4_cpu_run.py --prompt "Explain gravity in one sentence"
   python experiments/phi4_cpu_run.py --max-new-tokens 60 --bits 4
+  python experiments/phi4_cpu_run.py --qcsd --bits 4 --draft-bits 2 --draft-k 5
+  python experiments/phi4_cpu_run.py --qcsd-benchmark --prompt "Hi"   # no local weights
 """
 from __future__ import annotations
 
@@ -43,6 +45,18 @@ from transformers import AutoTokenizer
 from asdsl.engine import run_dual_model_speculative_benchmark
 
 
+def _configure_cpu_torch_runtime() -> None:
+    """Flush FP32 subnormals to zero on CPU (avoids 100× slowdowns in matmul/mv)."""
+    if hasattr(torch, "set_flush_denormal"):
+        try:
+            torch.set_flush_denormal(True)
+        except Exception:
+            pass
+
+
+_configure_cpu_torch_runtime()
+
+
 def set_thread_count(n: int) -> None:
     """Set CPU threads for NumPy/BLAS/PyTorch.
 
@@ -57,6 +71,7 @@ def set_thread_count(n: int) -> None:
                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(n)
     torch.set_num_threads(n)
+    _configure_cpu_torch_runtime()
 
 
 ROOT = Path(__file__).parent.parent
@@ -570,19 +585,22 @@ class WeightStore:
         return self._matvec_quant(layer_idx, name, x)
 
     def lm_head_matvec(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Compute logits = hidden @ lm_head.T with chunked f16 reads."""
-        x = hidden.view(-1)
-        lm = self.lm_head   # (vocab, hidden) float16
-        rows, cols = lm.shape
-        chunk_rows = max(1, _TARGET_CHUNK_BYTES // (cols * 4))
-        result = torch.empty(rows, dtype=torch.float32)
-        buf = self._pool[:chunk_rows * cols].view(chunk_rows, cols)
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
-            n = end - start
-            buf[:n].copy_(lm[start:end])
-            torch.mv(buf[:n], x, out=result[start:end])
-        return result
+        """Compute logits = hidden @ lm_head.T with chunked f16 reads.
+
+        Accepts ``hidden`` of shape ``(hidden_dim,)``, ``(1, hidden_dim)``, or
+        ``(K, hidden_dim)``. Uses batched ``torch.mm`` on weight chunks (not
+        ``torch.mv``) so multiple positions amortize the vocab-sized projection.
+
+        Returns ``(vocab,)`` when ``K == 1``, else ``(K, vocab)``.
+        """
+        if hidden.dim() == 1:
+            hidden = hidden.unsqueeze(0)
+        elif hidden.dim() != 2:
+            raise ValueError(f"lm_head_matvec expects 1D/2D hidden, got shape {tuple(hidden.shape)}")
+        out = self.lm_head_matmul_batch(hidden)
+        if out.shape[0] == 1:
+            return out.squeeze(0)
+        return out
 
     def warm_cache(self) -> None:
         """Prepare weight cache for streaming inference.
@@ -1284,53 +1302,47 @@ def generate_qcsd(
                 break
 
             # ── DRAFT PHASE ──────────────────────────────────────
-            # Run 2-bit model autoregressively for K steps.
-            # Snapshot KV first so we can roll back after drafting.
+            # Run draft weights (e.g. 2-bit bank) autoregressively for K steps.
             kv_snap = kv_hist.snapshot()
             draft_start_pos = pos
-            draft_tokens = []
-            draft_token = current_token
+            draft_tokens: list[int] = []
+            draft_tok = current_token
 
             for k_step in range(draft_k):
                 draft_logits = run_forward(
-                    draft_token, draft_start_pos + k_step, kv_hist,
+                    draft_tok, draft_start_pos + k_step, kv_hist,
                     need_logits=True, use_draft=True,
                 )
                 next_draft = int(draft_logits.argmax())
                 draft_tokens.append(next_draft)
-                draft_token = next_draft
+                draft_tok = next_draft
                 if next_draft in EOS_TOKEN_IDS:
                     break
 
             total_draft += len(draft_tokens)
             kv_hist.restore(kv_snap)
 
-            # ── VERIFY PHASE (BATCHED) ───────────────────────────
-            # Feed [current_token, d_0, d_1, ..., d_{K-2}] through the
-            # primary model in a SINGLE batched forward pass.
-            # Weight matrices are loaded ONCE and applied to all K tokens
-            # via BLAS GEMM — this is the core QCSD speedup.
-            verify_tokens = [current_token] + draft_tokens[:-1] if len(draft_tokens) > 1 else [current_token]
+            # ── VERIFY PHASE (BATCHED TARGET) ──────────────────
+            L = len(draft_tokens)
+            if L == 0:
+                verify_tokens = [current_token]
+            else:
+                verify_tokens = [current_token] + draft_tokens[:-1]
             n_verify = len(verify_tokens)
 
-            # Build batched hidden input: (n_verify, hidden_dim)
-            hidden_batch = torch.stack([
-                store.embed_f16[tid].float() for tid in verify_tokens
-            ])
+            hidden_batch = torch.stack(
+                [store.embed_f16[tid].float() for tid in verify_tokens]
+            )
 
-            # Run all layers with batched matmul
             for i in range(NUM_LAYERS):
                 hidden_batch = forward_layer_batch(
                     hidden_batch, i, store, kv_hist,
                     rope_cos, rope_sin, draft_start_pos,
                 )
 
-            # LM head on all positions — also batched
             hidden_batch = rms_norm(hidden_batch, store.final_norm)
             all_logits = store.lm_head_matmul_batch(hidden_batch)
-            # all_logits shape: (n_verify, vocab_size)
 
-            # Record KV for ASDSL tracker
             for vi in range(n_verify):
                 k_new_list, v_new_list = [], []
                 for layer in range(NUM_LAYERS):
@@ -1339,57 +1351,85 @@ def generate_qcsd(
                     v_new_list.append(kv_hist.v_buf[layer][cache_idx].numpy())
                 asdsl_tracker.record_token(k_new_list, v_new_list)
 
-            # ── ACCEPT / REJECT ──────────────────────────────────
-            # Logits[i] gives the primary model's prediction after seeing
-            # verify_tokens[0..i]. Compare logits[i].argmax() vs draft_tokens[i].
+            # Emit greedy next token (matches standard AR).
             generated.append(current_token)
-            tok_text = tokenizer.convert_tokens_to_string(
-                tokenizer.convert_ids_to_tokens([current_token])
+            print(
+                tokenizer.convert_tokens_to_string(
+                    tokenizer.convert_ids_to_tokens([current_token])
+                ),
+                end="",
+                flush=True,
             )
-            print(tok_text, end="", flush=True)
-            pos += 1
 
-            accepted = []
-            for k_idx in range(len(draft_tokens)):
-                if k_idx >= n_verify:
-                    break
+            accepted: list[int] = []
+            correction: int | None = None
+            for k_idx in range(L):
                 ref_tok = int(all_logits[k_idx].argmax())
                 if ref_tok == draft_tokens[k_idx]:
                     accepted.append(draft_tokens[k_idx])
                 else:
-                    accepted.append(ref_tok)
+                    correction = ref_tok
                     break
 
+            stop_decode = False
             for tok in accepted:
                 generated.append(tok)
-                tok_text = tokenizer.convert_tokens_to_string(
-                    tokenizer.convert_ids_to_tokens([tok])
+                print(
+                    tokenizer.convert_tokens_to_string(
+                        tokenizer.convert_ids_to_tokens([tok])
+                    ),
+                    end="",
+                    flush=True,
                 )
-                print(tok_text, end="", flush=True)
                 if tok in EOS_TOKEN_IDS:
+                    stop_decode = True
                     break
 
             total_accepted += len(accepted)
 
-            # Trim KV cache: verify processed n_verify tokens but we only
-            # accepted 1 (current) + len(accepted). Roll back the rest.
-            n_keep = 1 + len(accepted)
-            if n_keep < n_verify:
-                trimmed_snap = kv_hist.snapshot()
-                for layer in range(NUM_LAYERS):
-                    trimmed_snap["lens"][layer] -= (n_verify - n_keep)
-                kv_hist.restore(trimmed_snap)
-
-            pos += len(accepted)
-
-            # Next cycle: reuse the verify logit at the accepted boundary
-            if accepted and accepted[-1] not in EOS_TOKEN_IDS:
-                last_idx = min(len(accepted), n_verify - 1)
-                logits = all_logits[last_idx]
-            else:
+            if stop_decode:
                 break
 
-            if any(t in EOS_TOKEN_IDS for t in accepted):
+            # ── KV ALIGNMENT ─────────────────────────────────────
+            # Batched verify wrote n_verify slots starting at draft_start_pos.
+            # Roll back uncommitted suffix, then append correction or last draft.
+            if L == 0:
+                logits = all_logits[0]
+                pos += 1
+            elif correction is not None:
+                n_keep_verify = 1 + len(accepted)
+                if n_keep_verify < n_verify:
+                    trimmed = kv_hist.snapshot()
+                    for layer in range(NUM_LAYERS):
+                        trimmed["lens"][layer] -= n_verify - n_keep_verify
+                    kv_hist.restore(trimmed)
+                logits = run_forward(
+                    correction, draft_start_pos + n_keep_verify, kv_hist,
+                    need_logits=True, use_draft=False,
+                )
+                generated.append(correction)
+                print(
+                    tokenizer.convert_tokens_to_string(
+                        tokenizer.convert_ids_to_tokens([correction])
+                    ),
+                    end="",
+                    flush=True,
+                )
+                pos += n_keep_verify + 1
+                if correction in EOS_TOKEN_IDS:
+                    break
+            else:
+                # All draft tokens matched target greedy predictions.
+                logits = run_forward(
+                    draft_tokens[-1], draft_start_pos + n_verify, kv_hist,
+                    need_logits=True, use_draft=False,
+                )
+                pos += n_verify + 1
+                if draft_tokens[-1] in EOS_TOKEN_IDS:
+                    break
+
+            if len(generated) >= max_new_tokens:
+                generated[:] = generated[:max_new_tokens]
                 break
 
     t_decode = time.perf_counter() - t_decode_start
@@ -1536,8 +1576,16 @@ def main() -> None:
                         help="CPU threads for BLAS/OMP (0=auto: P-cores on Intel i7 Evo)")
     parser.add_argument("--stream", action="store_true",
                         help="Use streaming output (yield tokens as generated)")
-    parser.add_argument("--qcsd", action="store_true",
-                        help="Enable QCSD speculative decoding (Tier 2)")
+    parser.add_argument(
+        "--qcsd",
+        action="store_true",
+        help="Quantized CPU speculative decoding: load draft+primary weight banks and run QCSD",
+    )
+    parser.add_argument(
+        "--qcsd-benchmark",
+        action="store_true",
+        help="Run simulated dual-model QCSD benchmark (no local Phi-4 weights)",
+    )
     parser.add_argument("--draft-bits", type=int, default=2,
                         help="Bit-width for the QCSD draft model (default: 2)")
     parser.add_argument("--draft-k", type=int, default=7,
@@ -1553,9 +1601,9 @@ def main() -> None:
         args.threads = 8
     set_thread_count(args.threads)
 
-    if args.qcsd:
+    if args.qcsd_benchmark:
         print("=" * 66)
-        print("ASDSL x Phi-4 - QCSD Speculative Decode (Phase 7 backend)")
+        print("ASDSL x Phi-4 - QCSD simulated benchmark (dual-model stub)")
         print("=" * 66)
         print(f"  Hardware: Intel Core i7 Evo | CPU-only | threads={args.threads}")
         print(f"  Config  : bits={args.bits}, draft_bits={args.draft_bits}, draft_k={args.draft_k}")
@@ -1578,7 +1626,7 @@ def main() -> None:
         elapsed = time.perf_counter() - t0
 
         print("\n" + "=" * 66)
-        print("ASDSL x Phi-4 - QCSD Speculative Decoding")
+        print("ASDSL x Phi-4 - QCSD Speculative Decoding (simulated)")
         print("=" * 66)
         print(f"Prompt : {args.prompt!r}")
         print(f"Prompt tokens: {bench.prompt_tokens}")
@@ -1662,8 +1710,16 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
         )
     elif args.qcsd:
-        # qcsd is routed before model loading.
-        pass
+        if not store._enable_qcsd:
+            print("ERROR: --qcsd requires a QCSD draft bank; enable_qcsd was False.")
+            sys.exit(1)
+        generate_qcsd(
+            prompt=args.prompt,
+            store=store,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            draft_k=args.draft_k,
+        )
     elif args.stream:
         print("\nAssistant (streaming): ", end="", flush=True)
         for tok in generate_stream(

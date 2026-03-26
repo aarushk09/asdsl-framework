@@ -178,6 +178,27 @@ class SimulatedDualModel:
         self.advance_tokens(draft_tokens)
         return logits_seq, next_logits
 
+    def greedy_verify_logits_after_current(
+        self, current: int, draft_tokens: list[int]
+    ) -> list[np.ndarray]:
+        """Target logits for greedy QCSD: logits[i] predicts draft_tokens[i] after prefix.
+
+        Simulates batched verify: one amortized latency, no KV/cache mutation.
+        State is (conceptually): same as KV before ``current``, then consume
+        ``current``, then for each i predict draft_tokens[i] from the running hash.
+        """
+        if self._latency_s > 0:
+            batch_factor = 0.48 + 0.07 * max(len(draft_tokens) - 1, 0)
+            time.sleep(self._latency_s * batch_factor)
+
+        h = self._state_hash
+        h = self._mix_hash(h, int(current))
+        logits_seq: list[np.ndarray] = []
+        for dt in draft_tokens:
+            logits_seq.append(self._compute_logits(h))
+            h = self._mix_hash(h, int(dt))
+        return logits_seq
+
     def advance_tokens(self, tokens: list[int]) -> None:
         self._cache.append_many(tokens)
         for tok in tokens:
@@ -339,6 +360,132 @@ class DualModelSpeculativeDecoder:
         return int(self.rng.choice(len(probs), p=probs))
 
 
+@dataclass
+class GreedySpeculativeRunResult:
+    generated_tokens: list[int]
+    decode_time_s: float
+    effective_tokens_per_s: float
+    acceptance_rate: float
+    drafted_tokens: int
+    accepted_draft_matches: int
+    speculative_rounds: int
+
+
+class GreedyDualModelSpeculativeDecoder:
+    """Greedy (temperature 0) draft–verify decoding matching QCSD / standard speculative.
+
+    Draft model runs :math:`\\gamma` steps starting from the target's greedy token
+    ``current``; the target verifies with a batched (amortized-cost) logit chain when
+    :meth:`greedy_verify_logits_after_current` exists on the target (see
+    :class:`SimulatedDualModel`). KV is rolled back after verification, then both
+    models advance only the emitted prefix (+ optional correction).
+    """
+
+    def __init__(
+        self,
+        draft_model: SpeculativeModel,
+        target_model: SpeculativeModel,
+        gamma: int = 4,
+    ):
+        if gamma < 1:
+            raise ValueError("gamma must be >= 1")
+        self.draft_model = draft_model
+        self.target_model = target_model
+        self.gamma = gamma
+
+    def generate(
+        self,
+        prompt_tokens: list[int],
+        max_new_tokens: int,
+    ) -> GreedySpeculativeRunResult:
+        self.draft_model.prefill(prompt_tokens)
+        self.target_model.prefill(prompt_tokens)
+
+        generated: list[int] = []
+        total_draft = 0
+        accepted_matches = 0
+        rounds = 0
+        t0 = time.perf_counter()
+
+        while len(generated) < max_new_tokens:
+            if self.draft_model.kv_length != self.target_model.kv_length:
+                raise RuntimeError("KV misalignment before speculative step")
+
+            rounds += 1
+            logits = self.target_model.next_logits(count_cost=True)
+            current = int(np.argmax(logits))
+
+            draft_snap = self.draft_model.snapshot_kv()
+            draft_tokens: list[int] = []
+            dt = current
+            for _ in range(self.gamma):
+                self.draft_model.advance_tokens([dt])
+                dlog = self.draft_model.next_logits(count_cost=True)
+                nt = int(np.argmax(dlog))
+                draft_tokens.append(nt)
+                dt = nt
+            total_draft += len(draft_tokens)
+            self.draft_model.restore_kv(draft_snap)
+
+            target_snap = self.target_model.snapshot_kv()
+            if hasattr(self.target_model, "greedy_verify_logits_after_current"):
+                p_logits_seq = self.target_model.greedy_verify_logits_after_current(
+                    current, draft_tokens
+                )
+            else:
+                p_logits_seq = self._sequential_target_verify_logits(current, draft_tokens)
+
+            accepted: list[int] = []
+            correction: int | None = None
+            for i, dtok in enumerate(draft_tokens):
+                ref = int(np.argmax(p_logits_seq[i]))
+                if ref == dtok:
+                    accepted.append(dtok)
+                    accepted_matches += 1
+                else:
+                    correction = ref
+                    break
+
+            emit = [current] + accepted
+            if correction is not None:
+                emit.append(correction)
+
+            self.draft_model.restore_kv(draft_snap)
+            self.target_model.restore_kv(target_snap)
+            for t in emit:
+                self.draft_model.advance_tokens([t])
+                self.target_model.advance_tokens([t])
+
+            remaining = max_new_tokens - len(generated)
+            generated.extend(emit[:remaining])
+
+        decode_time = time.perf_counter() - t0
+        tps = len(generated) / max(decode_time, 1e-9)
+        acc_rate = accepted_matches / max(total_draft, 1)
+
+        return GreedySpeculativeRunResult(
+            generated_tokens=generated,
+            decode_time_s=decode_time,
+            effective_tokens_per_s=tps,
+            acceptance_rate=acc_rate,
+            drafted_tokens=total_draft,
+            accepted_draft_matches=accepted_matches,
+            speculative_rounds=rounds,
+        )
+
+    def _sequential_target_verify_logits(
+        self, current: int, draft_tokens: list[int]
+    ) -> list[np.ndarray]:
+        snap = self.target_model.snapshot_kv()
+        self.target_model.advance_tokens([current])
+        out: list[np.ndarray] = []
+        for dt in draft_tokens:
+            out.append(self.target_model.next_logits(count_cost=True))
+            self.target_model.advance_tokens([dt])
+        self.target_model.restore_kv(snap)
+        return out
+
+
 def _softmax(logits: np.ndarray) -> np.ndarray:
     shifted = logits - np.max(logits)
     exp_vals = np.exp(shifted)
@@ -374,3 +521,14 @@ def run_target_only_baseline(
     elapsed = time.perf_counter() - t0
     tok_s = len(generated) / max(elapsed, 1e-9)
     return generated, elapsed, tok_s
+
+
+def run_greedy_baseline_tokens(
+    target_model: SpeculativeModel,
+    prompt_tokens: list[int],
+    max_new_tokens: int,
+) -> tuple[list[int], float, float]:
+    """Greedy autoregressive decode; identical to ``temperature=0`` baseline."""
+    return run_target_only_baseline(
+        target_model, prompt_tokens, max_new_tokens, temperature=0.0, seed=0
+    )
