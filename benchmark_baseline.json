@@ -1,0 +1,96 @@
+{
+  "hardware": {
+    "cpu_brand": "Intel64 Family 6 Model 186 Stepping 2, GenuineIntel",
+    "physical_cores": 12,
+    "logical_cores": 16,
+    "l1_cache_kb": null,
+    "l2_cache_kb": 9216,
+    "l3_cache_kb": 18432,
+    "total_ram_gb": 16.9,
+    "available_ram_gb": 2.1,
+    "avx2_supported": true,
+    "avx512_supported": false,
+    "os_name": "win32",
+    "python_version": "3.11.0 (main, Oct 24 2022, 18:26:48) [MSC v.1933 64 bit (AMD64)]",
+    "torch_version": "2.9.1+cpu",
+    "numpy_version": "2.3.5"
+  },
+  "roofline": {
+    "peak_gflops": 422.4,
+    "peak_gflops_detail": {
+      "peak_gflops": 422.4,
+      "physical_cores_used": 12,
+      "base_clock_ghz": 2.2,
+      "flops_per_cycle": 16,
+      "avx2_assumed": true
+    },
+    "clock_estimated": true,
+    "bandwidth_gbps": 24.0,
+    "bandwidth_detail": {
+      "bandwidth_gbps": 24.0,
+      "iterations": 60,
+      "elapsed_sec": 2.014,
+      "array_size_mb": 256,
+      "note": "array_size_mb=256, available_ram_gb=2.0"
+    },
+    "gemv_arithmetic_intensity": 3.9874,
+    "gemv_detail": {
+      "used_native": true,
+      "out_rows": 14336,
+      "in_cols": 3072,
+      "arithmetic_intensity": 3.9874,
+      "gemv_time_ms_per_call": 1.618,
+      "note": "synthetic 14336×3072 Q4 packed matrix, group_size=64",
+      "flops_per_call": 88080384,
+      "bytes_per_call": 22089728
+    },
+    "ridge_point_flops_per_byte": 17.6,
+    "roofline_state": "memory_bound",
+    "prediction_confirmed": true
+  },
+  "dequant_profile": {
+    "quick_mode": false,
+    "out_rows": 14336,
+    "in_cols": 3072,
+    "n_iters": 20,
+    "used_native": true,
+    "t_q4_packed_ms": 87.853,
+    "t_fp32_mv_ms": 84.501,
+    "dequant_fraction_estimate": 0.0382,
+    "q4_throughput_gops": 20.0518,
+    "note": "native Q4 GEMV vs FP32 numpy.dot, 14336×3072, 20 iters"
+  },
+  "kernel_audit": {
+    "gemv_q4_avx2_cpp_line_count": 791,
+    "lut_avx2_line_count": 429,
+    "lut_avx2_state": "functional",
+    "openmp_enabled": true,
+    "avx512_enabled": false,
+    "native_extensions_built": true,
+    "notes": "lut_avx2.cpp is functional with AVX2 gather-based LUT matvec; Phase 1 target is vpshufb-based gemv_lut_q4_avx2 (not yet present)."
+  },
+  "token_throughput": {
+    "model_present": true,
+    "tok_per_sec": 1.2,
+    "tokens_generated": 32,
+    "thread_count_used": null,
+    "prompt_used": "The fundamental theorem of calculus states that",
+    "max_new_tokens": 32,
+    "note": "phi4_cpu_run.py --bits 4 greedy decode (result supplied via --tok-per-sec)"
+  },
+  "cache_profile": {
+    "available": false,
+    "reason": "perf not available or not linux"
+  },
+  "schema_version": "1.0",
+  "generated_at": "2026-03-27T22:35:02.834610+00:00",
+  "phase": 0,
+  "phase_0_summary": {
+    "bottleneck_confirmed_memory_bound": true,
+    "estimated_dequant_overhead_pct": 3.8,
+    "llc_miss_rate": null,
+    "baseline_tok_per_sec": 1.2,
+    "lut_avx2_ready_for_phase1": true,
+    "notes": "Kernel is memory-bound (AI=3.9874 vs ridge=17.6 FLOPS/byte); dequant overhead ~3.8%; LUT vpshufb rewrite is the highest-leverage Phase 1 intervention."
+  }
+}

@@ -15,10 +15,26 @@ os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_JAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
+try:
+    import torch
+
+    if hasattr(torch, "set_flush_denormal"):
+        try:
+            torch.set_flush_denormal(True)
+        except Exception:
+            pass
+    _t = os.environ.get("ASDSL_TORCH_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS")
+    _n = max(1, int(_t)) if _t is not None else min(8, max(1, os.cpu_count() or 4))
+    torch.set_num_threads(_n)
+    os.environ.setdefault("NUMEXPR_MAX_THREADS", str(_n))
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_n))
+except ImportError:
+    pass
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from asdsl.engine import evaluate_perplexity_phase8_native
+from asdsl.engine import evaluate_perplexity_phase8_native, resolve_hf_ppl_model_id
 from transformers import AutoTokenizer
 
 
@@ -45,9 +61,15 @@ def load_wikitext2(tokenizer, max_tokens: int | None = None) -> list[int]:
             print("WARNING: wikitext-2 not available. Using built-in sample.")
             text = _BUILTIN_SAMPLE
 
-    tokens = tokenizer.encode(text)
     if max_tokens is not None:
-        tokens = tokens[:max_tokens]
+        tokens = tokenizer.encode(
+            text,
+            max_length=max_tokens,
+            truncation=True,
+            add_special_tokens=False,
+        )
+    else:
+        tokens = tokenizer.encode(text)
     print(f"  Dataset tokens: {len(tokens)}")
     return tokens
 
@@ -83,18 +105,28 @@ def main():
                         help="Max dataset tokens to evaluate (controls runtime)")
     parser.add_argument("--stride", type=int, default=512,
                         help="Sliding window stride for PPL computation")
+    parser.add_argument(
+        "--hf-model-id",
+        type=str,
+        default=None,
+        help=(
+            "HuggingFace model id for perplexity and dataset tokenization "
+            "(default: $ASDSL_PPL_MODEL_ID or microsoft/phi-4)."
+        ),
+    )
     args = parser.parse_args()
+
+    ppl_model_id = resolve_hf_ppl_model_id(args.hf_model_id)
 
     print("=" * 66)
     print(f"  ASDSL Perplexity Evaluation - bits={args.bits}")
     print("=" * 66)
-    print("Routing: Phase-8 native backend (batched prefill + native generation)")
+    print(f"  HF model / tokenizer: {ppl_model_id}")
+    print("Routing: HuggingFace causal LM (summed NLL); mmap paths for roofline metadata only")
 
-    # Load tokenizer
+    # Load tokenizer (must match hf_model_id used in evaluate_perplexity_phase8_native)
     print("Loading tokenizer ...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        "microsoft/phi-4", trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(ppl_model_id, trust_remote_code=True)
 
     # Load WikiText
     print("Loading WikiText-2 ...")
@@ -106,6 +138,7 @@ def main():
         tokens=tokens,
         bits=args.bits,
         stride=args.stride,
+        hf_model_id=ppl_model_id,
     )
 
     # Report

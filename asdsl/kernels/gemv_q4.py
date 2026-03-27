@@ -191,7 +191,8 @@ def gemv_q4_packed(
     Args:
         w_packed:   Packed uint8 array, shape (M*K/2,).
                     Two 4-bit values per byte (low nibble first).
-        x:          Input vector, shape (K,), float32.
+        x:          Input vector, shape (K,), float32, or batch (B, K) C-contiguous
+                    for B independent GEMVs (native path avoids per-row pybind).
         scales:     Per-group scale factors, shape (total_groups,), float32.
         biases:     Per-group biases (= -zero*scale), shape (total_groups,), float32.
         M:          Output dimension (rows).
@@ -199,19 +200,36 @@ def gemv_q4_packed(
         group_size: Elements per quantization group.
 
     Returns:
-        Output vector, shape (M,), float32.
+        Output float32, shape (M,) if x is 1-D, else (B, M).
     """
     x = _ensure_f32_contiguous(x)
     scales = _ensure_f32_contiguous(scales)
     biases = _ensure_f32_contiguous(biases)
     w_packed = _ensure_u8_contiguous(w_packed)
 
+    if x.ndim == 1:
+        if x.shape[0] != K:
+            raise ValueError(f"x length {x.shape[0]} does not match K={K}")
+    elif x.ndim == 2:
+        if x.shape[1] != K:
+            raise ValueError(f"x.shape[1]={x.shape[1]} does not match K={K}")
+    else:
+        raise ValueError("x must be 1-D (K,) or 2-D (batch, K)")
+
     if _native_available:
         return np.asarray(
             _native.gemv_q4_packed(w_packed, x, scales, biases, M, K, group_size)
         )
 
-    return _gemv_q4_numpy_packed(w_packed, x, scales, biases, M, K, group_size)
+    if x.ndim == 1:
+        return _gemv_q4_numpy_packed(w_packed, x, scales, biases, M, K, group_size)
+    b = int(x.shape[0])
+    out = np.empty((b, M), dtype=np.float32)
+    for i in range(b):
+        out[i] = _gemv_q4_numpy_packed(
+            w_packed, x[i], scales, biases, M, K, group_size
+        )
+    return out
 
 
 def gemv_q4_unpacked(

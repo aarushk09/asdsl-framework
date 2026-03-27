@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -58,20 +59,28 @@ _configure_cpu_torch_runtime()
 
 
 def set_thread_count(n: int) -> None:
-    """Set CPU threads for NumPy/BLAS/PyTorch.
+    """Set CPU threads for NumPy/BLAS/PyTorch and ASDSL native OpenMP GEMV.
 
-    0 = auto-detect (defaults to 8 for Intel i7 Evo P-core count).
-    Intel i7 Evo has hybrid P+E cores; P-cores are more efficient
-    for compute-heavy GEMV, so we default to P-core thread count.
-    MKL is preferred over OpenBLAS on Intel hardware.
+    ``n <= 0`` (auto): use half of ``os.cpu_count()`` (minimum 1). That tends to map
+    closer to physical cores on typical SMT CPUs and reduces hyperthreading
+    contention on bandwidth-bound native GEMV while still letting explicit
+    ``--threads`` override for tuning.
     """
     if n <= 0:
-        n = min(8, max(1, os.cpu_count() or 4))
+        logical = os.cpu_count() or 4
+        n = max(1, logical // 2)
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(n)
     torch.set_num_threads(n)
     _configure_cpu_torch_runtime()
+    try:
+        from asdsl.kernels import _native_gemv as _ng
+
+        if bool(getattr(_ng, "has_openmp", False)) and hasattr(_ng, "set_num_threads"):
+            _ng.set_num_threads(int(n))
+    except ImportError:
+        pass
 
 
 ROOT = Path(__file__).parent.parent
@@ -100,6 +109,266 @@ ROTARY_DIM = int(0.75 * HEAD_DIM)      # 96 - only these dims get RoPE applied
 # 200020 = <|end|> (end of turn),  199999 = <|endoftext|> / </s> (end of text)
 # 200019 = <|assistant|> (start of assistant turn - NOT an EOS token)
 EOS_TOKEN_IDS = {200020, 199999}
+
+# Persistent mmap weight cache (safetensors). Bump when on-disk layout changes.
+WEIGHT_CACHE_FORMAT = "phi4_cpu_weights_v1"
+WEIGHT_CACHE_DIRNAME = "phi4_weight_cache"
+
+
+def _weight_cache_enabled() -> bool:
+    v = os.environ.get("PHI4_NO_WEIGHT_CACHE", "").strip().lower()
+    return v not in ("1", "true", "yes")
+
+
+def weight_cache_path_for_store(store: WeightStore) -> Path:
+    """Unique cache file from model dir, index mtime, and quantization flags."""
+    mtime = ""
+    if INDEX_FILE.exists():
+        mtime = str(INDEX_FILE.stat().st_mtime_ns)
+    payload = "|".join(
+        [
+            str(MODEL_DIR.resolve()),
+            mtime,
+            str(store.bits),
+            str(store.group_size),
+            str(store._enable_qcsd),
+            str(store._draft_bits),
+            str(store._draft_group_size),
+            str(store._enable_sparse),
+            f"{store._sparsity_threshold:.8g}",
+            str(store._symmetric),
+            str(store._optimize_clips),
+            WEIGHT_CACHE_FORMAT,
+        ]
+    )
+    digest = hashlib.md5(payload.encode("utf-8")).hexdigest()
+    d = MODEL_DIR.parent / WEIGHT_CACHE_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"phi4_cpu_{digest}.safetensors"
+
+
+def _shape_map_to_json(shapes: dict[tuple[int, str], tuple[int, int]]) -> str:
+    ser = {f"{i}|{n}": [int(r), int(c)] for (i, n), (r, c) in shapes.items()}
+    return json.dumps(ser, sort_keys=True)
+
+
+def _shape_map_from_json(s: str) -> dict[tuple[int, str], tuple[int, int]]:
+    raw = json.loads(s)
+    out: dict[tuple[int, str], tuple[int, int]] = {}
+    for k, v in raw.items():
+        li_s, nm = k.split("|", 1)
+        out[(int(li_s), nm)] = (int(v[0]), int(v[1]))
+    return out
+
+
+def _meta_sparsity_value(s: str) -> float:
+    try:
+        return float(json.loads(s))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return float(s)
+
+
+def _cache_meta_matches(store: WeightStore, md: dict[str, str] | None) -> bool:
+    if not md or md.get("format") != WEIGHT_CACHE_FORMAT:
+        return False
+    try:
+        checks = [
+            int(md["bits"]) == store.bits,
+            int(md["group_size"]) == store.group_size,
+            md.get("enable_qcsd", "False") == str(store._enable_qcsd),
+            int(md.get("draft_bits", "2")) == store._draft_bits,
+            int(md.get("draft_group_size", "32")) == store._draft_group_size,
+            md.get("enable_sparse", "False") == str(store._enable_sparse),
+            math.isclose(
+                _meta_sparsity_value(md.get("sparsity_threshold", "0.01")),
+                store._sparsity_threshold,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ),
+            md.get("symmetric", str(store._symmetric)) == str(store._symmetric),
+            md.get("optimize_clips", str(store._optimize_clips))
+            == str(store._optimize_clips),
+        ]
+        return all(checks)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def try_restore_weight_cache(store: WeightStore, path: Path) -> bool:
+    """Validate metadata, then mmap tensors via ``safetensors.torch.load_file``."""
+    if not path.is_file():
+        return False
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    with safe_open(str(path), framework="pt", device="cpu") as f0:
+        md = f0.metadata()
+        if not _cache_meta_matches(store, md) or "quant_shapes" not in md:
+            return False
+        shapes = _shape_map_from_json(md["quant_shapes"])
+
+    tensors = load_file(str(path), device="cpu")
+    fk = set(tensors.keys())
+
+    store.embed_f16 = tensors["embed_f16"]
+    store.lm_head = store.embed_f16
+    store.final_norm = tensors["final_norm"]
+    layer_norms: dict[int, dict[str, torch.Tensor]] = {}
+    for i in range(NUM_LAYERS):
+        for nm in ("input_layernorm", "post_attention_layernorm"):
+            layer_norms.setdefault(i, {})[nm] = tensors[f"norm_{i}_{nm}"]
+    store.layer_norms = layer_norms
+    store.embed = None
+
+    store._quant_shapes = shapes
+    store._quant_packed.clear()
+    store._quant_u8.clear()
+    store._quant_sc.clear()
+    store._quant_bi.clear()
+    store._draft_quant_packed.clear()
+    store._draft_quant_u8.clear()
+    store._draft_quant_sc.clear()
+    store._draft_quant_bi.clear()
+    store._outlier_values.clear()
+    store._outlier_coords.clear()
+    store._draft_outlier_values.clear()
+    store._draft_outlier_coords.clear()
+    store.layers.clear()
+    store._weight_cache.clear()
+
+    if store.bits == 16:
+        for (i, nm) in shapes.keys():
+            store._weight_cache[(i, nm)] = tensors[f"w16_{i}_{nm}"]
+    else:
+        for (i, nm) in shapes.keys():
+            store._quant_sc[(i, nm)] = tensors[f"qs_{i}_{nm}"]
+            store._quant_bi[(i, nm)] = tensors[f"qb_{i}_{nm}"]
+            pk = f"qp_{i}_{nm}"
+            uk = f"qu_{i}_{nm}"
+            r, c = shapes[(i, nm)]
+            if pk in fk:
+                store._quant_packed[(i, nm)] = tensors[pk].reshape(r, c // 2)
+            elif uk in fk:
+                store._quant_u8[(i, nm)] = tensors[uk].reshape(r, c)
+            else:
+                return False
+
+        if store._enable_qcsd:
+            for (i, nm) in shapes.keys():
+                d_sc_k = f"dqs_{i}_{nm}"
+                if d_sc_k not in fk:
+                    return False
+                store._draft_quant_sc[(i, nm)] = tensors[d_sc_k]
+                store._draft_quant_bi[(i, nm)] = tensors[f"dqb_{i}_{nm}"]
+                dpk = f"dqp_{i}_{nm}"
+                duk = f"dqu_{i}_{nm}"
+                r, c = shapes[(i, nm)]
+                if dpk in fk:
+                    store._draft_quant_packed[(i, nm)] = tensors[dpk].reshape(r, c // 2)
+                elif duk in fk:
+                    raw = tensors[duk]
+                    if raw.numel() == r * c:
+                        store._draft_quant_u8[(i, nm)] = raw.reshape(r, c)
+                    else:
+                        store._draft_quant_u8[(i, nm)] = raw
+                else:
+                    return False
+                dov_k = f"dov_{i}_{nm}"
+                if dov_k in fk:
+                    ov = tensors[dov_k].numpy()
+                    oc = tensors[f"doc_{i}_{nm}"].numpy().astype(np.int64)
+                    if ov.size > 0:
+                        store._draft_outlier_values[(i, nm)] = ov
+                        store._draft_outlier_coords[(i, nm)] = oc
+
+        for (i, nm) in shapes.keys():
+            ov_k = f"ov_{i}_{nm}"
+            if ov_k in fk:
+                ov = tensors[ov_k].numpy()
+                oc = tensors[f"oc_{i}_{nm}"].numpy().astype(np.int64)
+                if ov.size > 0:
+                    store._outlier_values[(i, nm)] = ov
+                    store._outlier_coords[(i, nm)] = oc
+
+    store._pool = torch.empty(_TARGET_CHUNK_BYTES // 4, dtype=torch.float32)
+    store._loaded_from_cache = True
+    return True
+
+
+def save_weight_store_cache(store: WeightStore, path: Path) -> None:
+    """Write post-``warm_cache`` tensors + metadata to a single safetensors file."""
+    from safetensors.torch import save_file
+
+    tensors: dict[str, torch.Tensor] = {}
+    tensors["embed_f16"] = store.embed_f16.contiguous()
+    tensors["final_norm"] = store.final_norm.contiguous()
+    for i in range(NUM_LAYERS):
+        for nm in ("input_layernorm", "post_attention_layernorm"):
+            tensors[f"norm_{i}_{nm}"] = store.layer_norms[i][nm].contiguous()
+
+    if store.bits == 16:
+        shape_map = {k: tuple(w.shape) for k, w in store._weight_cache.items()}
+        shapes_json = _shape_map_to_json(shape_map)
+    else:
+        shapes_json = _shape_map_to_json(store._quant_shapes)
+
+    meta: dict[str, str] = {
+        "format": WEIGHT_CACHE_FORMAT,
+        "bits": str(store.bits),
+        "group_size": str(store.group_size),
+        "enable_qcsd": str(store._enable_qcsd),
+        "draft_bits": str(store._draft_bits),
+        "draft_group_size": str(store._draft_group_size),
+        "enable_sparse": str(store._enable_sparse),
+        "sparsity_threshold": json.dumps(store._sparsity_threshold),
+        "symmetric": str(store._symmetric),
+        "optimize_clips": str(store._optimize_clips),
+        "quant_shapes": shapes_json,
+    }
+
+    if store.bits == 16:
+        for (i, nm), w in store._weight_cache.items():
+            tensors[f"w16_{i}_{nm}"] = w.contiguous()
+    else:
+        for (i, nm), sh in store._quant_shapes.items():
+            tensors[f"qs_{i}_{nm}"] = store._quant_sc[(i, nm)].contiguous()
+            tensors[f"qb_{i}_{nm}"] = store._quant_bi[(i, nm)].contiguous()
+            if (i, nm) in store._quant_packed:
+                tensors[f"qp_{i}_{nm}"] = store._quant_packed[(i, nm)].contiguous().reshape(
+                    -1
+                )
+            else:
+                tensors[f"qu_{i}_{nm}"] = store._quant_u8[(i, nm)].contiguous().reshape(-1)
+
+            if store._enable_qcsd and (i, nm) in store._draft_quant_sc:
+                tensors[f"dqs_{i}_{nm}"] = store._draft_quant_sc[(i, nm)].contiguous()
+                tensors[f"dqb_{i}_{nm}"] = store._draft_quant_bi[(i, nm)].contiguous()
+                if (i, nm) in store._draft_quant_packed:
+                    tensors[f"dqp_{i}_{nm}"] = store._draft_quant_packed[
+                        (i, nm)
+                    ].contiguous().reshape(-1)
+                elif (i, nm) in store._draft_quant_u8:
+                    dq = store._draft_quant_u8[(i, nm)].contiguous()
+                    tensors[f"dqu_{i}_{nm}"] = dq.reshape(-1)
+
+                if (i, nm) in store._draft_outlier_values:
+                    ov = store._draft_outlier_values[(i, nm)]
+                    oc = store._draft_outlier_coords[(i, nm)]
+                    tensors[f"dov_{i}_{nm}"] = torch.from_numpy(
+                        np.asarray(ov, dtype=np.float32)
+                    )
+                    tensors[f"doc_{i}_{nm}"] = torch.from_numpy(
+                        np.asarray(oc, dtype=np.int64)
+                    )
+
+            if (i, nm) in store._outlier_values and len(store._outlier_values[(i, nm)]) > 0:
+                ov = store._outlier_values[(i, nm)]
+                oc = store._outlier_coords[(i, nm)]
+                tensors[f"ov_{i}_{nm}"] = torch.from_numpy(np.asarray(ov, dtype=np.float32))
+                tensors[f"oc_{i}_{nm}"] = torch.from_numpy(np.asarray(oc, dtype=np.int64))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(path), metadata=meta)
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +436,9 @@ class WeightStore:
     separation (Tier 1C) for bits <= 3.
 
     Memory layout (4-bit, group_size=32):
-      - ~50 MB per layer (vs ~402 MB float32)
-      - ~1.7 GB total backbone (vs ~6.4 GB float32)
+      - Packed uint8 (rows, cols//2) per projection; fused GEMV via ``gemv_q4_packed``
+        (native AVX2 in-register unpack). No pre-unpacked uint8 expansion.
+      - ~1.7 GB total backbone packed (vs ~6.4 GB float32)
       - Embedding kept as bfloat16 torch tensor (~1.2 GB)
     """
 
@@ -198,6 +468,8 @@ class WeightStore:
         self.final_norm: torch.Tensor | None = None
         self._weight_cache: dict[tuple, torch.Tensor] = {}
         self._quant_u8: dict[tuple, torch.Tensor] = {}
+        # bits==4 primary: packed uint8 (rows, cols // 2), no pre-unpacked expansion.
+        self._quant_packed: dict[tuple, torch.Tensor] = {}
         self._quant_sc: dict[tuple, torch.Tensor] = {}
         self._quant_bi: dict[tuple, torch.Tensor] = {}
         self._quant_shapes: dict[tuple, tuple] = {}
@@ -211,9 +483,13 @@ class WeightStore:
 
         # QCSD dual-bank (Tier 2)
         self._enable_qcsd = enable_qcsd
-        self._draft_bits = draft_bits
-        self._draft_group_size = 16 if draft_bits <= 3 else 32
+        db = int(draft_bits)
+        if enable_qcsd and bits < 16:
+            db = min(db, bits)
+        self._draft_bits = db
+        self._draft_group_size = 16 if db <= 3 else 32
         self._draft_quant_u8: dict[tuple, torch.Tensor] = {}
+        self._draft_quant_packed: dict[tuple, torch.Tensor] = {}
         self._draft_quant_sc: dict[tuple, torch.Tensor] = {}
         self._draft_quant_bi: dict[tuple, torch.Tensor] = {}
         self._draft_outlier_values: dict[tuple, np.ndarray] = {}
@@ -222,9 +498,23 @@ class WeightStore:
         # Activation-sparse GEMV (Tier 3)
         self._enable_sparse = enable_sparse
         self._sparsity_threshold = sparsity_threshold
+        # Unpacked scratch for sparse path when weights are Q4 packed (down_proj only).
+        self._sparse_u8_scratch: np.ndarray | None = None
+        self._loaded_from_cache = False
 
     # ------------------------------------------------------------------
     def load(self) -> None:
+        self._loaded_from_cache = False
+        if _weight_cache_enabled():
+            cpath = weight_cache_path_for_store(self)
+            if try_restore_weight_cache(self, cpath):
+                nproj = NUM_LAYERS * 4
+                print(
+                    f"  Restored {nproj} projection weights from cache "
+                    f"({cpath.name}, mmap CPU) — skipping shard read/quantize"
+                )
+                return
+
         idx = json.loads(INDEX_FILE.read_text())["weight_map"]
 
         # Which shard holds which key
@@ -314,22 +604,30 @@ class WeightStore:
                                                 optimize_clips=self._optimize_clips)
                         self.layers.setdefault(layer_idx, {})[friendly] = qt
 
-                        # QCSD: also quantize to draft_bits for the draft bank
-                        if self._enable_qcsd and self.bits > self._draft_bits:
-                            from asdsl.quantization.core import quantize_weights_with_outliers
-                            d_sigma = 3.0 if self._draft_bits == 2 else 3.5
-                            d_cap = 0.005
-                            qt_d, ov_d, oc_d = quantize_weights_with_outliers(
-                                w_f32, bits=self._draft_bits,
-                                group_size=self._draft_group_size,
-                                outlier_threshold_sigma=d_sigma,
-                                outlier_fraction_cap=d_cap,
-                                symmetric=False,
-                                optimize_clips=True,
-                            )
-                            self.layers.setdefault(layer_idx, {})["_draft_" + friendly] = qt_d
-                            self._draft_outlier_values[(layer_idx, friendly)] = ov_d
-                            self._draft_outlier_coords[(layer_idx, friendly)] = oc_d
+                        # QCSD: separate lower-bit draft bank when primary is strictly coarser,
+                        # else mirror primary quant so warm_cache always fills _draft_quant_*.
+                        if self._enable_qcsd:
+                            if self.bits > self._draft_bits:
+                                from asdsl.quantization.core import quantize_weights_with_outliers
+                                d_sigma = 3.0 if self._draft_bits == 2 else 3.5
+                                d_cap = 0.005
+                                qt_d, ov_d, oc_d = quantize_weights_with_outliers(
+                                    w_f32, bits=self._draft_bits,
+                                    group_size=self._draft_group_size,
+                                    outlier_threshold_sigma=d_sigma,
+                                    outlier_fraction_cap=d_cap,
+                                    symmetric=False,
+                                    optimize_clips=True,
+                                )
+                                self.layers.setdefault(layer_idx, {})["_draft_" + friendly] = qt_d
+                                self._draft_outlier_values[(layer_idx, friendly)] = ov_d
+                                self._draft_outlier_coords[(layer_idx, friendly)] = oc_d
+                            else:
+                                self.layers.setdefault(layer_idx, {})["_draft_" + friendly] = qt
+                                ov_k = (layer_idx, friendly)
+                                if ov_k in self._outlier_values:
+                                    self._draft_outlier_values[ov_k] = self._outlier_values[ov_k]
+                                    self._draft_outlier_coords[ov_k] = self._outlier_coords[ov_k]
 
                     done += 1
                     if done % 16 == 0 or done == total_proj:
@@ -369,13 +667,10 @@ class WeightStore:
     # --- quantized path (bits≤8) helpers --------------------------------
 
     def _matvec_quant(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
-        """Chunked uint8->dequant->matvec for quantized weights.
-
-        Reads uint8 pre-unpacked values in L3-sized chunks, applies
-        scale/bias in-place (no intermediate allocations) and does BLAS
-        gemv from cache.  Keeps weights compressed in memory.
-        """
+        """Chunked dequant+matvec for quantized weights (unpacked uint8 path)."""
         key = (layer_idx, name)
+        if self.bits == 4:
+            return self._matvec_q4_packed(layer_idx, name, x, use_draft=False)
         u8 = self._quant_u8[key]
         sc = self._quant_sc[key]
         bi = self._quant_bi[key]
@@ -388,31 +683,95 @@ class WeightStore:
             end = min(start + chunk_rows, rows)
             n = end - start
             flat_len = n * cols
-            # Flat view of pool - copy uint8->f32 in-place
             buf = self._pool[:flat_len]
             buf.copy_(u8[start * cols:end * cols])
             vals = buf.view(n, groups_per_row, self.group_size)
             gs = start * groups_per_row
             ge = end * groups_per_row
-            # In-place dequantize:  val = val * scale + bias
             vals.mul_(sc[gs:ge].float().view(n, groups_per_row, 1))
             vals.add_(bi[gs:ge].float().view(n, groups_per_row, 1))
             torch.mv(vals.view(n, cols), x_flat, out=result[start:end])
         return result.unsqueeze(0)
 
+    def _matvec_q4_packed(
+        self, layer_idx: int, name: str, x: torch.Tensor, *, use_draft: bool
+    ) -> torch.Tensor:
+        """Fused GEMV on 4-bit packed weights (low nibble = even col, high = odd).
+
+        Dispatches to ``asdsl.kernels.gemv_q4_packed`` → C++ ``gemv_q4_packed``
+        (AVX2 in-register unpack + FMA; same nibble order as ``gemv_q4_kernel`` tests).
+        """
+        from asdsl.kernels import gemv_q4_packed
+
+        key = (layer_idx, name)
+        if use_draft and key in self._draft_quant_packed:
+            w_t = self._draft_quant_packed[key]
+            sc = self._draft_quant_sc[key]
+            bi = self._draft_quant_bi[key]
+            gs = self._draft_group_size
+        else:
+            w_t = self._quant_packed[key]
+            sc = self._quant_sc[key]
+            bi = self._quant_bi[key]
+            gs = self.group_size
+        rows, cols = self._quant_shapes[key]
+        w_np = w_t.numpy().reshape(-1)
+        x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+        sc_np = sc.detach().cpu().float().contiguous().numpy()
+        bi_np = bi.detach().cpu().float().contiguous().numpy()
+        out_np = gemv_q4_packed(w_np, x_np, sc_np, bi_np, rows, cols, gs)
+        result = torch.from_numpy(out_np).unsqueeze(0)
+        outlier_store = (
+            self._draft_outlier_values if use_draft else self._outlier_values
+        )
+        coord_store = (
+            self._draft_outlier_coords if use_draft else self._outlier_coords
+        )
+        if key in outlier_store and len(outlier_store[key]) > 0:
+            ov = outlier_store[key].astype(np.float32)
+            oc = coord_store[key]
+            col_indices = oc[:, 1]
+            row_indices = oc[:, 0]
+            x_sel = x_np[col_indices]
+            contributions = ov * x_sel
+            out_corr = np.zeros(rows, dtype=np.float32)
+            np.add.at(out_corr, row_indices, contributions)
+            result = result + torch.from_numpy(out_corr).unsqueeze(0)
+        return result
+
     def _matvec_native_gemv(self, layer_idx: int, name: str, x: torch.Tensor,
                             use_draft: bool = False) -> torch.Tensor:
-        """AVX2 GEMV fast path for 4-bit, 8-bit, 3-bit, and 2-bit weights."""
+        """AVX2 GEMV fast path for 4-bit packed, 8-bit, 3-bit, and 2-bit weights."""
         key = (layer_idx, name)
 
-        if use_draft and key in self._draft_quant_u8:
+        draft_q4 = use_draft and key in self._draft_quant_packed
+        draft_q2p = use_draft and key in self._draft_quant_u8 and self._draft_bits == 2
+        draft_unpacked = (
+            use_draft and key in self._draft_quant_u8 and not draft_q2p
+        )
+        draft_active = draft_q4 or draft_q2p or draft_unpacked
+
+        if self.bits == 4 and not draft_active:
+            return self._matvec_q4_packed(layer_idx, name, x, use_draft=False)
+        if draft_q4:
+            return self._matvec_q4_packed(layer_idx, name, x, use_draft=True)
+
+        if draft_q2p:
             w_data = self._draft_quant_u8[key].numpy()
             sc = self._draft_quant_sc[key].float().numpy()
             bi = self._draft_quant_bi[key].float().numpy()
             rows, cols = self._quant_shapes[key]
-            bits = self._draft_bits
             gs = self._draft_group_size
+            bits = 2
             is_packed = True
+        elif draft_unpacked:
+            w_data = self._draft_quant_u8[key].numpy()
+            sc = self._draft_quant_sc[key].float().numpy()
+            bi = self._draft_quant_bi[key].float().numpy()
+            rows, cols = self._quant_shapes[key]
+            gs = self._draft_group_size
+            bits = self._draft_bits
+            is_packed = False
         else:
             w_data = self._quant_u8[key].numpy()
             sc = self._quant_sc[key].float().numpy()
@@ -444,9 +803,12 @@ class WeightStore:
 
         result = torch.from_numpy(out_np).unsqueeze(0)
 
-        # Apply outlier correction for low-bit quantization
-        outlier_store = (self._draft_outlier_values if use_draft else self._outlier_values)
-        coord_store = (self._draft_outlier_coords if use_draft else self._outlier_coords)
+        outlier_store = (
+            self._draft_outlier_values if draft_active else self._outlier_values
+        )
+        coord_store = (
+            self._draft_outlier_coords if draft_active else self._outlier_coords
+        )
         if key in outlier_store and len(outlier_store[key]) > 0:
             ov = outlier_store[key].astype(np.float32)
             oc = coord_store[key]
@@ -464,10 +826,20 @@ class WeightStore:
                       bitmask: np.ndarray, active_indices: np.ndarray) -> torch.Tensor:
         """Activation-sparse GEMV: skip near-zero activation columns (Tier 3)."""
         key = (layer_idx, name)
-        u8_weights = self._quant_u8[key].numpy()
+        rows, cols = self._quant_shapes[key]
+        numel = rows * cols
+        if self.bits == 4:
+            from asdsl.quantization.core import _unpack_bits
+
+            if self._sparse_u8_scratch is None or self._sparse_u8_scratch.size < numel:
+                self._sparse_u8_scratch = np.empty(numel, dtype=np.uint8)
+            packed = self._quant_packed[key].numpy().ravel()
+            self._sparse_u8_scratch[:numel] = _unpack_bits(packed, 4)[:numel]
+            u8_weights = self._sparse_u8_scratch[:numel]
+        else:
+            u8_weights = self._quant_u8[key].numpy().ravel()
         sc = self._quant_sc[key].float().numpy()
         bi = self._quant_bi[key].float().numpy()
-        rows, cols = self._quant_shapes[key]
         x_np = x.detach().cpu().float().contiguous().numpy().ravel()
 
         try:
@@ -501,6 +873,8 @@ class WeightStore:
 
     def _matmul_quant_batch(self, layer_idx: int, name: str,
                             X_batch: torch.Tensor) -> torch.Tensor:
+        if self.bits == 4:
+            return self._matmul_q4_packed_batch(layer_idx, name, X_batch)
         key = (layer_idx, name)
         u8 = self._quant_u8[key]
         sc = self._quant_sc[key]
@@ -530,6 +904,67 @@ class WeightStore:
 
             w_chunk = vals.view(n, cols)
             torch.mm(w_chunk, x_flat.T, out=result[start:end, :])
+
+        return result.T.view(*X_batch.shape[:-1], rows)
+
+    def _matmul_q4_packed_batch(self, layer_idx: int, name: str,
+                                X_batch: torch.Tensor) -> torch.Tensor:
+        """Batched verify: native fused packed GEMV, or unpack + BLAS fallback."""
+        from asdsl.quantization.core import _unpack_bits
+        from asdsl.kernels import gemv_q4_packed
+
+        key = (layer_idx, name)
+        packed = self._quant_packed[key]
+        sc = self._quant_sc[key]
+        bi = self._quant_bi[key]
+        rows, cols = self._quant_shapes[key]
+        groups_per_row = cols // self.group_size
+        x_flat = X_batch.reshape(-1, cols).float()
+        k_batch = x_flat.shape[0]
+
+        if self._use_native_gemv:
+            w_np = packed.detach().cpu().numpy().reshape(-1)
+            x_np = x_flat.detach().cpu().float().contiguous().numpy()
+            sc_np = sc.detach().cpu().float().contiguous().numpy()
+            bi_np = bi.detach().cpu().float().contiguous().numpy()
+            out_np = gemv_q4_packed(
+                w_np, x_np, sc_np, bi_np, rows, cols, self.group_size
+            )
+            result_t = torch.from_numpy(np.asarray(out_np, dtype=np.float32))
+            if result_t.dim() == 1:
+                result_t = result_t.unsqueeze(0)
+            if key in self._outlier_values and len(self._outlier_values[key]) > 0:
+                ov = self._outlier_values[key].astype(np.float32)
+                oc = self._outlier_coords[key]
+                col_indices = oc[:, 1]
+                row_indices = oc[:, 0]
+                for bi in range(k_batch):
+                    x_row = x_np[bi]
+                    x_sel = x_row[col_indices]
+                    contributions = ov * x_sel
+                    out_corr = np.zeros(rows, dtype=np.float32)
+                    np.add.at(out_corr, row_indices, contributions)
+                    result_t[bi] = result_t[bi] + torch.from_numpy(out_corr)
+            return result_t.view(*X_batch.shape[:-1], rows)
+
+        chunk_rows = max(1, _TARGET_CHUNK_BYTES // (cols * 4))
+        result = torch.empty(rows, k_batch, dtype=torch.float32)
+        packed_np = packed.numpy()
+
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            n = end - start
+            flat_len = n * cols
+            buf = self._pool[:flat_len]
+            chunk_packed = packed_np[start:end].reshape(-1)
+            unpacked = _unpack_bits(chunk_packed, 4)[: n * cols]
+            buf.copy_(torch.from_numpy(unpacked.astype(np.uint8)))
+            vals = buf.view(n, groups_per_row, self.group_size)
+            gs = start * groups_per_row
+            ge = end * groups_per_row
+            vals.mul_(sc[gs:ge].float().view(n, groups_per_row, 1))
+            vals.add_(bi[gs:ge].float().view(n, groups_per_row, 1))
+            torch.mm(vals.view(n, cols), x_flat.T, out=result[start:end, :])
 
         return result.T.view(*X_batch.shape[:-1], rows)
 
@@ -578,7 +1013,7 @@ class WeightStore:
     def matvec(self, layer_idx: int, name: str, x: torch.Tensor,
                use_draft: bool = False) -> torch.Tensor:
         """Bandwidth-efficient matrix-vector product: y = W @ x."""
-        if self.bits == 16 and not use_draft:
+        if self.bits == 16:
             return self._matvec_f16(layer_idx, name, x)
         if self._use_native_gemv or use_draft:
             return self._matvec_native_gemv(layer_idx, name, x, use_draft=use_draft)
@@ -606,8 +1041,9 @@ class WeightStore:
         """Prepare weight cache for streaming inference.
 
         bits=16: float16 weight cache is already populated from load().
-        bits<=8:  pre-unpack quantized weights to uint8 tensors with f16
-                 scales/biases.  Keeps weights compressed - no f16 cache.
+        bits==4:  keep 4-bit weights packed (rows, cols//2) uint8; fused GEMV
+                 via native ``gemv_q4_packed`` (AVX2 in-register unpack).
+        other:    pre-unpack to uint8 tensors with f16 scales/biases.
         """
         from asdsl.quantization.core import _unpack_bits
 
@@ -631,6 +1067,32 @@ class WeightStore:
 
         self._use_native_gemv = has_gemv
 
+        if getattr(self, "_loaded_from_cache", False):
+            total = NUM_LAYERS * 4
+            print(
+                f"  Warm-cache: skipped (restored {total} projections from safetensors cache)"
+            )
+            kernel_labels = {4: "Q4 packed (gemv_q4_packed)", 8: "Q8", 3: "Q3", 2: "Q2"}
+            if self.bits == 16:
+                print("  Inference: chunked f16 matvec")
+            elif has_gemv:
+                kl = kernel_labels.get(self.bits, f"Q{self.bits}")
+                print(f"  Inference: native AVX2 GEMV {kl}")
+            else:
+                print(
+                    "  Inference: chunked uint8 dequant+matvec (in-place, no AVX GEMV)"
+                )
+            if self._enable_qcsd and self.bits != 16:
+                d_bytes = sum(t.nbytes for t in self._draft_quant_u8.values())
+                d_bytes += sum(t.nbytes for t in self._draft_quant_packed.values())
+                print(
+                    f"  QCSD draft bank: {d_bytes / 1e6:.0f} MB ({self._draft_bits}-bit)"
+                )
+            n_outliers = sum(len(v) for v in self._outlier_values.values())
+            if n_outliers > 0:
+                print(f"  SpQR outliers: {n_outliers:,} values in FP16 sparse format")
+            return
+
         total = NUM_LAYERS * 4
         if self.bits == 16:
             print(f"  Float16 weight cache already populated ({total} tensors)")
@@ -638,80 +1100,185 @@ class WeightStore:
         else:
             done = 0
             qmax = (1 << self.bits) - 1
-            label = "primary" if self._enable_qcsd else ""
-            print(f"  Pre-unpacking {total} {label} tensors to uint8 ... ", end="", flush=True)
 
-            for i in range(NUM_LAYERS):
-                for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
-                    qt = self.layers[i][name]
-                    rows, cols = qt.shape
-                    key = (i, name)
-                    self._quant_shapes[key] = (rows, cols)
+            if self.bits == 4:
+                print(
+                    f"  Caching packed Q4 weights ({total} tensors, rows×cols/2) ... ",
+                    end="",
+                    flush=True,
+                )
+                for i in range(NUM_LAYERS):
+                    for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
+                        qt = self.layers[i][name]
+                        rows, cols = qt.shape
+                        key = (i, name)
+                        self._quant_shapes[key] = (rows, cols)
+                        packed_np = np.ascontiguousarray(qt.data, dtype=np.uint8).copy()
+                        self._quant_packed[key] = torch.from_numpy(packed_np).reshape(
+                            rows, cols // 2
+                        )
 
-                    numel = rows * cols
-                    unpacked = _unpack_bits(qt.data, qt.bits)[:numel]
-                    self._quant_u8[key] = torch.from_numpy(unpacked.astype(np.uint8))
-
-                    n_groups = numel // qt.group_size
-                    sc_f16 = torch.from_numpy(qt.scales[:n_groups].copy()).to(torch.float16)
-                    if qt.is_symmetric:
-                        half_range = qmax / 2.0
-                        bi_f16 = (-half_range * sc_f16.float()).half()
-                    else:
-                        zr = torch.from_numpy(qt.zeros[:n_groups].copy()).to(torch.float16)
-                        bi_f16 = (-zr.float() * sc_f16.float()).half()
-                    self._quant_sc[key] = sc_f16
-                    self._quant_bi[key] = bi_f16
-
-                    # QCSD: store draft weights PACKED (4 values per byte for 2-bit).
-                    # This loads 4x less data from DRAM per draft token.
-                    if self._enable_qcsd and "_draft_" + name in self.layers.get(i, {}):
-                        qt_d = self.layers[i]["_draft_" + name]
-                        d_numel = rows * cols
-                        # Keep packed data directly — no pre-unpack
-                        self._draft_quant_u8[key] = torch.from_numpy(qt_d.data.copy())
-                        d_qmax = (1 << qt_d.bits) - 1
-                        d_n_groups = d_numel // qt_d.group_size
-                        d_sc = torch.from_numpy(qt_d.scales[:d_n_groups].copy()).to(torch.float16)
-                        if qt_d.is_symmetric:
-                            d_half = d_qmax / 2.0
-                            d_bi = (-d_half * d_sc.float()).half()
+                        numel = rows * cols
+                        n_groups = numel // qt.group_size
+                        sc = torch.from_numpy(qt.scales[:n_groups].copy().astype(np.float32))
+                        if qt.is_symmetric:
+                            dq = (1 << qt.bits) - 1
+                            half_range = float(dq) / 2.0
+                            bi = (-half_range * sc).to(torch.float32)
                         else:
-                            d_zr = torch.from_numpy(qt_d.zeros[:d_n_groups].copy()).to(torch.float16)
-                            d_bi = (-d_zr.float() * d_sc.float()).half()
-                        self._draft_quant_sc[key] = d_sc
-                        self._draft_quant_bi[key] = d_bi
+                            zr = torch.from_numpy(qt.zeros[:n_groups].copy().astype(np.float32))
+                            bi = (-zr * sc)
+                        self._quant_sc[key] = sc
+                        self._quant_bi[key] = bi
 
-                    done += 1
+                        if self._enable_qcsd and "_draft_" + name in self.layers.get(i, {}):
+                            qt_d = self.layers[i]["_draft_" + name]
+                            d_numel = rows * cols
+                            if qt_d.bits == 2:
+                                self._draft_quant_u8[key] = torch.from_numpy(qt_d.data.copy())
+                            elif qt_d.bits == 4:
+                                dp = np.ascontiguousarray(qt_d.data, dtype=np.uint8).copy()
+                                self._draft_quant_packed[key] = torch.from_numpy(dp).reshape(
+                                    rows, cols // 2
+                                )
+                            else:
+                                unpacked_d = _unpack_bits(qt_d.data, qt_d.bits)[:d_numel]
+                                self._draft_quant_u8[key] = torch.from_numpy(
+                                    unpacked_d.astype(np.uint8)
+                                )
+                            d_qmax = (1 << qt_d.bits) - 1
+                            d_n_groups = d_numel // qt_d.group_size
+                            d_sc = torch.from_numpy(
+                                qt_d.scales[:d_n_groups].copy().astype(np.float32)
+                            )
+                            if qt_d.is_symmetric:
+                                d_half = float(d_qmax) / 2.0
+                                d_bi = (-d_half * d_sc).to(torch.float32)
+                            else:
+                                d_zr = torch.from_numpy(
+                                    qt_d.zeros[:d_n_groups].copy().astype(np.float32)
+                                )
+                                d_bi = (-d_zr * d_sc).to(torch.float32)
+                            self._draft_quant_sc[key] = d_sc
+                            self._draft_quant_bi[key] = d_bi
 
-            # Clean up draft layer entries
-            for i in range(NUM_LAYERS):
-                if i in self.layers:
-                    for k in list(self.layers[i].keys()):
-                        if k.startswith("_draft_"):
-                            del self.layers[i][k]
+                        done += 1
 
-            self.layers.clear()
-            self._weight_cache.clear()
-            u8_bytes = sum(t.nbytes for t in self._quant_u8.values())
-            sc_bytes = sum(t.nbytes for t in self._quant_sc.values())
-            bi_bytes = sum(t.nbytes for t in self._quant_bi.values())
+                for i in range(NUM_LAYERS):
+                    if i in self.layers:
+                        for k in list(self.layers[i].keys()):
+                            if k.startswith("_draft_"):
+                                del self.layers[i][k]
 
-            total_mb = (u8_bytes + sc_bytes + bi_bytes) / 1e6
-            print(f"done ({done}/{total}) | {total_mb:.0f} MB")
+                self.layers.clear()
+                self._weight_cache.clear()
+                packed_bytes = sum(t.nbytes for t in self._quant_packed.values())
+                sc_bytes = sum(t.nbytes for t in self._quant_sc.values())
+                bi_bytes = sum(t.nbytes for t in self._quant_bi.values())
+                total_mb = (packed_bytes + sc_bytes + bi_bytes) / 1e6
+                print(f"done ({done}/{total}) | {total_mb:.0f} MB")
 
-            if self._enable_qcsd:
-                d_bytes = sum(t.nbytes for t in self._draft_quant_u8.values())
-                print(f"  QCSD draft bank: {d_bytes / 1e6:.0f} MB ({self._draft_bits}-bit)")
+                if self._enable_qcsd:
+                    d_bytes = sum(t.nbytes for t in self._draft_quant_u8.values())
+                    d_bytes += sum(t.nbytes for t in self._draft_quant_packed.values())
+                    print(f"  QCSD draft bank: {d_bytes / 1e6:.0f} MB ({self._draft_bits}-bit)")
+                    pk = set(self._quant_packed.keys())
+                    dk = set(self._draft_quant_sc.keys())
+                    if dk != pk:
+                        raise RuntimeError(
+                            "QCSD draft bank keys mismatch vs primary ("
+                            f"{len(dk)} vs {len(pk)} tensors)"
+                        )
+
+            else:
+                label = "primary" if self._enable_qcsd else ""
+                print(
+                    f"  Pre-unpacking {total} {label} tensors to uint8 ... ",
+                    end="",
+                    flush=True,
+                )
+
+                for i in range(NUM_LAYERS):
+                    for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
+                        qt = self.layers[i][name]
+                        rows, cols = qt.shape
+                        key = (i, name)
+                        self._quant_shapes[key] = (rows, cols)
+
+                        numel = rows * cols
+                        unpacked = _unpack_bits(qt.data, qt.bits)[:numel]
+                        self._quant_u8[key] = torch.from_numpy(unpacked.astype(np.uint8))
+
+                        n_groups = numel // qt.group_size
+                        sc_f16 = torch.from_numpy(qt.scales[:n_groups].copy()).to(torch.float16)
+                        if qt.is_symmetric:
+                            half_range = qmax / 2.0
+                            bi_f16 = (-half_range * sc_f16.float()).half()
+                        else:
+                            zr = torch.from_numpy(qt.zeros[:n_groups].copy()).to(torch.float16)
+                            bi_f16 = (-zr.float() * sc_f16.float()).half()
+                        self._quant_sc[key] = sc_f16
+                        self._quant_bi[key] = bi_f16
+
+                        if self._enable_qcsd and "_draft_" + name in self.layers.get(i, {}):
+                            qt_d = self.layers[i]["_draft_" + name]
+                            d_numel = rows * cols
+                            if qt_d.bits == 2:
+                                self._draft_quant_u8[key] = torch.from_numpy(qt_d.data.copy())
+                            else:
+                                unpacked_d = _unpack_bits(qt_d.data, qt_d.bits)[:d_numel]
+                                self._draft_quant_u8[key] = torch.from_numpy(
+                                    unpacked_d.astype(np.uint8)
+                                )
+                            d_qmax = (1 << qt_d.bits) - 1
+                            d_n_groups = d_numel // qt_d.group_size
+                            d_sc = torch.from_numpy(qt_d.scales[:d_n_groups].copy()).to(
+                                torch.float16
+                            )
+                            if qt_d.is_symmetric:
+                                d_half = d_qmax / 2.0
+                                d_bi = (-d_half * d_sc.float()).half()
+                            else:
+                                d_zr = torch.from_numpy(
+                                    qt_d.zeros[:d_n_groups].copy()
+                                ).to(torch.float16)
+                                d_bi = (-d_zr.float() * d_sc.float()).half()
+                            self._draft_quant_sc[key] = d_sc
+                            self._draft_quant_bi[key] = d_bi
+
+                        done += 1
+
+                for i in range(NUM_LAYERS):
+                    if i in self.layers:
+                        for k in list(self.layers[i].keys()):
+                            if k.startswith("_draft_"):
+                                del self.layers[i][k]
+
+                self.layers.clear()
+                self._weight_cache.clear()
+                u8_bytes = sum(t.nbytes for t in self._quant_u8.values())
+                sc_bytes = sum(t.nbytes for t in self._quant_sc.values())
+                bi_bytes = sum(t.nbytes for t in self._quant_bi.values())
+                total_mb = (u8_bytes + sc_bytes + bi_bytes) / 1e6
+                print(f"done ({done}/{total}) | {total_mb:.0f} MB")
+
+                if self._enable_qcsd:
+                    d_bytes = sum(t.nbytes for t in self._draft_quant_u8.values())
+                    print(f"  QCSD draft bank: {d_bytes / 1e6:.0f} MB ({self._draft_bits}-bit)")
+                    if len(self._draft_quant_u8) != len(self._quant_u8):
+                        raise RuntimeError(
+                            "QCSD draft bank incomplete relative to primary weights ("
+                            f"{len(self._draft_quant_u8)} vs {len(self._quant_u8)} tensors)"
+                        )
 
             n_outliers = sum(len(v) for v in self._outlier_values.values())
             if n_outliers > 0:
                 print(f"  SpQR outliers: {n_outliers:,} values in FP16 sparse format")
 
-            kernel_labels = {4: "Q4", 8: "Q8", 3: "Q3", 2: "Q2"}
+            kernel_labels = {4: "Q4 packed (gemv_q4_packed)", 8: "Q8", 3: "Q3", 2: "Q2"}
             if has_gemv:
                 kl = kernel_labels.get(self.bits, f"Q{self.bits}")
-                print(f"  Inference: native AVX2 GEMV {kl} kernel")
+                print(f"  Inference: native AVX2 GEMV {kl}")
             else:
                 print(f"  Inference: chunked uint8 dequant+matvec (in-place, no AVX GEMV)")
 
@@ -991,6 +1558,7 @@ def generate(
     tokenizer,
     max_new_tokens: int = 50,
     system_prompt: str = "You are a helpful AI assistant.",
+    bench_metrics_out: list | None = None,
 ) -> str:
     print("\n" + "=" * 66)
     print("ASDSL x Phi-4 - CPU Inference")
@@ -1101,6 +1669,15 @@ def generate(
           f"| {kv_stats['memory_mb']:.1f} MB")
     print(f"Weights   : {quant_label}")
     print("=" * 66)
+
+    if bench_metrics_out is not None:
+        bench_metrics_out.append(
+            {
+                "decode_tokens": n_tokens,
+                "decode_s": t_decode,
+                "tokens_per_second": tps,
+            }
+        )
 
     return response_text
 
@@ -1227,6 +1804,7 @@ def generate_qcsd(
     max_new_tokens: int = 50,
     system_prompt: str = "You are a helpful AI assistant.",
     draft_k: int = 7,
+    bench_metrics_out: list | None = None,
 ) -> str:
     """Generate tokens using Quantization Cascade Speculative Decoding.
 
@@ -1287,6 +1865,12 @@ def generate_qcsd(
     total_draft = 0
     total_accepted = 0
     t_decode_start = time.perf_counter()
+    # Target verify: one batched stack (all draft positions at once) should give
+    # _verify_calls == speculative_cycles. If _verify_calls ~= draft_k * cycles, a
+    # serial-per-token verify bug is likely.
+    _verify_calls = 0
+    _verify_extra_run_forward = 0
+    speculative_cycles = 0
 
     pos = len(input_ids)
     with torch.inference_mode():
@@ -1334,6 +1918,8 @@ def generate_qcsd(
                 [store.embed_f16[tid].float() for tid in verify_tokens]
             )
 
+            speculative_cycles += 1
+            _verify_calls += 1
             for i in range(NUM_LAYERS):
                 hidden_batch = forward_layer_batch(
                     hidden_batch, i, store, kv_hist,
@@ -1403,6 +1989,7 @@ def generate_qcsd(
                     for layer in range(NUM_LAYERS):
                         trimmed["lens"][layer] -= n_verify - n_keep_verify
                     kv_hist.restore(trimmed)
+                _verify_extra_run_forward += 1
                 logits = run_forward(
                     correction, draft_start_pos + n_keep_verify, kv_hist,
                     need_logits=True, use_draft=False,
@@ -1420,6 +2007,7 @@ def generate_qcsd(
                     break
             else:
                 # All draft tokens matched target greedy predictions.
+                _verify_extra_run_forward += 1
                 logits = run_forward(
                     draft_tokens[-1], draft_start_pos + n_verify, kv_hist,
                     need_logits=True, use_draft=False,
@@ -1445,9 +2033,30 @@ def generate_qcsd(
     print(f"\n\nGenerated : {n_tokens} tokens  |  {tps:.2f} tok/s  |  decode {t_decode:.1f}s")
     print(f"QCSD      : acceptance rate {accept_rate:.1%}  |  "
           f"drafted {total_draft} / accepted {total_accepted}")
+    _avg_v = _verify_calls / max(speculative_cycles, 1)
+    print(
+        f"QCSD verify telemetry: _verify_calls (batched target stacks)={_verify_calls} "
+        f"in {speculative_cycles} cycle(s); avg {_avg_v:.2f}/cycle "
+        f"(expect ~1.0; ~{draft_k}x would suggest serial verify over k); "
+        f"extra target run_forward after verify={_verify_extra_run_forward}"
+    )
     print(f"ASDSL KV  : {kv_stats['tokens']} tokens tracked  "
           f"| {kv_stats['blocks_used']}/{kv_stats['blocks_capacity']} blocks")
     print("=" * 66)
+
+    if bench_metrics_out is not None:
+        bench_metrics_out.append(
+            {
+                "decode_tokens": n_tokens,
+                "decode_s": t_decode,
+                "tokens_per_second": tps,
+                "acceptance_rate": accept_rate,
+                "_verify_calls": _verify_calls,
+                "qcsd_verify_batched_passes": _verify_calls,
+                "qcsd_speculative_cycles": speculative_cycles,
+                "qcsd_verify_extra_run_forward": _verify_extra_run_forward,
+            }
+        )
 
     return response_text
 
@@ -1572,8 +2181,12 @@ def main() -> None:
                              "8/4/3/2=ASDSL N-bit quantization (demo, lower quality)")
     parser.add_argument("--group-size", type=int, default=0,
                         help="Quantization group size (0=auto: 32 for <=4-bit, 128 for 8-bit)")
-    parser.add_argument("--threads", type=int, default=0,
-                        help="CPU threads for BLAS/OMP (0=auto: P-cores on Intel i7 Evo)")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="CPU threads for BLAS/OpenMP/native GEMV (0=auto: half of logical CPUs, min 1)",
+    )
     parser.add_argument("--stream", action="store_true",
                         help="Use streaming output (yield tokens as generated)")
     parser.add_argument(
@@ -1594,12 +2207,18 @@ def main() -> None:
                         help="Enable activation-sparse GEMV (Tier 3)")
     parser.add_argument("--sparse-threshold", type=float, default=0.01,
                         help="Activation sparsity threshold (default: 0.01)")
+    parser.add_argument(
+        "--no-weight-cache",
+        action="store_true",
+        help="Disable persistent safetensors weight cache (env PHI4_NO_WEIGHT_CACHE=1)",
+    )
     args = parser.parse_args()
+    if args.no_weight_cache:
+        os.environ["PHI4_NO_WEIGHT_CACHE"] = "1"
 
-    # Intel i7 Evo optimal threading: use P-cores by default (8 threads)
+    set_thread_count(args.threads if args.threads > 0 else 0)
     if args.threads == 0:
-        args.threads = 8
-    set_thread_count(args.threads)
+        args.threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
 
     if args.qcsd_benchmark:
         print("=" * 66)
@@ -1683,24 +2302,39 @@ def main() -> None:
     )
     store.load()
     t_load = time.perf_counter() - t0
-    verb = "Load" if args.bits == 16 else "Load + quantize"
-    print(f"  {verb} complete in {t_load / 60:.1f} minutes")
+    if getattr(store, "_loaded_from_cache", False):
+        print(f"  Weight restore complete in {t_load:.2f}s (persistent cache)")
+    else:
+        verb = "Load" if args.bits == 16 else "Load + quantize"
+        print(f"  {verb} complete in {t_load / 60:.1f} minutes")
     if args.bits != 16:
         print(f"  Layers ready: {len(store.layers)}/32  "
               f"| Norms ready: {len(store.layer_norms)}/32")
     store.warm_cache()
+    if _weight_cache_enabled() and not getattr(store, "_loaded_from_cache", False):
+        cpath = weight_cache_path_for_store(store)
+        save_weight_store_cache(store, cpath)
+        print(f"  Saved weight cache: {cpath}")
     if args.bits == 16:
         print(f"  Memory: f16 weight cache (~6.4 GB) + embed_f16 (~1.2 GB) ~= 7.6 GB")
     else:
-        u8_mb = sum(t.nbytes for t in store._quant_u8.values()) / 1e6
+        if args.bits == 4:
+            w_mb = sum(t.nbytes for t in store._quant_packed.values()) / 1e6
+            w_label = "packed Q4"
+        else:
+            w_mb = sum(t.nbytes for t in store._quant_u8.values()) / 1e6
+            w_label = "uint8 weights"
         sc_mb = sum(t.nbytes for t in store._quant_sc.values()) / 1e6
         bi_mb = sum(t.nbytes for t in store._quant_bi.values()) / 1e6
         embed_mb = store.embed_f16.nbytes / 1e6
-        total_mb = u8_mb + sc_mb + bi_mb + embed_mb
+        total_mb = w_mb + sc_mb + bi_mb + embed_mb
         if args.qcsd:
-            d_mb = sum(t.nbytes for t in store._draft_quant_u8.values()) / 1e6
+            d_mb = (
+                sum(t.nbytes for t in store._draft_quant_u8.values())
+                + sum(t.nbytes for t in store._draft_quant_packed.values())
+            ) / 1e6
             total_mb += d_mb
-        print(f"  Memory: uint8 weights ({u8_mb:.0f} MB) + scales/biases ({sc_mb + bi_mb:.0f} MB)"
+        print(f"  Memory: {w_label} ({w_mb:.0f} MB) + scales/biases ({sc_mb + bi_mb:.0f} MB)"
               f" + embed_f16 ({embed_mb:.0f} MB) ~= {total_mb / 1e3:.1f} GB")
 
     if args.chat:

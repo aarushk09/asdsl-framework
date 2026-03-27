@@ -14,6 +14,11 @@ from typing import Protocol
 
 import numpy as np
 
+# Greedy QCSD batched verify: sleep ~= latency_s * (BASE + SLOPE * (num_drafts - 1)).
+# Lower than ``verify_logits_batch`` (0.55 + 0.08 * ...) to reflect amortized verify tax.
+GREEDY_VERIFY_BATCH_FACTOR_BASE = 0.34
+GREEDY_VERIFY_BATCH_FACTOR_SLOPE = 0.055
+
 
 class SpeculativeModel(Protocol):
     """Model interface required by the dual-model decoder."""
@@ -114,12 +119,17 @@ class SimulatedDualModel:
         latency_s: float,
         draft_noise_std: float,
         resident_mb: int = 0,
+        sim_acceptance_rate: float = 0.70,
     ):
         self._name = name
         self._vocab_size = vocab_size
         self._seed = np.uint64(base_seed)
         self._latency_s = float(latency_s)
         self._draft_noise_std = float(draft_noise_std)
+        p = float(sim_acceptance_rate)
+        if not 0.0 <= p <= 1.0:
+            raise ValueError("sim_acceptance_rate must be in [0, 1]")
+        self._sim_acceptance_rate = p
         self._cache = FixedKVCache(max_context=max_context)
 
         # Separate state hash from kv length so restore is exact.
@@ -127,12 +137,59 @@ class SimulatedDualModel:
         self._hash_history = np.empty(max_context + 1, dtype=np.uint64)
         self._hash_history[0] = self._state_hash
 
+        self._resident_mb = int(resident_mb)
         self._resident_weights = None
         if resident_mb > 0:
             # Keep the draft model memory resident and separate from verifier paths.
             count = (resident_mb * 1024 * 1024) // 4
             self._resident_weights = np.empty(count, dtype=np.float32)
             self._resident_weights.fill(0.001)
+
+    @property
+    def resident_mb(self) -> int:
+        """Allocated resident weight buffer size (0 if none)."""
+        return self._resident_mb
+
+    @property
+    def sim_acceptance_rate(self) -> float:
+        """Bernoulli success probability per draft step (simulator realism)."""
+        return self._sim_acceptance_rate
+
+    def generate_draft(
+        self,
+        current: int,
+        gamma: int,
+        rng: np.random.Generator,
+    ) -> tuple[list[int], int]:
+        """Greedy draft continuation with Bernoulli early exit.
+
+        After each greedy draft token is drawn, a Bernoulli draw with success
+        probability :attr:`sim_acceptance_rate` runs. On failure, draft
+        generation stops and the token is discarded (KV is restored by the
+        caller via snapshot). On success, the token is appended and the chain
+        continues up to ``gamma`` steps.
+
+        Returns:
+            (draft_tokens, n_bernoulli_trials) for aggregate acceptance stats.
+        """
+        draft_tokens: list[int] = []
+        dt = int(current)
+        p = self._sim_acceptance_rate
+        trials = 0
+        if gamma < 1 or p <= 0.0:
+            return draft_tokens, trials
+
+        for _ in range(gamma):
+            self.advance_tokens([dt])
+            dlog = self.next_logits(count_cost=True)
+            nt = int(np.argmax(dlog))
+            trials += 1
+            if rng.random() < p:
+                draft_tokens.append(nt)
+                dt = nt
+            else:
+                break
+        return draft_tokens, trials
 
     @property
     def name(self) -> str:
@@ -188,7 +245,9 @@ class SimulatedDualModel:
         ``current``, then for each i predict draft_tokens[i] from the running hash.
         """
         if self._latency_s > 0:
-            batch_factor = 0.48 + 0.07 * max(len(draft_tokens) - 1, 0)
+            batch_factor = GREEDY_VERIFY_BATCH_FACTOR_BASE + GREEDY_VERIFY_BATCH_FACTOR_SLOPE * max(
+                len(draft_tokens) - 1, 0
+            )
             time.sleep(self._latency_s * batch_factor)
 
         h = self._state_hash
@@ -369,16 +428,26 @@ class GreedySpeculativeRunResult:
     drafted_tokens: int
     accepted_draft_matches: int
     speculative_rounds: int
+    bernoulli_trials: int = 0
+    bernoulli_successes: int = 0
 
 
 class GreedyDualModelSpeculativeDecoder:
     """Greedy (temperature 0) draft–verify decoding matching QCSD / standard speculative.
 
-    Draft model runs :math:`\\gamma` steps starting from the target's greedy token
-    ``current``; the target verifies with a batched (amortized-cost) logit chain when
+    When the draft model implements :meth:`SimulatedDualModel.generate_draft`, each
+    greedy draft step survives an independent Bernoulli draw with probability
+    :attr:`SimulatedDualModel.sim_acceptance_rate`; on failure the draft chain ends
+    early (realistic acceptance-limited drafts). Otherwise up to :math:`\\gamma`
+    steps are taken.
+
+    The target verifies with a batched (amortized-cost) logit chain when
     :meth:`greedy_verify_logits_after_current` exists on the target (see
     :class:`SimulatedDualModel`). KV is rolled back after verification, then both
     models advance only the emitted prefix (+ optional correction).
+
+    Reported :attr:`GreedySpeculativeRunResult.acceptance_rate` is the aggregate
+    Bernoulli success rate (draft steps accepted / Bernoulli trials).
     """
 
     def __init__(
@@ -386,12 +455,14 @@ class GreedyDualModelSpeculativeDecoder:
         draft_model: SpeculativeModel,
         target_model: SpeculativeModel,
         gamma: int = 4,
+        draft_sim_seed: int = 2026,
     ):
         if gamma < 1:
             raise ValueError("gamma must be >= 1")
         self.draft_model = draft_model
         self.target_model = target_model
         self.gamma = gamma
+        self._draft_sim_rng = np.random.default_rng(int(draft_sim_seed))
 
     def generate(
         self,
@@ -404,6 +475,8 @@ class GreedyDualModelSpeculativeDecoder:
         generated: list[int] = []
         total_draft = 0
         accepted_matches = 0
+        bernoulli_trials = 0
+        bernoulli_successes = 0
         rounds = 0
         t0 = time.perf_counter()
 
@@ -416,14 +489,22 @@ class GreedyDualModelSpeculativeDecoder:
             current = int(np.argmax(logits))
 
             draft_snap = self.draft_model.snapshot_kv()
-            draft_tokens: list[int] = []
-            dt = current
-            for _ in range(self.gamma):
-                self.draft_model.advance_tokens([dt])
-                dlog = self.draft_model.next_logits(count_cost=True)
-                nt = int(np.argmax(dlog))
-                draft_tokens.append(nt)
-                dt = nt
+            if hasattr(self.draft_model, "generate_draft"):
+                gen = getattr(self.draft_model, "generate_draft")
+                draft_tokens, n_trials = gen(current, self.gamma, self._draft_sim_rng)
+                bernoulli_trials += n_trials
+                bernoulli_successes += len(draft_tokens)
+            else:
+                draft_tokens = []
+                dt = current
+                for _ in range(self.gamma):
+                    self.draft_model.advance_tokens([dt])
+                    dlog = self.draft_model.next_logits(count_cost=True)
+                    nt = int(np.argmax(dlog))
+                    draft_tokens.append(nt)
+                    dt = nt
+                bernoulli_trials += len(draft_tokens)
+                bernoulli_successes += len(draft_tokens)
             total_draft += len(draft_tokens)
             self.draft_model.restore_kv(draft_snap)
 
@@ -461,7 +542,8 @@ class GreedyDualModelSpeculativeDecoder:
 
         decode_time = time.perf_counter() - t0
         tps = len(generated) / max(decode_time, 1e-9)
-        acc_rate = accepted_matches / max(total_draft, 1)
+        # Report simulator Bernoulli acceptance (converges to sim_acceptance_rate).
+        acc_rate = bernoulli_successes / max(bernoulli_trials, 1)
 
         return GreedySpeculativeRunResult(
             generated_tokens=generated,
@@ -471,6 +553,8 @@ class GreedyDualModelSpeculativeDecoder:
             drafted_tokens=total_draft,
             accepted_draft_matches=accepted_matches,
             speculative_rounds=rounds,
+            bernoulli_trials=bernoulli_trials,
+            bernoulli_successes=bernoulli_successes,
         )
 
     def _sequential_target_verify_logits(

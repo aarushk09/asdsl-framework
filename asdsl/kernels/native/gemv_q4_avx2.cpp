@@ -28,6 +28,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
+#include "gemv_q4_kernel.h"
+
 #include <immintrin.h>
 #include <cstdint>
 #include <cstddef>
@@ -525,10 +527,13 @@ static void validate_gemv_args(
     int64_t w_size, int64_t x_size,
     int64_t s_size, int64_t b_size,
     int M, int K, int group_size,
-    int64_t expected_w_size
+    int64_t expected_w_size,
+    int64_t batch_B = 1
 ) {
     if (M <= 0 || K <= 0 || group_size <= 0)
         throw std::invalid_argument("M, K, group_size must be positive");
+    if (batch_B < 1)
+        throw std::invalid_argument("batch must be >= 1");
     if (K % 2 != 0)
         throw std::invalid_argument("K must be even for 4-bit packing");
     if (K % group_size != 0)
@@ -536,8 +541,8 @@ static void validate_gemv_args(
     if (group_size % 8 != 0)
         throw std::invalid_argument(
             "group_size must be a multiple of 8 for AVX2 vectorization");
-    if (x_size != K)
-        throw std::invalid_argument("x length must equal K");
+    if (x_size != batch_B * K)
+        throw std::invalid_argument("x size must equal batch * K");
     if (w_size != expected_w_size)
         throw std::invalid_argument("weight buffer size mismatch");
 
@@ -552,6 +557,25 @@ static void validate_gemv_args(
  * pybind11 Bindings
  * =================================================================== */
 
+static void assert_x_gemv_layout(const py::buffer_info& xb, int K, int64_t batch_B) {
+    const py::ssize_t esz = static_cast<py::ssize_t>(sizeof(float));
+    if (xb.ndim == 1) {
+        if (batch_B != 1)
+            throw std::invalid_argument("internal: batch_B must be 1 for 1-D x");
+        if (xb.shape[0] != K)
+            throw std::invalid_argument("x length must equal K");
+        if (xb.strides[0] != esz)
+            throw std::invalid_argument("x must be contiguous (C-order)");
+        return;
+    }
+    if (xb.ndim != 2)
+        throw std::invalid_argument("x must be 1-D (K,) or 2-D (batch, K)");
+    if (xb.shape[0] != static_cast<py::ssize_t>(batch_B) || xb.shape[1] != K)
+        throw std::invalid_argument("x shape must be (batch, K) matching arguments");
+    if (xb.strides[1] != esz || xb.strides[0] != esz * K)
+        throw std::invalid_argument("x (batch, K) must be C-contiguous");
+}
+
 static py::array_t<float> py_gemv_q4_packed(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> w_packed,
     py::array_t<float,   py::array::c_style | py::array::forcecast> x,
@@ -564,23 +588,33 @@ static py::array_t<float> py_gemv_q4_packed(
     auto sb = scales.request();
     auto bb = biases.request();
 
+    const int64_t batch_B = xb.ndim == 1 ? 1 : static_cast<int64_t>(xb.shape[0]);
     validate_gemv_args(
         wb.size, xb.size, sb.size, bb.size,
         M, K, group_size,
-        static_cast<int64_t>(M) * K / 2);
+        static_cast<int64_t>(M) * K / 2,
+        batch_B);
+    assert_x_gemv_layout(xb, K, batch_B);
 
-    auto result = py::array_t<float>(M);
+    py::array_t<float> result = (batch_B == 1)
+        ? py::array_t<float>(static_cast<py::ssize_t>(M))
+        : py::array_t<float>(std::vector<py::ssize_t>{
+              static_cast<py::ssize_t>(batch_B), static_cast<py::ssize_t>(M)});
     auto rb = result.request();
 
     {
         py::gil_scoped_release release;
-        gemv_q4_packed_impl_v2(
-            static_cast<const uint8_t*>(wb.ptr),
-            static_cast<const float*>(xb.ptr),
-            static_cast<const float*>(sb.ptr),
-            static_cast<const float*>(bb.ptr),
-            static_cast<float*>(rb.ptr),
-            M, K, group_size);
+        const float* xp = static_cast<const float*>(xb.ptr);
+        float* yp = static_cast<float*>(rb.ptr);
+        for (int64_t b = 0; b < batch_B; ++b) {
+            gemv_q4_packed_impl_v2(
+                static_cast<const uint8_t*>(wb.ptr),
+                xp + b * K,
+                static_cast<const float*>(sb.ptr),
+                static_cast<const float*>(bb.ptr),
+                yp + b * M,
+                M, K, group_size);
+        }
     }
 
     return result;
@@ -642,7 +676,8 @@ Fused 4-bit GEMV on packed weights with in-register unpacking.
 
 Args:
     w_packed: Packed uint8 array, shape (M*K/2,). Two 4-bit values per byte.
-    x:        Input vector, shape (K,), float32.
+    x:        Input, shape (K,) float32, or batch (B, K) C-contiguous for B
+              independent GEMVs (handled in one native call).
     scales:   Per-group scales, shape (M * K/group_size,), float32.
     biases:   Per-group biases, shape (M * K/group_size,), float32.
     M:        Number of output rows.
@@ -650,7 +685,7 @@ Args:
     group_size: Quantization group size (must be multiple of 16).
 
 Returns:
-    Output vector, shape (M,), float32.
+    float32 (M,) if x is 1-D, else (B, M).
 )doc",
         py::arg("w_packed"), py::arg("x"),
         py::arg("scales"), py::arg("biases"),
@@ -666,6 +701,68 @@ one byte per quantized value.
         py::arg("w"), py::arg("x"),
         py::arg("scales"), py::arg("biases"),
         py::arg("M"), py::arg("K"), py::arg("group_size"));
+
+    m.def(
+        "gemv_q4_avx2_gs64",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> w_packed,
+           py::array_t<float, py::array::c_style | py::array::forcecast> x,
+           py::array_t<float, py::array::c_style | py::array::forcecast> scales,
+           int rows,
+           int cols) {
+            auto wb = w_packed.request();
+            auto xb = x.request();
+            auto sb = scales.request();
+            const int64_t packed_elems = static_cast<int64_t>(rows) * (cols / 2);
+            const int64_t groups = static_cast<int64_t>(rows) * (cols / 64);
+            if (cols <= 0 || rows <= 0 || (cols % 64) != 0 || (cols % 2) != 0) {
+                throw std::invalid_argument("cols must be positive, even, and divisible by 64");
+            }
+            if (wb.size != packed_elems) {
+                throw std::invalid_argument("w_packed size must be rows * (cols/2)");
+            }
+            if (sb.size != groups) {
+                throw std::invalid_argument("scales length must be rows * (cols/64)");
+            }
+            const int64_t batch_B = xb.ndim == 1 ? 1 : static_cast<int64_t>(xb.shape[0]);
+            assert_x_gemv_layout(xb, cols, batch_B);
+            if (xb.size != batch_B * cols) {
+                throw std::invalid_argument("x size must equal batch * cols");
+            }
+            py::array_t<float> result = (batch_B == 1)
+                ? py::array_t<float>(static_cast<py::ssize_t>(rows))
+                : py::array_t<float>(std::vector<py::ssize_t>{
+                      static_cast<py::ssize_t>(batch_B), static_cast<py::ssize_t>(rows)});
+            auto rb = result.request();
+            {
+                py::gil_scoped_release release;
+                const float* xp = static_cast<const float*>(xb.ptr);
+                float* yp = static_cast<float*>(rb.ptr);
+                for (int64_t b = 0; b < batch_B; ++b) {
+                    gemv_q4_avx2(
+                        static_cast<const uint8_t*>(wb.ptr),
+                        xp + b * cols,
+                        static_cast<const float*>(sb.ptr),
+                        yp + b * rows,
+                        rows,
+                        cols);
+                }
+            }
+            return result;
+        },
+        R"doc(
+Specialized 4-bit packed GEMV: fixed group size 64, one scale per 64 columns.
+y[r] = sum_g scales[r*(cols/64)+g] * dot(unpack(W[r,g,:]), x[g*64:(g+1)*64]).
+
+x may be shape (cols,) or (batch, cols) C-contiguous; output is (rows,) or
+(batch, rows).
+
+Packed byte layout: low nibble = even column, high nibble = odd column.
+)doc",
+        py::arg("w_packed"),
+        py::arg("x"),
+        py::arg("scales"),
+        py::arg("rows"),
+        py::arg("cols"));
 
     m.def("check_avx2", &check_avx2_support,
         "Runtime check: does this CPU support AVX2?");

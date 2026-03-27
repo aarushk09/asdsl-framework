@@ -8,6 +8,7 @@ from asdsl.inference.engine import (
 	DualModelBenchmarkResult,
 	NativePerplexityResult,
 	evaluate_perplexity_phase8_native,
+	resolve_hf_ppl_model_id,
 	run_dual_model_speculative_benchmark,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
 	"DualModelBenchmarkResult",
 	"NativePerplexityResult",
 	"evaluate_perplexity_phase8_native",
+	"resolve_hf_ppl_model_id",
 	"run_dual_model_speculative_benchmark",
 ]

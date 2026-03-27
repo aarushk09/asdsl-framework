@@ -6,6 +6,10 @@ C++ extension modules; all other metadata comes from pyproject.toml.
 The native extensions are optional: if pybind11 is not installed or
 the build fails, ASDSL falls back to pure-Python/NumPy implementations.
 
+Non-Windows builds use ``-O3 -mavx2 -mfma -ffast-math -fopenmp``. On macOS,
+Apple's linker may require Homebrew OpenMP (``brew install libomp``) and
+``CPPFLAGS``/``LDFLAGS`` pointing at libomp if ``-fopenmp`` fails to link.
+
 Build manually:
     python setup.py build_ext --inplace
 
@@ -31,22 +35,34 @@ def get_native_extensions():
         )
         return [], {}
 
+    # Aggressive optimization for memory-bandwidth-heavy GEMV / inference kernels.
+    # MSVC: /openmp is compile-only; the linker pulls the OpenMP runtime automatically.
+    # Unix (Linux/macOS): -fopenmp on link as well. macOS may need Homebrew libomp
+    # (see https://brew.sh/formula/libomp) and CPPFLAGS/LDFLAGS if the linker cannot find -lomp.
     extra_compile_args = []
     extra_link_args = []
 
     if sys.platform == "win32":
-        extra_compile_args = ["/arch:AVX2", "/O2", "/fp:fast", "/EHsc"]
-        # MSVC OpenMP
-        extra_compile_args.append("/openmp")
-    elif sys.platform == "darwin":
-        extra_compile_args = ["-mavx2", "-mfma", "-mf16c", "-O3", "-ffast-math"]
-        extra_compile_args.append("-std=c++17")
+        extra_compile_args = [
+            "/O2",
+            "/Ob2",
+            "/Oi",
+            "/arch:AVX2",
+            "/fp:fast",
+            "/openmp",
+            "/EHsc",
+        ]
     else:
         extra_compile_args = [
-            "-mavx2", "-mfma", "-mf16c", "-O3", "-ffast-math", "-std=c++17",
+            "-O3",
+            "-mavx2",
+            "-mfma",
+            "-mf16c",
+            "-ffast-math",
+            "-std=c++17",
+            "-fopenmp",
         ]
-        extra_compile_args.append("-fopenmp")
-        extra_link_args.append("-fopenmp")
+        extra_link_args = ["-fopenmp"]
 
     ext_modules = [
         Pybind11Extension(
@@ -59,7 +75,10 @@ def get_native_extensions():
 
         Pybind11Extension(
             "asdsl.kernels._native_gemv",
-            ["asdsl/kernels/native/gemv_q4_avx2.cpp"],
+            [
+                "asdsl/kernels/native/gemv_q4_avx2.cpp",
+                "asdsl/kernels/native/gemv_q4_kernel.cpp",
+            ],
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
             define_macros=[("PYBIND11_DETAILED_ERROR_MESSAGES", "1")],
