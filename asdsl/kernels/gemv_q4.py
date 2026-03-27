@@ -47,6 +47,30 @@ try:
 except ImportError:
     logger.info("Native GEMV extension not built — using NumPy fallback")
 
+# ---------------------------------------------------------------------------
+# LUT kernel (Phase 1): vpshufb-based Q4 GEMV
+# ---------------------------------------------------------------------------
+
+_native_lut = None
+_lut_import_attempted = False
+
+
+def _try_import_lut():
+    """Lazy import of _native_lut extension. Returns module or None."""
+    global _native_lut, _lut_import_attempted
+    if not _lut_import_attempted:
+        _lut_import_attempted = True
+        try:
+            from asdsl.kernels import _native_lut as _nl
+            _native_lut = _nl
+            logger.info(
+                "Native LUT GEMV kernel loaded (vpshufb=%s)",
+                getattr(_nl, "lut_use_shuffle", "unknown"),
+            )
+        except ImportError:
+            logger.info("Native LUT extension not built — LUT path unavailable")
+    return _native_lut
+
 
 def has_native_kernel() -> bool:
     """Return True if the compiled AVX2+FMA GEMV kernel is available."""
@@ -185,6 +209,7 @@ def gemv_q4_packed(
     M: int,
     K: int,
     group_size: int,
+    use_lut: bool = False,
 ) -> np.ndarray:
     """Fused 4-bit packed GEMV: y = dequant(W_q4) @ x.
 
@@ -198,6 +223,8 @@ def gemv_q4_packed(
         M:          Output dimension (rows).
         K:          Input dimension (columns).
         group_size: Elements per quantization group.
+        use_lut:    If True, use the vpshufb LUT kernel (Phase 1) instead of FMA.
+                    Falls back to FMA path if _native_lut is not available.
 
     Returns:
         Output float32, shape (M,) if x is 1-D, else (B, M).
@@ -215,6 +242,17 @@ def gemv_q4_packed(
             raise ValueError(f"x.shape[1]={x.shape[1]} does not match K={K}")
     else:
         raise ValueError("x must be 1-D (K,) or 2-D (batch, K)")
+
+    # LUT path (Phase 1): vpshufb-based kernel
+    if use_lut and x.ndim == 1:
+        nl = _try_import_lut()
+        if nl is not None:
+            try:
+                return np.asarray(
+                    nl.gemv_lut_q4_avx2(w_packed, scales, biases, x, M, K, group_size)
+                )
+            except Exception as e:
+                logger.warning("LUT kernel failed (%s), falling back to FMA path", e)
 
     if _native_available:
         return np.asarray(

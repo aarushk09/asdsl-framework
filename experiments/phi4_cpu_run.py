@@ -476,6 +476,8 @@ class WeightStore:
 
         # Native LUT/GEMV fast path
         self._use_native_gemv = False
+        # Phase 1: vpshufb LUT kernel (Profile D)
+        self._use_lut_gemv = False
 
         # SpQR outlier separation (Tier 1C) — for bits <= 3
         self._outlier_values: dict[tuple, np.ndarray] = {}
@@ -928,7 +930,8 @@ class WeightStore:
             sc_np = sc.detach().cpu().float().contiguous().numpy()
             bi_np = bi.detach().cpu().float().contiguous().numpy()
             out_np = gemv_q4_packed(
-                w_np, x_np, sc_np, bi_np, rows, cols, self.group_size
+                w_np, x_np, sc_np, bi_np, rows, cols, self.group_size,
+                use_lut=self._use_lut_gemv,
             )
             result_t = torch.from_numpy(np.asarray(out_np, dtype=np.float32))
             if result_t.dim() == 1:

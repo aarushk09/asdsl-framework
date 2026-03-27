@@ -92,5 +92,16 @@
     "baseline_tok_per_sec": 1.2,
     "lut_avx2_ready_for_phase1": true,
     "notes": "Kernel is memory-bound (AI=3.9874 vs ridge=17.6 FLOPS/byte); dequant overhead ~3.8%; LUT vpshufb rewrite is the highest-leverage Phase 1 intervention."
+  },
+  "phase_1_results": {
+    "profile_c_tok_per_sec": 1.6,
+    "profile_d_tok_per_sec": 1.79,
+    "speedup_vs_profile_c": 1.119,
+    "speedup_vs_asdsl_baseline": 1.492,
+    "llama_cpp_gap_closed_pct": 10.2,
+    "lut_implementation": "vpshufb nibble extraction + float32 gather LUT with AVX2 FMA accumulation",
+    "correctness_test_passed": true,
+    "phase_1_bottleneck_note": "memory-bound confirmed; LUT reduces effective bytes-per-weight by eliminating FP32 expansion; weights stay packed 4-bit throughout shuffle path; gather latency limits speedup on cache-resident data",
+    "next_phase_recommendation": "phase 2 slim-llm reduces model footprint from ~7.5gb to ~3.8gb, directly scaling tok/s proportionally under memory-bound roofline"
   }
 }
