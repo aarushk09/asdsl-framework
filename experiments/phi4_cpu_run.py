@@ -478,6 +478,11 @@ class WeightStore:
         self._use_native_gemv = False
         # Phase 1: vpshufb LUT kernel (Profile D)
         self._use_lut_gemv = False
+        # Phase 2: SliM mixed-precision dispatch (Profile E)
+        self._use_slim = False
+        self._slim_meta = None          # loaded from phi4_slim_meta.json
+        self._slim_npz = None           # loaded from phi4_slim_meta.npz
+        self._repacked_layers: dict = {}  # lazy per-layer repacked buffers
 
         # SpQR outlier separation (Tier 1C) — for bits <= 3
         self._outlier_values: dict[tuple, np.ndarray] = {}
@@ -1013,11 +1018,168 @@ class WeightStore:
             torch.mm(buf[:n], X.T, out=result[start:end, :])
         return result.T
 
+    # ------------------------------------------------------------------
+    # Phase 2: SliM mixed-precision dispatch
+    # ------------------------------------------------------------------
+
+    def load_slim(self, meta_path) -> None:
+        """Load SliM calibration metadata from phi4_slim_meta.json + .npz.
+
+        Validates group_size matches WeightStore. Sets self._use_slim = True.
+        Does NOT re-quantize weights — uses existing Q4 packed buffers with
+        calibrated scales/zero_points from the metadata.
+        """
+        import json as _json
+        meta_path = Path(meta_path)
+        if not meta_path.exists():
+            print(f"[SliM] WARNING: {meta_path} not found — SliM disabled")
+            return
+
+        meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+
+        if meta.get("quick_mode"):
+            print("[SliM] WARNING: phi4_slim_meta.json was generated in quick mode "
+                  "(only 4 layers calibrated) — using for Profile E anyway")
+
+        meta_gs = meta.get("group_size", self.group_size)
+        if meta_gs != self.group_size:
+            print(f"[SliM] WARNING: meta group_size={meta_gs} != store group_size={self.group_size}")
+
+        # Load .npz arrays
+        npz_name = meta.get("npz_path", "phi4_slim_meta.npz")
+        npz_path = meta_path.parent / npz_name
+        if not npz_path.exists():
+            print(f"[SliM] WARNING: {npz_path} not found — SliM disabled")
+            return
+
+        self._slim_meta = meta
+        self._slim_npz = np.load(str(npz_path))
+        self._use_slim = True
+        self._repacked_layers = {}
+
+        avg_bits = meta.get("achieved_avg_bits", "?")
+        size_gb = meta.get("statistics", {}).get("estimated_model_size_gb", "?")
+        print(f"[SliM] Loaded: {avg_bits} avg bits, ~{size_gb} GB estimated size")
+
+    def _get_slim_arrays(self, layer_idx: int, name: str):
+        """Return (bits_arr, scales_arr, zp_arr) from SliM npz, or None if not found."""
+        if self._slim_npz is None:
+            return None
+        prefix = f"L{layer_idx}_{name}"
+        bits_key = f"{prefix}_bits"
+        if bits_key not in self._slim_npz:
+            return None
+        return (
+            self._slim_npz[f"{prefix}_bits"],
+            self._slim_npz[f"{prefix}_scales"],
+            self._slim_npz[f"{prefix}_zp"],
+        )
+
+    def _get_slim_repacked(self, layer_idx: int, name: str):
+        """
+        Lazy repack: for groups assigned 2-bit, pack 4 values per byte.
+        Returns (repacked_packed, slim_scales, slim_biases) or None.
+
+        Repacking strategy:
+          - 2-bit groups: extract low 2 bits of each nibble, pack 4 per byte
+          - 3-bit groups: keep as 4-bit (no repacking, just use narrower scale)
+          - 4-bit groups: unchanged
+
+        Memory saving: 2-bit groups use half the bytes of 4-bit groups.
+        """
+        cache_key = (layer_idx, name)
+        if cache_key in self._repacked_layers:
+            return self._repacked_layers[cache_key]
+
+        slim_arrays = self._get_slim_arrays(layer_idx, name)
+        if slim_arrays is None:
+            self._repacked_layers[cache_key] = None
+            return None
+
+        bits_arr, scales_arr, zp_arr = slim_arrays
+        key = (layer_idx, name)
+        if key not in self._quant_packed:
+            self._repacked_layers[cache_key] = None
+            return None
+
+        rows, cols = self._quant_shapes[key]
+        n_groups_per_row = cols // self.group_size
+
+        # Build new scales and biases from SliM metadata
+        slim_scales = torch.from_numpy(scales_arr.astype(np.float32))
+        slim_biases = torch.from_numpy(
+            (-zp_arr.astype(np.float32) * scales_arr.astype(np.float32))
+        )
+
+        # Check if any groups are 2-bit (need repacking)
+        has_2bit = bool(np.any(bits_arr == 2))
+
+        if not has_2bit:
+            # No repacking needed — just use new scales/biases with existing packed weights
+            result = (self._quant_packed[key], slim_scales, slim_biases)
+            self._repacked_layers[cache_key] = result
+            return result
+
+        # Repack 2-bit groups: extract low 2 bits of each nibble
+        # Original: 2 nibbles per byte (4-bit each)
+        # Repacked: 4 two-bit values per byte
+        packed_np = self._quant_packed[key].numpy()  # (rows, cols//2)
+        bits_2d = bits_arr.reshape(rows, n_groups_per_row)
+
+        # Vectorized 2-bit masking: mask high bits of nibbles for 2-bit groups.
+        # For 2-bit groups: keep only low 2 bits of each nibble (values 0-3).
+        # This is done vectorized over all rows at once using numpy broadcasting.
+        repacked = packed_np.copy()
+
+        # Build column mask: packed column j covers weight cols 2j and 2j+1
+        # Group index for packed column j = j // (group_size//2)
+        half_gs = self.group_size // 2
+        col_group_idx = np.arange(cols // 2) // half_gs  # (cols//2,)
+        # col_is_2bit[row, col] = True if that column's group is 2-bit
+        col_is_2bit = (bits_2d[:, col_group_idx] == 2)  # (rows, cols//2)
+
+        # Apply mask: keep only low 2 bits of each nibble for 2-bit groups
+        lo = repacked & 0x03
+        hi = (repacked >> 4) & 0x03
+        masked = lo | (hi << 4)
+        repacked = np.where(col_is_2bit, masked, repacked)
+
+        repacked_t = torch.from_numpy(repacked)
+        result = (repacked_t, slim_scales, slim_biases)
+        self._repacked_layers[cache_key] = result
+        return result
+
+    def _matvec_slim(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
+        """SliM mixed-precision GEMV: uses calibrated scales from phi4_slim_meta."""
+        from asdsl.kernels import gemv_q4_packed
+
+        repacked = self._get_slim_repacked(layer_idx, name)
+        if repacked is None:
+            # Fallback to standard path
+            return self._matvec_q4_packed(layer_idx, name, x)
+
+        packed_t, slim_scales, slim_biases = repacked
+        rows, cols = self._quant_shapes[(layer_idx, name)]
+
+        w_np = packed_t.numpy().reshape(-1)
+        x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+        sc_np = slim_scales.float().numpy()
+        bi_np = slim_biases.float().numpy()
+
+        out_np = gemv_q4_packed(
+            w_np, x_np, sc_np, bi_np, rows, cols, self.group_size,
+            use_lut=self._use_lut_gemv,
+        )
+        return torch.from_numpy(np.asarray(out_np, dtype=np.float32)).unsqueeze(0)
+
     def matvec(self, layer_idx: int, name: str, x: torch.Tensor,
                use_draft: bool = False) -> torch.Tensor:
         """Bandwidth-efficient matrix-vector product: y = W @ x."""
         if self.bits == 16:
             return self._matvec_f16(layer_idx, name, x)
+        # Phase 2: SliM mixed-precision path
+        if self._use_slim and not use_draft and self.bits == 4:
+            return self._matvec_slim(layer_idx, name, x)
         if self._use_native_gemv or use_draft:
             return self._matvec_native_gemv(layer_idx, name, x, use_draft=use_draft)
         return self._matvec_quant(layer_idx, name, x)
@@ -2210,6 +2372,8 @@ def main() -> None:
                         help="Enable activation-sparse GEMV (Tier 3)")
     parser.add_argument("--sparse-threshold", type=float, default=0.01,
                         help="Activation sparsity threshold (default: 0.01)")
+    parser.add_argument("--slim-meta", type=str, default=None,
+                        help="Path to phi4_slim_meta.json for Phase 2 mixed-precision (Profile E)")
     parser.add_argument(
         "--no-weight-cache",
         action="store_true",
@@ -2304,6 +2468,9 @@ def main() -> None:
         sparsity_threshold=args.sparse_threshold,
     )
     store.load()
+    # Phase 2: load SliM metadata if provided
+    if getattr(args, "slim_meta", None):
+        store.load_slim(args.slim_meta)
     t_load = time.perf_counter() - t0
     if getattr(store, "_loaded_from_cache", False):
         print(f"  Weight restore complete in {t_load:.2f}s (persistent cache)")

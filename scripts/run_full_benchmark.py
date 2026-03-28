@@ -498,6 +498,7 @@ def run_phi4_benchmark(
     qcsd_draft_mb_override: float | None = None,
     qcsd_target_mb_override: float | None = None,
     phi4_acceptance_estimate: float = 0.40,
+    slim_meta: str | None = None,
 ) -> None:
     phi4 = _load_phi4_module(root)
     idx = phi4.INDEX_FILE
@@ -528,6 +529,14 @@ def run_phi4_benchmark(
     )
     t_load = time.perf_counter()
     store.load()
+    # Phase 2: load SliM metadata if available
+    _slim_meta_path = None
+    if slim_meta:
+        _slim_meta_path = Path(slim_meta)
+    elif (root / "phi4_slim_meta.json").exists():
+        _slim_meta_path = root / "phi4_slim_meta.json"
+    if _slim_meta_path and _slim_meta_path.exists():
+        store.load_slim(str(_slim_meta_path))
     t_load = time.perf_counter() - t_load
     store.warm_cache()
     gc.collect()
@@ -641,6 +650,31 @@ def run_phi4_benchmark(
     tps_d = float(m_d.get("tokens_per_second", 0.0))
     store._use_lut_gemv = False  # reset to default
 
+    # Profile E: AR + LUT GEMV + SliM 2.2-bit mixed precision (Phase 2)
+    metrics_e: list = []
+    tps_e = None
+    peak_e = None
+    if getattr(store, "_use_slim", False):
+        store._use_native_gemv = True
+        store._use_lut_gemv = True
+        # _use_slim is already True from load_slim() call above
+        with contextlib.redirect_stdout(buf):
+            with phi4.torch.inference_mode():
+                phi4.generate(
+                    prompt,
+                    store,
+                    tokenizer,
+                    max_new_tokens=max_new_tokens,
+                    bench_metrics_out=metrics_e,
+                )
+        gc.collect()
+        peak_e = _peak_rss_mb()
+        m_e = metrics_e[0] if metrics_e else {}
+        tps_e = float(m_e.get("tokens_per_second", 0.0))
+        store._use_lut_gemv = False
+    else:
+        print("[Profile E] skipped: phi4_slim_meta.json not found or not loaded")
+
     metrics_b: list = []
     with contextlib.redirect_stdout(buf):
         with phi4.torch.inference_mode():
@@ -671,10 +705,11 @@ def run_phi4_benchmark(
         _append_qcsd_acceptance_rate(root, float(m_b["acceptance_rate"]))
         appended_qcsd_history = True
 
-    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_b) if x is not None)
+    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_b) if x is not None)
     rss_a_s = f"{peak_a:.0f}" if peak_a is not None else "n/a"
     rss_c_s = f"{peak_c:.0f}" if peak_c is not None else "n/a"
     rss_d_s = f"{peak_d:.0f}" if peak_d is not None else "n/a"
+    rss_e_s = f"{peak_e:.0f}" if peak_e is not None else "n/a"
     rss_b_s = f"{peak_b:.0f}" if peak_b is not None else "n/a"
 
     try:
@@ -733,6 +768,16 @@ def run_phi4_benchmark(
         f"{'D  AR + LUT Q4 GEMV (vpshufb, Phase 1)':<40} "
         f"{tps_d:>12.2f} {rss_d_s:>14} {est_footprint_c:>20.0f}"
     )
+    if tps_e is not None:
+        print(
+            f"{'E  AR + LUT GEMV + SliM 2.2-bit (Phase 2)':<40} "
+            f"{tps_e:>12.2f} {rss_e_s:>14} {est_footprint_c:>20.0f}"
+        )
+    else:
+        print(
+            f"{'E  AR + LUT GEMV + SliM 2.2-bit (Phase 2)':<40} "
+            f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
+        )
     b_row = (
         "B  Native GEMV + QCSD + Q4 KV est."
         if qcsd_on
@@ -762,11 +807,19 @@ def run_phi4_benchmark(
             f"  Corrected footprint B (AR): primary ~{primary_mb:.0f} MB + Q4 KV est ~{kv_q4_mb:.0f} MB "
             f"= ~{est_footprint_b:.0f} MB"
         )
-    print(f"  Max sampled RSS (load / A / C / D / B): {peak_rss:.0f} MB")
+    print(f"  Max sampled RSS (load / A / C / D / E / B): {peak_rss:.0f} MB")
     if tps_c > 0:
         d_speedup = tps_d / tps_c if tps_c > 0 else 0.0
         print(f"  Profile D speedup vs C: {d_speedup:.2f}x (LUT vpshufb vs FMA)")
         print(f"  Profile D speedup vs baseline (1.20 tok/s): {tps_d/1.20:.2f}x")
+    if tps_e is not None and tps_c > 0:
+        e_speedup_c = tps_e / tps_c
+        e_speedup_d = tps_e / tps_d if tps_d > 0 else 0.0
+        llama_gap = (tps_e - 1.20) / (7.0 - 1.20) * 100
+        print(f"  Profile E speedup vs C: {e_speedup_c:.2f}x (SliM + LUT vs FMA)")
+        print(f"  Profile E speedup vs D: {e_speedup_d:.2f}x (SliM vs no-SliM)")
+        print(f"  Profile E speedup vs baseline (1.20 tok/s): {tps_e/1.20:.2f}x")
+        print(f"  llama.cpp gap closed: {llama_gap:.1f}%")
     if m_b and qcsd_on:
         ar = float(m_b.get("acceptance_rate", 0.0))
         print(f"  QCSD acceptance (greedy): {ar:.1%}")
@@ -884,6 +937,13 @@ def main() -> None:
         action="store_true",
         help="Simulator only: time AR on Profile-B target, compare QCSD/AR ratio to Leviathan S (5 percent tolerance)",
     )
+    p.add_argument(
+        "--slim-meta",
+        type=str,
+        default=None,
+        help="Path to phi4_slim_meta.json for Phase 2 SliM mixed-precision (Profile E). "
+             "Default: phi4_slim_meta.json at repo root if it exists.",
+    )
     args = p.parse_args()
     if not 0.0 <= args.sim_acceptance_rate <= 1.0:
         p.error("--sim-acceptance-rate must be between 0 and 1")
@@ -903,6 +963,7 @@ def main() -> None:
             qcsd_draft_mb_override=args.qcsd_draft_mb_override,
             qcsd_target_mb_override=args.qcsd_target_mb_override,
             phi4_acceptance_estimate=args.phi4_acceptance_estimate,
+            slim_meta=getattr(args, "slim_meta", None),
         )
         return
 

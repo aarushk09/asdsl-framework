@@ -1,0 +1,981 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-03-28T02:54:12.905706+00:00",
+  "model": "phi4-14b",
+  "target_avg_bits": 2.2,
+  "achieved_avg_bits": 3.09,
+  "group_size": 32,
+  "calibration_prompts_used": 4,
+  "quick_mode": true,
+  "npz_path": "phi4_slim_meta.npz",
+  "layers": {
+    "0": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 49949,
+        "groups_3bit": 441571,
+        "groups_2bit": 0,
+        "avg_bits": 3.102
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 15902,
+        "groups_3bit": 279010,
+        "groups_2bit": 0,
+        "avg_bits": 3.054
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 129499,
+        "groups_3bit": 1443365,
+        "groups_2bit": 0,
+        "avg_bits": 3.082
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 24563,
+        "groups_3bit": 761869,
+        "groups_2bit": 0,
+        "avg_bits": 3.031
+      }
+    },
+    "1": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 200902,
+        "groups_3bit": 290618,
+        "groups_2bit": 0,
+        "avg_bits": 3.409
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 31665,
+        "groups_3bit": 263247,
+        "groups_2bit": 0,
+        "avg_bits": 3.107
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 390189,
+        "groups_3bit": 1182675,
+        "groups_2bit": 0,
+        "avg_bits": 3.248
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 72684,
+        "groups_3bit": 713748,
+        "groups_2bit": 0,
+        "avg_bits": 3.092
+      }
+    },
+    "2": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 17713,
+        "groups_3bit": 473807,
+        "groups_2bit": 0,
+        "avg_bits": 3.036
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 6346,
+        "groups_3bit": 288566,
+        "groups_2bit": 0,
+        "avg_bits": 3.022
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 40714,
+        "groups_3bit": 1532150,
+        "groups_2bit": 0,
+        "avg_bits": 3.026
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 7627,
+        "groups_3bit": 778805,
+        "groups_2bit": 0,
+        "avg_bits": 3.01
+      }
+    },
+    "3": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 29786,
+        "groups_3bit": 461734,
+        "groups_2bit": 0,
+        "avg_bits": 3.061
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 15458,
+        "groups_3bit": 279454,
+        "groups_2bit": 0,
+        "avg_bits": 3.052
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 83842,
+        "groups_3bit": 1489022,
+        "groups_2bit": 0,
+        "avg_bits": 3.053
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 15623,
+        "groups_3bit": 770809,
+        "groups_2bit": 0,
+        "avg_bits": 3.02
+      }
+    },
+    "4": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "5": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "6": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "7": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "8": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "9": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "10": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "11": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "12": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "13": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "14": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "15": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "16": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "17": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "18": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "19": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "20": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "21": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "22": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "23": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "24": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "25": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "26": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "27": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "28": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "29": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "30": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    },
+    "31": {
+      "qkv_proj": {
+        "n_groups": 491520,
+        "groups_4bit": 491520,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "o_proj": {
+        "n_groups": 294912,
+        "groups_4bit": 294912,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "gate_up_proj": {
+        "n_groups": 1572864,
+        "groups_4bit": 1572864,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      },
+      "down_proj": {
+        "n_groups": 786432,
+        "groups_4bit": 786432,
+        "groups_3bit": 0,
+        "groups_2bit": 0,
+        "avg_bits": 4.0
+      }
+    }
+  },
+  "statistics": {
+    "groups_at_4bit": 89212846,
+    "groups_at_3bit": 11450450,
+    "groups_at_2bit": 0,
+    "total_groups": 100663296,
+    "estimated_model_size_gb": 2.76,
+    "size_reduction_vs_q4_pct": 63.1
+  }
+}

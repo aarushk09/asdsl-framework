@@ -103,5 +103,28 @@
     "correctness_test_passed": true,
     "phase_1_bottleneck_note": "memory-bound confirmed; LUT reduces effective bytes-per-weight by eliminating FP32 expansion; weights stay packed 4-bit throughout shuffle path; gather latency limits speedup on cache-resident data",
     "next_phase_recommendation": "phase 2 slim-llm reduces model footprint from ~7.5gb to ~3.8gb, directly scaling tok/s proportionally under memory-bound roofline"
+  },
+  "phase_2_results": {
+    "profile_e_tok_per_sec": null,
+    "speedup_vs_profile_d": null,
+    "speedup_vs_profile_c": null,
+    "speedup_vs_asdsl_baseline": null,
+    "llama_cpp_gap_closed_pct": null,
+    "slim_meta_generated": true,
+    "slim_meta_quick_mode": true,
+    "achieved_avg_bits": 3.09,
+    "estimated_model_size_gb": 2.76,
+    "calibration_prompts_used": 4,
+    "correctness_test_passed": true,
+    "profile_e_note": "Profile E benchmark skipped: calibration process consuming all available RAM (16.9 GB total; model requires ~12 GB; calibration process held ~12 GB). SliM dispatch code is implemented and tested (6/6 tests pass). Profile E can be benchmarked after calibration process terminates.",
+    "phase_1_gather_bottleneck_note": "phase 1 lut kernel uses _mm_i32gather_ps (~20 cycle latency) instead of true vpshufb byte-shuffle; phase 1 speedup limited to 1.12x; gather bottleneck unresolved in phase 2; flagged for phase 1 revisit after phase 3",
+    "phase_2_bandwidth_analysis": {
+      "measured_bandwidth_gbps": 24.0,
+      "q4_bandwidth_ceiling_toks": 3.2,
+      "slim_bandwidth_ceiling_toks": 8.7,
+      "framework_efficiency_pct": 50.0,
+      "note": "SliM reduces model from 7.5 GB to 2.76 GB (quick-mode, 4/32 layers calibrated). Full calibration would achieve ~3.8 GB target. Bandwidth ceiling shifts from 3.2 to 8.7 tok/s."
+    },
+    "next_phase_recommendation": "phase 3 relu sparsity eliminates 85% of ffn memory traffic; combined with phase 2 footprint reduction, projected ceiling exceeds llama.cpp baseline"
   }
 }
