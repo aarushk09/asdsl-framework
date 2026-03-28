@@ -1,0 +1,43 @@
+  Loading & quantizing 128 projection weights to 4-bit ...
+  (embedding + norms loaded as bfloat16)
+    16/128 (12%)      32/128 (25%)      48/128 (38%)      64/128 (50%)      80/128 (62%)      96/128 (75%)      112/128 (88%)      128/128 (100%)      128/128 (100%)  done.               
+  Caching embed float16 ... done
+[SliM] WARNING: phi4_slim_meta.json was generated in quick mode (only 4 layers calibrated) — using for Profile E anyway
+[SliM] Loaded: 3.09 avg bits, ~2.76 GB estimated size
+  Caching packed Q4 weights (128 tensors, rows×cols/2) ... done (128/128) | 2416 MB
+  QCSD draft bank: 805 MB (2-bit)
+  Inference: native AVX2 GEMV Q4 packed (gemv_q4_packed)
+
+WARNING: QCSD break-even FAIL (Leviathan et al., 2023): expected speedup S=0.458x < 1.01x (enable gate) at alpha=0.143, gamma=7, c=draft/target=0.221 (805.3 MB / 3645.1 MB). Binary-search min alpha for 1.05x (reference) is ~0.636 (raise acceptance or lower c).
+  (Analytical Leviathan S=0.458x; falling back to AR for Profile B.)
+
+========================================================================
+ASDSL full benchmark (Phi-4 local weights)
+========================================================================
+  Native Q4 GEMV (gemv_q4_packed / AVX2): available
+  Threads (OMP / BLAS / torch / native GEMV): 8 (use --threads N to override; 0 = auto, half of logical CPUs)
+  Leviathan gate alpha: 0.143 (history mean over 1 run(s)); CLI prior default if no history: 0.40
+  Load+quantize: 1163.8s  |  primary 4-bit  |  draft 2-bit  |  draft_k=7
+  Weights (reported): ~4450 MB  (draft bank 805 MB)
+  Physical primary breakdown: packed_Q4 1611 MB | uint8_matmul 0 MB | scales+bias 805 MB | embed_f16 1229 MB (packed path avoids 2x uint8 weight expansion for 4-bit)
+
+Profile                                         tok/s  Peak RSS (MB) Corr. footprint (MB)
+----------------------------------------------------------------------------------------
+A  AR + PyTorch matvec + FP32 KV est.            1.23           6473                 3656
+C  AR + Native Q4 GEMV + FP32 KV est.            1.25           6477                 3656
+D  AR + LUT Q4 GEMV (vpshufb, Phase 1)           0.62           6461                 3656
+E  AR + LUT GEMV + SliM 2.2-bit (Phase 2)         0.62           6477                 3656
+B  Native GEMV + AR + Q4 KV est. (QCSD off)         1.25           6470                 3648
+----------------------------------------------------------------------------------------
+  Corrected footprint A: primary+embed ~3645 MB + FP32 KV ~11 MB = ~3656 MB
+  Profile C (native AR): 1.25 tok/s  |  peak RSS ~6477 MB  |  same footprint model as A (~3656 MB est.)
+  Corrected footprint B (AR): primary ~3645 MB + Q4 KV est ~3 MB = ~3648 MB
+  Max sampled RSS (load / A / C / D / E / B): 6477 MB
+  Profile D speedup vs C: 0.49x (LUT vpshufb vs FMA)
+  Profile D speedup vs baseline (1.20 tok/s): 0.51x
+  Profile E speedup vs C: 0.50x (SliM + LUT vs FMA)
+  Profile E speedup vs D: 1.01x (SliM vs no-SliM)
+  Profile E speedup vs baseline (1.20 tok/s): 0.52x
+  llama.cpp gap closed: -9.9%
+  KV column: A and C use FP32 KV geometry; B adds theoretical Q4 KV payload (``KVHistory`` in phi4_cpu_run remains FP32; Q4 is planning/comparison).
+========================================================================

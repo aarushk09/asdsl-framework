@@ -233,6 +233,48 @@ class TestLutGemvCorrectness:
         assert y_lut.shape == (out_f,), f"Wrong output shape: {y_lut.shape}"
         assert not np.any(np.isnan(y_lut)), "LUT output contains NaN"
 
+    def test_tiled_vs_reference(self):
+        """
+        Prerequisite A: tiled LUT kernel (TILE_ROWS=4) vs reference FMA path.
+
+        Uses Phi-4 FFN dimensions (14336×3072) sub-sampled to 32 rows for speed.
+        The tiled kernel must produce output within rtol=0.02, atol=0.05 of
+        the reference dequant_q4_ref path.
+        """
+        out_f, in_f, gs = 32, 3072, 64  # 32 rows (divisible by 4)
+        wp, sc, bi, x = make_test_case(out_f, in_f, gs, seed=777)
+
+        from asdsl.kernels._native_lut import gemv_lut_q4_tiled
+        y_tiled = gemv_lut_q4_tiled(wp, sc, bi, x, out_f, in_f, gs)
+        y_ref = dequant_q4_ref(wp, sc, bi, x, out_f, in_f, gs)
+
+        np.testing.assert_allclose(
+            y_tiled, y_ref, rtol=0.02, atol=0.05,
+            err_msg="Tiled LUT output diverges from reference"
+        )
+
+    def test_tiled_handles_remainder(self):
+        """
+        Prerequisite A remainder: out_features=14 (not divisible by TILE_ROWS=4).
+
+        Rows 12 and 13 fall into the scalar fallback path. Verifies all 14
+        outputs are correct.
+        """
+        out_f, in_f, gs = 14, 128, 32  # 14 rows: 3 tiles of 4 + 2 remainder
+        wp, sc, bi, x = make_test_case(out_f, in_f, gs, seed=321)
+
+        from asdsl.kernels._native_lut import gemv_lut_q4_tiled
+        y_tiled = gemv_lut_q4_tiled(wp, sc, bi, x, out_f, in_f, gs)
+        y_ref = dequant_q4_ref(wp, sc, bi, x, out_f, in_f, gs)
+
+        # All 14 outputs must be correct, including the 2 remainder rows
+        np.testing.assert_allclose(
+            y_tiled, y_ref, rtol=0.02, atol=0.05,
+            err_msg="Tiled LUT remainder rows diverge from reference"
+        )
+        assert y_tiled.shape == (out_f,), f"Wrong shape: {y_tiled.shape}"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+

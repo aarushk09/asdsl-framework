@@ -512,6 +512,15 @@ class WeightStore:
         self._sparse_u8_scratch: np.ndarray | None = None
         self._loaded_from_cache = False
 
+        # Phase 4 Prerequisite B: transposed down_proj weights for column-sparse access
+        # Stored as {layer_idx: {'packed': np.ndarray, 'scales': np.ndarray, 'biases': np.ndarray}}
+        self._down_proj_T: dict = {}
+
+        # Phase 5 EAGLE-3: MTP head for speculative decoding
+        self._use_eagle3: bool = False
+        self._mtp_head: dict | None = None
+        self._last_final_hidden: "np.ndarray | None" = None
+
     # ------------------------------------------------------------------
     def load(self) -> None:
         self._loaded_from_cache = False
@@ -1068,6 +1077,7 @@ class WeightStore:
         """Load FATReLU thresholds from phi4_fatrelu_thresholds.json.
 
         Sets self._use_fatrelu = True and populates self._fatrelu_thresholds.
+        Also triggers transposed down_proj loading (Prerequisite B).
         """
         import json as _json
         thresholds_path = Path(thresholds_path)
@@ -1085,6 +1095,170 @@ class WeightStore:
         sparsity = data.get("target_sparsity", 0.85)
         print(f"[FATReLU] Loaded: {n} layers, mean tau={mean_tau:.4f}, "
               f"target sparsity={sparsity:.0%}")
+
+        # Phase 4 Prerequisite B: build transposed down_proj weights
+        self.load_transposed_down_proj()
+
+    def load_transposed_down_proj(self) -> None:
+        """Build transposed down_proj Q4 weights for column-sparse access.
+
+        Original down_proj: [out_dim=3072, in_dim=8192] Q4 packed row-major.
+        Transposed down_proj: [in_dim=8192, out_dim=3072] Q4 packed row-major.
+
+        With FATReLU 85% sparsity, only ~15% of 8192 intermediate neurons are
+        active. Transposed storage makes each active neuron's contribution a
+        contiguous 3072-element row read (vs column-sparse access in original).
+        Memory traffic: 6.7x reduction for down_proj at 85% sparsity.
+
+        Runs layer-by-layer to stay within ~202 MB peak RAM per layer.
+        """
+        import gc as _gc
+        import psutil as _psutil
+
+        if not self._quant_packed:
+            print("[FATReLU] WARNING: load_transposed_down_proj called before warm_cache — skipping")
+            return
+
+        print("[FATReLU] Building transposed down_proj weights (Prerequisite B)...")
+        n_transposed = 0
+
+        for layer_idx in range(NUM_LAYERS):
+            key = (layer_idx, "down_proj")
+            if key not in self._quant_packed:
+                continue
+
+            # Memory guard
+            avail_gb = _psutil.virtual_memory().available / 1e9
+            if avail_gb < 1.0:
+                _gc.collect()
+                avail_gb = _psutil.virtual_memory().available / 1e9
+                if avail_gb < 0.5:
+                    print(f"[FATReLU] WARNING: Only {avail_gb:.1f} GB available — "
+                          f"stopping transposed load at layer {layer_idx}")
+                    break
+
+            packed_t = self._quant_packed[key]  # [out_dim, in_dim/2] = [3072, 4096]
+            sc_t = self._quant_sc[key]           # [out_dim * n_groups]
+            bi_t = self._quant_bi[key]           # [out_dim * n_groups]
+            out_dim, in_half = packed_t.shape
+            in_dim = in_half * 2  # 8192
+
+            # Dequantize to float32 — one layer at a time (~100 MB)
+            n_groups_per_row = in_dim // self.group_size
+            packed_np = packed_t.numpy().astype(np.uint8)  # [out_dim, in_dim/2]
+
+            # Unpack nibbles to uint8: [out_dim, in_dim]
+            lo = (packed_np & 0x0F).astype(np.float32)  # even cols
+            hi = ((packed_np >> 4) & 0x0F).astype(np.float32)  # odd cols
+            # Interleave: col 2j = lo[j], col 2j+1 = hi[j]
+            w_f32 = np.empty((out_dim, in_dim), dtype=np.float32)
+            w_f32[:, 0::2] = lo
+            w_f32[:, 1::2] = hi
+
+            # Apply scale and bias to get float32 weights
+            sc_np = sc_t.float().numpy().reshape(out_dim, n_groups_per_row)  # [3072, 128]
+            bi_np = bi_t.float().numpy().reshape(out_dim, n_groups_per_row)  # [3072, 128]
+            # Broadcast scale/bias to each group's columns
+            sc_expanded = np.repeat(sc_np, self.group_size, axis=1)  # [3072, 8192]
+            bi_expanded = np.repeat(bi_np, self.group_size, axis=1)  # [3072, 8192]
+            w_f32 = w_f32 * sc_expanded + bi_expanded  # [3072, 8192] dequantized
+
+            del lo, hi, sc_expanded, bi_expanded
+
+            # Transpose: [8192, 3072]
+            w_T_f32 = w_f32.T.copy()  # [in_dim, out_dim] = [8192, 3072]
+            del w_f32
+
+            # Re-quantize transposed weights: [8192 rows, 3072 cols]
+            # Group size along new rows (each row = one intermediate dim, 3072 elements)
+            gs = self.group_size  # 32
+            out_dim_T = w_T_f32.shape[1]  # 3072
+            in_dim_T  = w_T_f32.shape[0]  # 8192
+            n_groups_T_per_row = out_dim_T // gs
+
+            # Quantize row by row (vectorized across rows)
+            # Scale per (in_dim, out_dim/gs) group
+            w_T_reshaped = w_T_f32.reshape(in_dim_T, n_groups_T_per_row, gs)
+            max_abs = np.max(np.abs(w_T_reshaped), axis=2, keepdims=True)  # [8192, 96, 1]
+            max_abs = np.maximum(max_abs, 1e-9)
+            sc_T = (max_abs / 7.5).astype(np.float32).reshape(in_dim_T, n_groups_T_per_row)
+            bi_T_base = (-8.0 * sc_T).astype(np.float32)  # zero_point=8
+
+            # Quantize
+            inv_sc = (7.5 / max_abs.squeeze(2)).astype(np.float32)  # [8192, 96]
+            inv_expanded = np.repeat(inv_sc, gs, axis=1)  # [8192, 3072]
+            w_q = np.clip(
+                np.round(w_T_f32 * inv_expanded + 8.0).astype(np.int32),
+                0, 15
+            ).astype(np.uint8)  # [8192, 3072]
+
+            del w_T_f32, inv_sc, inv_expanded
+
+            # Pack nibbles: [8192, 3072/2]
+            packed_T = (w_q[:, 0::2] | (w_q[:, 1::2] << 4)).astype(np.uint8)  # [8192, 1536]
+            del w_q
+
+            self._down_proj_T[layer_idx] = {
+                'packed': packed_T,                              # [8192, 1536]
+                'scales': sc_T.reshape(in_dim_T * n_groups_T_per_row),   # flat
+                'biases': bi_T_base.reshape(in_dim_T * n_groups_T_per_row),  # flat
+                'in_dim': in_dim_T,   # 8192
+                'out_dim': out_dim_T,  # 3072
+            }
+            n_transposed += 1
+            _gc.collect()
+            if n_transposed % 4 == 0:
+                print(f"  [FATReLU] Transposed {n_transposed}/{NUM_LAYERS} layers...", flush=True)
+
+        print(f"[FATReLU] Transposed down_proj ready: {n_transposed}/{NUM_LAYERS} layers")
+
+    def load_mtp_head(self, path: str = "models/mtp_head.pt") -> bool:
+        """Load EAGLE-3 MTP head checkpoint.
+
+        Returns True if loaded successfully (val_top1 >= 5%), False otherwise.
+        Disabled head: sets _use_eagle3 = False.
+        """
+        import os
+        import torch
+
+        if not os.path.exists(path):
+            print(f"[EAGLE-3] {path} not found — EAGLE-3 disabled")
+            self._use_eagle3 = False
+            return False
+
+        try:
+            ckpt = torch.load(path, map_location="cpu")
+        except Exception as e:
+            print(f"[EAGLE-3] Failed to load {path}: {e}")
+            self._use_eagle3 = False
+            return False
+
+        val_acc = float(ckpt.get("val_top1_accuracy", 0))
+        if val_acc < 5.0:
+            print(f"[EAGLE-3] WARNING: val_top1={val_acc:.1f}% < 5% threshold — "
+                  f"head may be overfit, EAGLE-3 disabled")
+            self._use_eagle3 = False
+            return False
+
+        # Store as float32 numpy for fast inference
+        self._mtp_head = {
+            "fc1_W":   ckpt["fc1_weight"].float().numpy(),    # [1024, 6144]
+            "fc1_b":   ckpt["fc1_bias"].float().numpy(),      # [1024]
+            "norm_W":  ckpt["norm_weight"].float().numpy(),   # [1024]
+            "norm_b":  ckpt["norm_bias"].float().numpy(),     # [1024]
+            "proj_W":  ckpt["proj_weight"].float().numpy(),   # [3072, 1024]
+            "proj_b":  ckpt["proj_bias"].float().numpy(),     # [3072]
+            "hidden_dim_mtp": int(ckpt.get("hidden_dim_mtp", 1024)),
+            "val_acc": val_acc,
+        }
+        self._use_eagle3 = True
+        size_mb = os.path.getsize(path) / 1e6
+        print(f"[EAGLE-3] MTP head loaded ({size_mb:.1f} MB, val_top1={val_acc:.1f}%)")
+        return True
+
+    def _get_token_embedding(self, token_id: int) -> "np.ndarray":
+        """Return float32 token embedding vector [hidden_dim] for EAGLE-3."""
+        return self.embed_f16[token_id].float().numpy().ravel()
 
     def _get_slim_arrays(self, layer_idx: int, name: str):
         """Return (bits_arr, scales_arr, zp_arr) from SliM npz, or None if not found."""
@@ -1180,8 +1354,9 @@ class WeightStore:
 
         repacked = self._get_slim_repacked(layer_idx, name)
         if repacked is None:
-            # Fallback to standard path
-            return self._matvec_q4_packed(layer_idx, name, x)
+            # Uncalibrated layer: fall through to native GEMV (respects _use_lut_gemv).
+            # Previously called _matvec_q4_packed which bypassed LUT and caused -65% vs C.
+            return self._matvec_native_gemv(layer_idx, name, x, use_draft=False)
 
         packed_t, slim_scales, slim_biases = repacked
         rows, cols = self._quant_shapes[(layer_idx, name)]
@@ -1643,13 +1818,30 @@ def forward_layer(
         tau = store._fatrelu_thresholds[layer_idx]
         act = act * (act.abs() >= tau).float()
 
-    # Tier 3: Activation-sparse GEMV for the down projection.
-    # Only worthwhile when sparsity > 80% AND native sparse kernel is available.
-    # Without transposed weight storage, cache-unfriendly column access makes
-    # the sparse path slower than dense unless sparsity is extreme.
-    use_sparse = (store._enable_sparse and not use_draft
-                  and store._use_native_gemv)
-    if use_sparse:
+    # Phase 4 Prerequisite B: use transposed down_proj for column-sparse access
+    # When FATReLU is active and transposed weights are available, use
+    # sparse_down_proj_T for 6.7x memory traffic reduction.
+    use_T_sparse = (store._use_fatrelu and layer_idx in store._down_proj_T
+                    and not use_draft)
+    if use_T_sparse:
+        act_np = act.detach().cpu().float().contiguous().numpy().ravel()
+        active_rows = np.where(np.abs(act_np) > 1e-9)[0].astype(np.int32)
+        if len(active_rows) > 0:
+            try:
+                from asdsl.kernels._native_sparse_gemv import sparse_down_proj_T as _sparse_T
+                dT = store._down_proj_T[layer_idx]
+                y_down_np = _sparse_T(
+                    dT['packed'].ravel(), dT['scales'], dT['biases'],
+                    act_np, active_rows,
+                    dT['in_dim'], dT['out_dim'], store.group_size
+                )
+                hidden = residual + torch.from_numpy(y_down_np).unsqueeze(0)
+            except Exception:
+                hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
+        else:
+            # All zeros: output is zero
+            hidden = residual + torch.zeros(1, HIDDEN, dtype=torch.float32)
+    elif store._enable_sparse and not use_draft and store._use_native_gemv:
         from asdsl.kernels import compute_activation_bitmask
         act_np = act.detach().cpu().float().contiguous().numpy().ravel()
         bitmask, active_indices = compute_activation_bitmask(
@@ -2042,6 +2234,9 @@ def generate_qcsd(
         if not need_logits:
             return None
         hidden = rms_norm(hidden, store.final_norm)
+        # Capture last final hidden for EAGLE-3 MTP draft generation
+        if store._use_eagle3:
+            store._last_final_hidden = hidden.detach().cpu().float().numpy().ravel()
         return store.lm_head_matvec(hidden)
 
     # Prefill with primary model
@@ -2253,6 +2448,287 @@ def generate_qcsd(
                 "qcsd_verify_extra_run_forward": _verify_extra_run_forward,
             }
         )
+
+    return response_text
+
+
+# ---------------------------------------------------------------------------
+# EAGLE-3: MTP head speculative decoding (Profile G)
+# ---------------------------------------------------------------------------
+
+def _run_mtp_draft(
+    store: "WeightStore",
+    current_token_id: int,
+    k: int = 4,
+) -> list[int]:
+    """Run EAGLE-3 MTP head autoregressively for k draft tokens.
+
+    Requires store._use_eagle3 = True and store._last_final_hidden to be set.
+
+    Returns: list of up to k draft token ids.
+    """
+    import numpy as np
+
+    if not store._use_eagle3 or store._mtp_head is None:
+        return []
+
+    head = store._mtp_head
+    fc1_W  = head["fc1_W"]    # [1024, 6144]
+    fc1_b  = head["fc1_b"]    # [1024]
+    norm_W = head["norm_W"]   # [1024]
+    norm_b = head["norm_b"]   # [1024]
+    proj_W = head["proj_W"]   # [3072, 1024]
+    proj_b = head["proj_b"]   # [3072]
+
+    prev_hidden = store._last_final_hidden.copy()  # [3072]
+    cur_tok     = current_token_id
+    drafts: list[int] = []
+
+    for _ in range(k):
+        tok_emb = store._get_token_embedding(cur_tok)          # [3072]
+        x = np.concatenate([prev_hidden, tok_emb])              # [6144]
+
+        # FC1
+        h = x @ fc1_W.T + fc1_b                                # [1024]
+        # LayerNorm
+        mean = h.mean(); std = h.std() + 1e-5
+        h = (h - mean) / std * norm_W + norm_b
+        # GELU approximation
+        h = h * 0.5 * (1.0 + np.tanh(0.7978845608 * (h + 0.044715 * h**3)))
+        # Proj back to PHI4_HIDDEN
+        h_proj = h @ proj_W.T + proj_b                         # [3072]
+
+        # lm_head: use lm_head_matvec (chunked to avoid OOM on vocab projection)
+        import torch
+        h_t = torch.from_numpy(h_proj).float().unsqueeze(0)    # [1, 3072]
+        logits_t = store.lm_head_matvec(h_t)                   # [vocab] or [1, vocab]
+        next_tok = int(logits_t.argmax())
+        drafts.append(next_tok)
+
+        # Update state for next step
+        prev_hidden = h_proj     # reuse proj output as next prev_hidden
+        cur_tok = next_tok
+
+    return drafts
+
+
+def generate_eagle3(
+    prompt: str,
+    store: "WeightStore",
+    tokenizer,
+    max_new_tokens: int = 50,
+    system_prompt: str = "You are a helpful AI assistant.",
+    draft_k: int = 4,
+    bench_metrics_out: list | None = None,
+) -> str:
+    """Generate tokens using EAGLE-3 MTP speculative decoding (Profile G).
+
+    If store._use_eagle3 is False, falls back to standard greedy generation.
+    Draft phase uses _run_mtp_draft() (MTP head) instead of 2-bit draft bank.
+    Verify phase is identical to generate_qcsd: batched forward_layer_batch.
+    """
+    import torch
+
+    if not store._use_eagle3:
+        print("[EAGLE-3] MTP head not loaded — using greedy fallback")
+        return generate(prompt, store, tokenizer, max_new_tokens=max_new_tokens,
+                        system_prompt=system_prompt)
+
+    print("\n" + "=" * 66)
+    print("ASDSL x Phi-4 - EAGLE-3 MTP Speculative Decoding (Profile G)")
+    print("=" * 66)
+    print(f"Prompt : {prompt!r}")
+    print(f"Draft K: {draft_k}  |  val_top1: {store._mtp_head['val_acc']:.1f}%")
+    print("-" * 66)
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+
+    max_seq = len(input_ids) + max_new_tokens + draft_k + 64
+    rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
+    kv_hist = KVHistory(max_seq=max_seq)
+    asdsl_tracker = ASDSLKVTracker()
+
+    def run_forward(token_id: int, pos: int, kv: KVHistory,
+                    need_logits: bool = True) -> "torch.Tensor | None":
+        hidden = store.embed_f16[token_id].float().unsqueeze(0)
+        k_new, v_new = [], []
+        for i in range(NUM_LAYERS):
+            hidden = forward_layer(
+                hidden, i, store, kv, rope_cos, rope_sin, pos)
+            k_np, v_np = kv.get_last_np(i)
+            k_new.append(k_np); v_new.append(v_np)
+        asdsl_tracker.record_token(k_new, v_new)
+        if not need_logits:
+            return None
+        hidden = rms_norm(hidden, store.final_norm)
+        # Update _last_final_hidden for MTP draft
+        store._last_final_hidden = hidden.detach().cpu().float().numpy().ravel()
+        return store.lm_head_matvec(hidden)
+
+    # Prefill
+    print("Prefill: ", end="", flush=True)
+    t_prefill_start = time.perf_counter()
+    with torch.inference_mode():
+        logits = None
+        for pos, tid in enumerate(input_ids):
+            is_last = (pos == len(input_ids) - 1)
+            logits = run_forward(tid, pos, kv_hist, need_logits=is_last)
+    t_prefill = time.perf_counter() - t_prefill_start
+    print(f"done ({len(input_ids)} tokens in {t_prefill:.1f}s)")
+
+    # Decode loop
+    print("\nAssistant: ", end="", flush=True)
+    generated: list[int] = []
+    total_draft = 0
+    total_accepted = 0
+    total_accepted_per_cycle: list[int] = []
+    t_decode_start = time.perf_counter()
+    speculative_cycles = 0
+
+    pos = len(input_ids)
+    with torch.inference_mode():
+        while len(generated) < max_new_tokens:
+            current_token = int(logits.argmax())
+
+            if current_token in EOS_TOKEN_IDS:
+                generated.append(current_token)
+                print(tokenizer.convert_tokens_to_string(
+                    tokenizer.convert_ids_to_tokens([current_token])), end="", flush=True)
+                break
+
+            # ── EAGLE-3 DRAFT PHASE ──────────────────────────────
+            kv_snap = kv_hist.snapshot()
+            draft_start_pos = pos
+            draft_tokens: list[int] = _run_mtp_draft(store, current_token, k=draft_k)
+
+            total_draft += len(draft_tokens)
+            kv_hist.restore(kv_snap)   # draft did not write KV — pure numpy forward
+
+            # ── VERIFY PHASE (BATCHED PRIMARY MODEL) ─────────────
+            L = len(draft_tokens)
+            verify_tokens = [current_token] + draft_tokens[:-1] if L > 0 else [current_token]
+            n_verify = len(verify_tokens)
+
+            hidden_batch = torch.stack(
+                [store.embed_f16[tid].float() for tid in verify_tokens]
+            )
+
+            speculative_cycles += 1
+            for i in range(NUM_LAYERS):
+                hidden_batch = forward_layer_batch(
+                    hidden_batch, i, store, kv_hist, rope_cos, rope_sin, draft_start_pos)
+
+            hidden_batch = rms_norm(hidden_batch, store.final_norm)
+            all_logits = store.lm_head_matmul_batch(hidden_batch)
+
+            # Update _last_final_hidden from last verify position
+            store._last_final_hidden = (
+                hidden_batch[-1].detach().cpu().float().numpy().ravel()
+            )
+
+            # Record KV tracker
+            for vi in range(n_verify):
+                k_new_list, v_new_list = [], []
+                for layer in range(NUM_LAYERS):
+                    cache_idx = kv_hist._len[layer] - n_verify + vi
+                    k_new_list.append(kv_hist.k_buf[layer][cache_idx].numpy())
+                    v_new_list.append(kv_hist.v_buf[layer][cache_idx].numpy())
+                asdsl_tracker.record_token(k_new_list, v_new_list)
+
+            # Emit current_token
+            generated.append(current_token)
+            print(tokenizer.convert_tokens_to_string(
+                tokenizer.convert_ids_to_tokens([current_token])), end="", flush=True)
+
+            # Acceptance check
+            accepted: list[int] = []
+            correction: int | None = None
+            for k_idx in range(L):
+                ref_tok = int(all_logits[k_idx].argmax())
+                if ref_tok == draft_tokens[k_idx]:
+                    accepted.append(draft_tokens[k_idx])
+                else:
+                    correction = ref_tok
+                    break
+
+            stop_decode = False
+            for tok in accepted:
+                generated.append(tok)
+                print(tokenizer.convert_tokens_to_string(
+                    tokenizer.convert_ids_to_tokens([tok])), end="", flush=True)
+                if tok in EOS_TOKEN_IDS:
+                    stop_decode = True; break
+
+            total_accepted += len(accepted)
+            total_accepted_per_cycle.append(len(accepted))
+
+            if stop_decode:
+                break
+
+            # KV alignment
+            if L == 0:
+                logits = all_logits[0]
+                pos += 1
+            elif correction is not None:
+                n_keep = 1 + len(accepted)
+                if n_keep < n_verify:
+                    snap = kv_hist.snapshot()
+                    for layer in range(NUM_LAYERS):
+                        snap["lens"][layer] -= n_verify - n_keep
+                    kv_hist.restore(snap)
+                logits = run_forward(
+                    correction, draft_start_pos + n_keep, kv_hist, need_logits=True)
+                generated.append(correction)
+                print(tokenizer.convert_tokens_to_string(
+                    tokenizer.convert_ids_to_tokens([correction])), end="", flush=True)
+                pos += n_keep + 1
+                if correction in EOS_TOKEN_IDS:
+                    break
+            else:
+                logits = run_forward(
+                    draft_tokens[-1], draft_start_pos + n_verify, kv_hist, need_logits=True)
+                pos += n_verify + 1
+                if draft_tokens[-1] in EOS_TOKEN_IDS:
+                    break
+
+            if len(generated) >= max_new_tokens:
+                generated[:] = generated[:max_new_tokens]
+                break
+
+    t_decode = time.perf_counter() - t_decode_start
+    n_tokens = len(generated)
+    tps = n_tokens / t_decode if t_decode > 0 else 0
+    accept_rate = total_accepted / max(total_draft, 1)
+    mean_acc_per_cycle = (
+        sum(total_accepted_per_cycle) / len(total_accepted_per_cycle)
+        if total_accepted_per_cycle else 0.0
+    )
+
+    response_text = tokenizer.convert_tokens_to_string(
+        tokenizer.convert_ids_to_tokens(generated))
+
+    print(f"\n\nGenerated : {n_tokens} tokens  |  {tps:.2f} tok/s  |  decode {t_decode:.1f}s")
+    print(f"EAGLE-3   : acceptance rate {accept_rate:.1%}  |  "
+          f"mean tokens/cycle {mean_acc_per_cycle:.2f}  |  "
+          f"drafted {total_draft} / accepted {total_accepted}")
+    print("=" * 66)
+
+    if bench_metrics_out is not None:
+        bench_metrics_out.append({
+            "decode_tokens": n_tokens,
+            "decode_s": t_decode,
+            "tokens_per_second": tps,
+            "acceptance_rate": accept_rate,
+            "mean_tokens_accepted_per_cycle": mean_acc_per_cycle,
+            "draft_k": draft_k,
+            "eagle3_speculative_cycles": speculative_cycles,
+        })
 
     return response_text
 

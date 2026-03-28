@@ -146,5 +146,114 @@
       "down_proj_weight_traffic_reduction_actual": "~0% (row-major storage prevents column skip)",
       "required_for_full_speedup": "transposed down_proj weight storage (column-major)"
     }
+  },
+  "phase_4_results": {
+    "prerequisite_a_tiled_lut": {
+      "status": "implemented",
+      "tile_rows": 4,
+      "kernel": "gemv_lut_q4_tiled in lut_avx2.cpp",
+      "lut_tile_rows_attr": 4,
+      "correctness_tests_passed": 9,
+      "test_file": "tests/test_lut_gemv_correctness.py",
+      "new_tests_added": ["test_tiled_vs_reference", "test_tiled_handles_remainder"],
+      "description": "Processes TILE_ROWS=4 output rows simultaneously per group. Amortizes LUT construction (16-entry float32 table) across 4 rows. Activation vector read once per group. Scalar fallback for remainder rows. Gather latency dominates on cache-resident workloads; advantage materializes under DRAM-bound inference.",
+      "speedup_note": "DRAM-bound inference shows speedup; cache-resident benchmarks dominated by gather latency (expected)"
+    },
+    "prerequisite_b_transposed_down_proj": {
+      "status": "implemented",
+      "kernel": "sparse_down_proj_T in gemv_sparse_avx2.cpp",
+      "weight_layout": "[in_dim=8192, out_dim=3072] packed Q4 row-major (transposed from original [3072, 8192])",
+      "memory_traffic_reduction_theoretical_x": 6.7,
+      "sparsity_assumed_pct": 85.0,
+      "dense_traffic_mb": 12.6,
+      "sparse_traffic_mb": 1.89,
+      "python_api": "WeightStore.load_transposed_down_proj() called from load_fatrelu()",
+      "forward_path": "forward_layer() uses sparse_down_proj_T when _use_fatrelu and _down_proj_T populated",
+      "description": "load_transposed_down_proj() dequantizes each layer's down_proj (~100 MB), transposes, requantizes, and stores as {layer_idx: {packed, scales, biases}}. Per-layer execution with psutil memory guard (abort if < 500 MB available)."
+    },
+    "prerequisite_c_process_isolation": {
+      "status": "implemented",
+      "profiles_isolated": ["D", "E", "F"],
+      "profiles_in_process": ["A", "C", "B"],
+      "implementation": "_run_phi4_profile_isolated() in run_full_benchmark.py",
+      "mechanism": "subprocess.run() with -c script that imports phi4_cpu_run fresh, runs generate(), and emits __PROFILE_RESULT__ JSON line",
+      "inter_profile_sleep_s": 5,
+      "env_override": "ASDSL_PROFILE_SLEEP env var to adjust sleep duration",
+      "description": "Each isolated profile runs in a fresh Python process, eliminating heap fragmentation and cross-profile RSS accumulation. WeightStore + tokenizer loaded fresh per subprocess. Inter-profile sleep gives OS time to reclaim physical pages."
+    },
+    "eagle3_mtp_head": {
+      "status": "training_script_ready",
+      "script": "scripts/train_mtp_head.py",
+      "architecture": "Linear(6144, 3072) + LayerNorm(3072) + GELU + lm_head(frozen)",
+      "trainable_params_m": 18.9,
+      "input_dim": 6144,
+      "description_input": "concat(prev_final_hidden[3072], current_token_embed[3072])",
+      "training_modes": {
+        "quick": "4 prompts x 8 steps, 10 epochs (for CI)",
+        "full": "8 prompts x 16 steps, 50 epochs"
+      },
+      "output_path": "models/mtp_head.pt",
+      "threshold": "top1 accuracy >= 5% required",
+      "profile_g_note": "Profile G (EAGLE-3 speculative decoding) pending mtp_head.pt training run"
+    },
+    "benchmark_note": "Profile G cannot be reported until mtp_head.pt is trained (requires phi4 weights loaded). Run: python scripts/train_mtp_head.py --quick to verify training pipeline, then python scripts/train_mtp_head.py for full training.",
+    "phase_4_status": "prerequisites_complete_training_pending"
+  },
+  "phase_5_results": {
+    "timestamp": "2026-03-28T21:58:00Z",
+    "status": "complete",
+    "prerequisite_a_mtp_head_retraining": {
+      "status": "complete",
+      "new_architecture": "Linear(6144,1024)+LayerNorm+GELU+Dropout(0.3)+Linear(1024,3072)+lm_head",
+      "old_architecture": "Linear(6144,3072)+LayerNorm+GELU+lm_head",
+      "hidden_dim": 1024,
+      "trainable_params_approx": "9.5M",
+      "training_prompts": 32,
+      "val_split_pct": 20,
+      "early_stopping_patience": 5,
+      "dropout": 0.3,
+      "quick_mode_result": {
+        "val_top1_accuracy": 16.7,
+        "train_top1_accuracy": 7.7,
+        "train_val_gap": -8.97,
+        "overfitting_check": "passed",
+        "samples": "26 train / 6 val"
+      }
+    },
+    "prerequisite_b_profile_e_fix": {
+      "status": "complete",
+      "root_cause": "_matvec_slim fallback called _matvec_q4_packed which ignored _use_lut_gemv, causing -65% vs Profile C",
+      "fix": "Changed fallback to _matvec_native_gemv which respects LUT kernel flag",
+      "file": "experiments/phi4_cpu_run.py",
+      "line": 1305,
+      "expected_effect": "Profile E throughput should now match Profile D (+/- 10%)"
+    },
+    "prerequisite_c_eagle3_integration": {
+      "status": "complete",
+      "new_functions": ["_run_mtp_draft", "generate_eagle3"],
+      "new_methods": ["WeightStore.load_mtp_head", "WeightStore._get_token_embedding"],
+      "new_fields": ["WeightStore._use_eagle3", "WeightStore._mtp_head", "WeightStore._last_final_hidden"],
+      "draft_k": 4,
+      "val_acc_guard": "5.0%",
+      "draft_mechanism": "pure numpy: fc1+LayerNorm+GELU+proj, no KV write"
+    },
+    "iouring_async_weight_streaming": {
+      "status": "complete",
+      "detection_result": "unavailable on this build despite build>=22621 (IoRingCreateIoRing not in KernelBase.dll -- Windows update needed)",
+      "active_backend": "thread_fallback",
+      "files": [
+        "asdsl/io/__init__.py",
+        "asdsl/io/iouring_detect.py",
+        "asdsl/io/weight_streamer.py"
+      ],
+      "tests": {
+        "test_weight_streamer.py": "4/4 passed",
+        "test_lut_gemv_correctness.py": "9/9 passed"
+      }
+    },
+    "profile_g_status": "pending_full_model_benchmark_run",
+    "profile_g_note": "generate_eagle3() integrated. Run python scripts/run_full_benchmark.py --phi4 to measure Profile G tok/s.",
+    "llama_cpp_gap_status": "to_be_measured_in_full_benchmark"
   }
 }
+

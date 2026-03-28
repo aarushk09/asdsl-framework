@@ -487,6 +487,127 @@ def run_sim_benchmark(
     print("=" * 72)
 
 
+# ---------------------------------------------------------------------------
+# Prerequisite C: subprocess isolation for profiles D, E, F
+# Each profile runs in a fresh Python process to avoid heap fragmentation
+# and cross-profile RSS accumulation.
+# ---------------------------------------------------------------------------
+
+_PROFILE_RUNNER_SCRIPT = '''
+import sys, json, time, gc, os, contextlib, io
+sys.path.insert(0, {root!r})
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_JAX", "0")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+from experiments.phi4_cpu_run import WeightStore, generate
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True)
+
+store = WeightStore(bits={bits}, group_size=None, enable_qcsd=False,
+                   draft_bits=2, enable_sparse=False)
+store.load()
+{setup_code}
+store.warm_cache()
+gc.collect()
+
+store._use_native_gemv = {use_native}
+store._use_lut_gemv = {use_lut}
+store._enable_sparse = {enable_sparse}
+store._sparsity_threshold = {sparsity_threshold}
+
+metrics = []
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    generate({prompt!r}, store, tokenizer,
+             max_new_tokens={max_new_tokens}, bench_metrics_out=metrics)
+
+if metrics:
+    m = metrics[0]
+    print("__PROFILE_RESULT__" + json.dumps({{
+        "tps": float(m.get("tokens_per_second", 0.0)),
+        "rss": None,
+    }}))
+else:
+    print("__PROFILE_RESULT__" + json.dumps({{"tps": 0.0, "rss": None}}))
+'''
+
+
+def _run_phi4_profile_isolated(
+    profile_name: str,
+    root: Path,
+    prompt: str,
+    max_new_tokens: int,
+    primary_bits: int,
+    *,
+    use_native: bool = True,
+    use_lut: bool = False,
+    enable_sparse: bool = False,
+    sparsity_threshold: float = 0.01,
+    needs_slim: bool = False,
+    needs_fatrelu: bool = False,
+    slim_meta_path: str | None = None,
+    fatrelu_path: str | None = None,
+    inter_profile_sleep: float = 5.0,
+) -> tuple[float, None]:
+    """Run a single profile in an isolated subprocess.
+
+    Returns (tps, rss) where rss is None (no cross-process RSS available).
+    """
+    import subprocess
+    import time as _time
+
+    print(f"[Profile {profile_name}] Starting isolated subprocess "
+          f"(sleep {inter_profile_sleep:.0f}s first)...", flush=True)
+    _time.sleep(inter_profile_sleep)
+
+    setup_lines = []
+    if needs_slim and slim_meta_path:
+        setup_lines.append(f"store.load_slim({slim_meta_path!r})")
+    if needs_fatrelu and fatrelu_path:
+        setup_lines.append(f"store.load_fatrelu({fatrelu_path!r})")
+    setup_code = "\n".join(setup_lines)
+
+    script = _PROFILE_RUNNER_SCRIPT.format(
+        root=str(root),
+        bits=primary_bits,
+        setup_code=setup_code,
+        use_native=use_native,
+        use_lut=use_lut,
+        enable_sparse=enable_sparse,
+        sparsity_threshold=sparsity_threshold,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+
+    tps = 0.0
+    marker = "__PROFILE_RESULT__"
+    for line in result.stdout.splitlines():
+        if line.startswith(marker):
+            try:
+                data = json.loads(line[len(marker):])
+                tps = float(data.get("tps", 0.0))
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    if result.returncode != 0:
+        print(f"[Profile {profile_name}] subprocess error (rc={result.returncode}):",
+              file=sys.stderr)
+        print(result.stderr[-2000:] if result.stderr else "(no stderr)", file=sys.stderr)
+
+    print(f"[Profile {profile_name}] isolated result: {tps:.3f} tok/s", flush=True)
+    return tps, None
+
+
 def run_phi4_benchmark(
     root: Path,
     prompt: str,
@@ -641,77 +762,49 @@ def run_phi4_benchmark(
     m_c = metrics_c[0] if metrics_c else {}
     tps_c = float(m_c.get("tokens_per_second", 0.0))
 
-    # Profile D: AR + LUT Q4 GEMV (vpshufb, Phase 1)
-    metrics_d: list = []
-    store._use_native_gemv = True
-    store._use_lut_gemv = True
-    with contextlib.redirect_stdout(buf):
-        with phi4.torch.inference_mode():
-            phi4.generate(
-                prompt,
-                store,
-                tokenizer,
-                max_new_tokens=max_new_tokens,
-                bench_metrics_out=metrics_d,
-            )
-    gc.collect()
-    peak_d = _peak_rss_mb()
-    m_d = metrics_d[0] if metrics_d else {}
-    tps_d = float(m_d.get("tokens_per_second", 0.0))
-    store._use_lut_gemv = False  # reset to default
+    # Profile D: AR + LUT Q4 GEMV (vpshufb, Phase 1) - isolated subprocess
+    tps_d = 0.0
+    peak_d = None
+    _inter_sleep = float(os.environ.get("ASDSL_PROFILE_SLEEP", "5"))
+    tps_d, peak_d = _run_phi4_profile_isolated(
+        "D", root, prompt, max_new_tokens, primary_bits,
+        use_native=True, use_lut=True,
+        enable_sparse=False, sparsity_threshold=0.01,
+        inter_profile_sleep=_inter_sleep,
+    )
+    m_d: dict = {"tokens_per_second": tps_d}
+    store._use_lut_gemv = False  # keep store in-process state clean
 
-    # Profile E: AR + LUT GEMV + SliM 2.2-bit mixed precision (Phase 2)
-    metrics_e: list = []
+    # Profile E: AR + LUT GEMV + SliM 2.2-bit mixed precision (Phase 2) - isolated subprocess
     tps_e = None
     peak_e = None
-    if getattr(store, "_use_slim", False):
-        store._use_native_gemv = True
-        store._use_lut_gemv = True
-        # _use_slim is already True from load_slim() call above
-        with contextlib.redirect_stdout(buf):
-            with phi4.torch.inference_mode():
-                phi4.generate(
-                    prompt,
-                    store,
-                    tokenizer,
-                    max_new_tokens=max_new_tokens,
-                    bench_metrics_out=metrics_e,
-                )
-        gc.collect()
-        peak_e = _peak_rss_mb()
-        m_e = metrics_e[0] if metrics_e else {}
-        tps_e = float(m_e.get("tokens_per_second", 0.0))
-        store._use_lut_gemv = False
+    if getattr(store, "_use_slim", False) and _slim_meta_path:
+        tps_e, peak_e = _run_phi4_profile_isolated(
+            "E", root, prompt, max_new_tokens, primary_bits,
+            use_native=True, use_lut=True,
+            needs_slim=True, slim_meta_path=str(_slim_meta_path),
+            inter_profile_sleep=_inter_sleep,
+        )
+        m_e: dict = {"tokens_per_second": tps_e}
     else:
         print("[Profile E] skipped: phi4_slim_meta.json not found or not loaded")
+        m_e = {}
 
-    # Profile F: AR + Native GEMV + FATReLU 85% sparsity (Phase 3)
-    metrics_f: list = []
+    # Profile F: AR + Native GEMV + FATReLU 85% sparsity (Phase 3) - isolated subprocess
     tps_f = None
     peak_f = None
-    if getattr(store, "_use_fatrelu", False):
-        store._use_native_gemv = True
-        store._use_lut_gemv = False
-        store._enable_sparse = True  # enable sparse GEMV for FATReLU-zeroed activations
-        store._sparsity_threshold = 0.0  # use FATReLU mask (already zeroed), not threshold
-        # _use_fatrelu is already True from load_fatrelu() call above
-        with contextlib.redirect_stdout(buf):
-            with phi4.torch.inference_mode():
-                phi4.generate(
-                    prompt,
-                    store,
-                    tokenizer,
-                    max_new_tokens=max_new_tokens,
-                    bench_metrics_out=metrics_f,
-                )
-        gc.collect()
-        peak_f = _peak_rss_mb()
-        m_f = metrics_f[0] if metrics_f else {}
-        tps_f = float(m_f.get("tokens_per_second", 0.0))
-        store._enable_sparse = False  # reset
-        store._sparsity_threshold = 0.01
+    if getattr(store, "_use_fatrelu", False) and _fatrelu_path:
+        tps_f, peak_f = _run_phi4_profile_isolated(
+            "F", root, prompt, max_new_tokens, primary_bits,
+            use_native=True, use_lut=False,
+            enable_sparse=True, sparsity_threshold=0.0,
+            needs_fatrelu=True, fatrelu_path=str(_fatrelu_path),
+            inter_profile_sleep=_inter_sleep,
+        )
+        m_f: dict = {"tokens_per_second": tps_f}
     else:
         print("[Profile F] skipped: phi4_fatrelu_thresholds.json not found or not loaded")
+        m_f = {}
 
     metrics_b: list = []
     with contextlib.redirect_stdout(buf):

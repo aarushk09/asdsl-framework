@@ -694,6 +694,228 @@ static py::array_t<float> py_lut_matvec(
 }
 
 
+/* ===================================================================
+ * gemv_lut_q4_tiled — 4-row tiled vpshufb LUT GEMV
+ *
+ * Prerequisite A fix: processes TILE_ROWS=4 output rows simultaneously.
+ * Each group builds TILE_ROWS float32 LUTs (one per row in the tile).
+ * The inner loop iterates over the activation vector ONCE per group,
+ * computing 4 dot products in parallel with separate LUT per row.
+ *
+ * Memory traffic (vs single-row path):
+ *   - Weight reads:    same (still row-major, must read each row's weights)
+ *   - Activation read: once per group shared across TILE_ROWS rows
+ *   - LUT builds:      TILE_ROWS per group (vs 1 per group in single-row)
+ *   - Speedup source:  int8 conversion amortized over 4 rows; the LUT
+ *                      float32 computation (lut_f[k] = scale*k) fires
+ *                      out_features times total (amortized by TILE_ROWS).
+ *
+ * L1 fit: TILE_ROWS LUTs = 4 × 16 × 4 bytes = 256 bytes (hot in L1).
+ * OpenMP parallel over tiles for multi-core throughput.
+ * =================================================================== */
+
+#define TILE_ROWS 4
+
+static void gemv_lut_q4_tiled_impl(
+    const uint8_t* __restrict weights_packed,  // [out_features, in_features/2] row-major
+    const float*   __restrict scales,           // [out_features * num_groups]
+    const float*   __restrict biases,           // [out_features * num_groups]
+    const float*   __restrict x,                // [in_features] activation vector
+    float*         __restrict y,                // [out_features] output
+    int            out_features,
+    int            in_features,
+    int            group_size
+) {
+    const int num_groups    = in_features / group_size;
+    const int packed_stride = in_features / 2;  // bytes per row
+    const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+
+    // Precompute sum(x) per group for bias correction
+    std::vector<float> group_sum_x(num_groups);
+    for (int g = 0; g < num_groups; ++g) {
+        const float* xg = x + g * group_size;
+        __m256 acc = _mm256_setzero_ps();
+        for (int j = 0; j < group_size; j += 8) {
+            acc = _mm256_add_ps(acc, _mm256_loadu_ps(xg + j));
+        }
+        group_sum_x[g] = hsum256_ps(acc);
+    }
+
+    const int n_tiles = out_features / TILE_ROWS;
+
+    // Process TILE_ROWS output rows simultaneously
+    #pragma omp parallel for schedule(static)
+    for (int tile = 0; tile < n_tiles; tile++) {
+        int row_base = tile * TILE_ROWS;
+        float acc[TILE_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int g = 0; g < num_groups; ++g) {
+            const int k0   = g * group_size;
+            const int gbase = g;  // scale index offset relative to row start
+
+            // Build TILE_ROWS float32 LUTs — one per row in the tile
+            alignas(16) float lut_f[TILE_ROWS][16];
+            float lut_bias[TILE_ROWS];
+
+            for (int t = 0; t < TILE_ROWS; t++) {
+                int row = row_base + t;
+                int gidx = row * num_groups + g;
+                float s = scales[gidx];
+                float b = biases[gidx];
+                for (int k = 0; k < 16; ++k)
+                    lut_f[t][k] = s * static_cast<float>(k);
+                lut_bias[t] = b;
+            }
+
+            // Read activation slice for this group
+            const uint8_t* gp0 = weights_packed + static_cast<size_t>(row_base + 0) * packed_stride + k0 / 2;
+            const uint8_t* gp1 = weights_packed + static_cast<size_t>(row_base + 1) * packed_stride + k0 / 2;
+            const uint8_t* gp2 = weights_packed + static_cast<size_t>(row_base + 2) * packed_stride + k0 / 2;
+            const uint8_t* gp3 = weights_packed + static_cast<size_t>(row_base + 3) * packed_stride + k0 / 2;
+            const float* xp = x + k0;
+            const int group_bytes = group_size / 2;
+
+            // Accumulators for this group per tile row
+            __m256 dot_acc[TILE_ROWS] = {
+                _mm256_setzero_ps(), _mm256_setzero_ps(),
+                _mm256_setzero_ps(), _mm256_setzero_ps()
+            };
+
+            int j = 0;
+            const uint8_t* gps[TILE_ROWS] = {gp0, gp1, gp2, gp3};
+
+            // Process 8 packed bytes (16 weights) per iteration, per tile row
+            for (; j + 8 <= group_bytes; j += 8) {
+                for (int t = 0; t < TILE_ROWS; t++) {
+                    __m128i packed = _mm_loadl_epi64(
+                        reinterpret_cast<const __m128i*>(gps[t] + j));
+
+                    __m128i lo = _mm_and_si128(packed, nibble_mask);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask);
+                    __m128i interleaved = _mm_unpacklo_epi8(lo, hi);
+
+                    __m128i idx0 = _mm_cvtepu8_epi32(interleaved);
+                    __m128i idx1 = _mm_cvtepu8_epi32(_mm_srli_si128(interleaved, 4));
+                    __m128i idx2 = _mm_cvtepu8_epi32(_mm_srli_si128(interleaved, 8));
+                    __m128i idx3 = _mm_cvtepu8_epi32(_mm_srli_si128(interleaved, 12));
+
+                    __m128 lut0 = _mm_i32gather_ps(lut_f[t], idx0, 4);
+                    __m128 lut1 = _mm_i32gather_ps(lut_f[t], idx1, 4);
+                    __m128 lut2 = _mm_i32gather_ps(lut_f[t], idx2, 4);
+                    __m128 lut3 = _mm_i32gather_ps(lut_f[t], idx3, 4);
+
+                    __m128 x0 = _mm_loadu_ps(xp + j * 2);
+                    __m128 x1 = _mm_loadu_ps(xp + j * 2 + 4);
+                    __m128 x2 = _mm_loadu_ps(xp + j * 2 + 8);
+                    __m128 x3 = _mm_loadu_ps(xp + j * 2 + 12);
+
+                    __m256 prod01 = _mm256_insertf128_ps(
+                        _mm256_castps128_ps256(_mm_mul_ps(lut0, x0)),
+                        _mm_mul_ps(lut1, x1), 1);
+                    __m256 prod23 = _mm256_insertf128_ps(
+                        _mm256_castps128_ps256(_mm_mul_ps(lut2, x2)),
+                        _mm_mul_ps(lut3, x3), 1);
+                    dot_acc[t] = _mm256_add_ps(dot_acc[t], prod01);
+                    dot_acc[t] = _mm256_add_ps(dot_acc[t], prod23);
+                }
+            }
+
+            // Accumulate into per-row result
+            for (int t = 0; t < TILE_ROWS; t++) {
+                float dot = hsum256_ps(dot_acc[t]);
+                // Scalar tail for this row
+                for (int jj = j; jj < group_bytes; ++jj) {
+                    uint8_t byte = gps[t][jj];
+                    dot += lut_f[t][byte & 0x0F]        * xp[jj * 2];
+                    dot += lut_f[t][(byte >> 4) & 0x0F] * xp[jj * 2 + 1];
+                }
+                acc[t] += dot + lut_bias[t] * group_sum_x[g];
+            }
+        }
+
+        for (int t = 0; t < TILE_ROWS; t++)
+            y[row_base + t] = acc[t];
+    }
+
+    // Scalar fallback for remainder rows (out_features % TILE_ROWS != 0)
+    for (int row = n_tiles * TILE_ROWS; row < out_features; row++) {
+        float row_sum = 0.0f;
+        const uint8_t* rp = weights_packed + static_cast<size_t>(row) * packed_stride;
+        for (int g = 0; g < num_groups; ++g) {
+            int k0 = g * group_size;
+            int gidx = row * num_groups + g;
+            float s = scales[gidx];
+            float b = biases[gidx];
+            const uint8_t* gp = rp + k0 / 2;
+            const float*   xp = x + k0;
+            alignas(16) float lut_f[16];
+            for (int k = 0; k < 16; ++k) lut_f[k] = s * static_cast<float>(k);
+            const int group_bytes = group_size / 2;
+            float dot = 0.0f;
+            for (int j = 0; j < group_bytes; ++j) {
+                uint8_t byte = gp[j];
+                dot += lut_f[byte & 0x0F]        * xp[j * 2];
+                dot += lut_f[(byte >> 4) & 0x0F] * xp[j * 2 + 1];
+            }
+            row_sum += dot + b * group_sum_x[g];
+        }
+        y[row] = row_sum;
+    }
+}
+
+
+static py::array_t<float> py_gemv_lut_q4_tiled(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> weights_packed,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> scales,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> biases,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> x,
+    int out_features,
+    int in_features,
+    int group_size
+) {
+    auto wb = weights_packed.request();
+    auto sb = scales.request();
+    auto bb = biases.request();
+    auto xb = x.request();
+
+    if (in_features % group_size != 0)
+        throw std::invalid_argument("in_features must be divisible by group_size");
+    if (group_size % 2 != 0)
+        throw std::invalid_argument("group_size must be even");
+
+    const int num_groups = in_features / group_size;
+    const int64_t expected_w  = static_cast<int64_t>(out_features) * (in_features / 2);
+    const int64_t expected_sg = static_cast<int64_t>(out_features) * num_groups;
+
+    if (wb.size != expected_w)
+        throw std::invalid_argument("weights_packed size mismatch (tiled): expected " +
+            std::to_string(expected_w) + " got " + std::to_string(wb.size));
+    if (sb.size != expected_sg)
+        throw std::invalid_argument("scales size mismatch (tiled)");
+    if (bb.size != expected_sg)
+        throw std::invalid_argument("biases size mismatch (tiled)");
+    if (xb.size != in_features)
+        throw std::invalid_argument("x size mismatch (tiled)");
+
+    auto result = py::array_t<float>(out_features);
+    auto rb = result.request();
+
+    {
+        py::gil_scoped_release release;
+        gemv_lut_q4_tiled_impl(
+            static_cast<const uint8_t*>(wb.ptr),
+            static_cast<const float*>(sb.ptr),
+            static_cast<const float*>(bb.ptr),
+            static_cast<const float*>(xb.ptr),
+            static_cast<float*>(rb.ptr),
+            out_features, in_features, group_size
+        );
+    }
+
+    return result;
+}
+
+
 PYBIND11_MODULE(_native_lut, m) {
     m.doc() = R"doc(
 Native AVX2 LUT builder and matrix-vector multiply for ASDSL.
@@ -778,6 +1000,31 @@ Notes:
         py::arg("group_size") = 32);
 
     m.attr("lut_use_shuffle") = static_cast<bool>(ASDSL_LUT_USE_SHUFFLE);
+    m.attr("lut_tile_rows") = static_cast<int>(TILE_ROWS);
+
+    m.def("gemv_lut_q4_tiled", &py_gemv_lut_q4_tiled,
+        R"doc(
+Tiled LUT-based Q4 GEMV — processes TILE_ROWS=4 output rows simultaneously.
+
+Prerequisite A fix: amortizes LUT construction cost across 4 rows per group,
+reducing effective LUT build overhead by 4×. Activation vector traversed once
+per group (shared across 4 rows). Scalar fallback for remainder rows.
+
+Args:
+    weights_packed: Nibble-packed uint8, shape (out_features * in_features/2,).
+    scales:         Per-group scale factors, shape (out_features * num_groups,).
+    biases:         Per-group biases (= -zero_point * scale), same shape.
+    x:              Activation vector, shape (in_features,), float32.
+    out_features:   Number of output rows (M).
+    in_features:    Number of input columns (K).
+    group_size:     Quantization group size.
+
+Returns:
+    float32 output vector, shape (out_features,).
+)doc",
+        py::arg("weights_packed"), py::arg("scales"), py::arg("biases"),
+        py::arg("x"), py::arg("out_features"), py::arg("in_features"),
+        py::arg("group_size") = 32);
 
 #ifdef _OPENMP
     m.attr("has_openmp") = true;

@@ -1,0 +1,38 @@
+[
+  {
+    "model": "Phi4",
+    "target_model_size_gb": 8.8,
+    "theoretical_limit_tps": 1.2738620939719154,
+    "baseline_tps": 5.217979818737029,
+    "qcsd_tps": 16.843181099176054,
+    "speedup": 3.2279122733849155,
+    "qcsd_vs_theoretical": 13.222138549282707,
+    "acceptance_rate": 0.6551724137931034,
+    "drafted_tokens": 203,
+    "accepted_draft_tokens": 133
+  },
+  {
+    "model": "TinyLlama",
+    "target_model_size_gb": 4.6,
+    "theoretical_limit_tps": 2.436953571076708,
+    "baseline_tps": 9.857191049134272,
+    "qcsd_tps": 29.396119377769605,
+    "speedup": 2.982200429233983,
+    "qcsd_vs_theoretical": 12.062650567766728,
+    "acceptance_rate": 0.6836734693877551,
+    "drafted_tokens": 196,
+    "accepted_draft_tokens": 134
+  },
+  {
+    "model": "Qwen1p5B",
+    "target_model_size_gb": 5.8,
+    "theoretical_limit_tps": 1.9327562805091132,
+    "baseline_tps": 7.4947610683267545,
+    "qcsd_tps": 14.012818891701418,
+    "speedup": 1.869681870302752,
+    "qcsd_vs_theoretical": 7.250173771527085,
+    "acceptance_rate": 0.47876447876447875,
+    "drafted_tokens": 259,
+    "accepted_draft_tokens": 124
+  }
+]

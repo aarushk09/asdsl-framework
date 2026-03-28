@@ -1,0 +1,26 @@
+==================================================================
+ASDSL Phi-4 CPU Inference Setup
+==================================================================
+  Hardware: Intel Core i7 Evo | CPU-only | threads=8
+Loading tokenizer ...
+  Vocabulary size: 200,019
+
+Loading weights (ASDSL 4-bit quantization) ...
+  Restored 128 projection weights from cache (phi4_cpu_70ed9279305b9b1e9ee4f2f48302156f.safetensors, mmap CPU) — skipping shard read/quantize
+  Weight restore complete in 0.10s (persistent cache)
+  Layers ready: 0/32  | Norms ready: 32/32
+  Warm-cache: skipped (restored 128 projections from safetensors cache)
+  Inference: native AVX2 GEMV Q4 packed (gemv_q4_packed)
+  Memory: packed Q4 (1611 MB) + scales/biases (805 MB) + embed_f16 (1229 MB) ~= 3.6 GB
+
+==================================================================
+ASDSL x Phi-4 - CPU Inference
+==================================================================
+Prompt : 'The fundamental theorem of calculus states that'
+------------------------------------------------------------------
+Prefill: done (19 tokens in 17.5s)
+
+Assistant: The fundamental theorem of calculus states that if a function is continuous on an interval [a, b], then it has an antiderivative on that interval. ThisGenerated : 32 tokens  |  1.20 tok/s  |  decode 26.6s
+ASDSL KV  : 51 tokens tracked  | 4/256 blocks  | 13.4 MB
+Weights   : 4-bit ASDSL
+==================================================================
