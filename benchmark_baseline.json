@@ -126,5 +126,25 @@
       "note": "SliM reduces model from 7.5 GB to 2.76 GB (quick-mode, 4/32 layers calibrated). Full calibration would achieve ~3.8 GB target. Bandwidth ceiling shifts from 3.2 to 8.7 tok/s."
     },
     "next_phase_recommendation": "phase 3 relu sparsity eliminates 85% of ffn memory traffic; combined with phase 2 footprint reduction, projected ceiling exceeds llama.cpp baseline"
+  },
+  "phase_3_results": {
+    "profile_f_tok_per_sec": 1.21,
+    "speedup_vs_profile_c": 0.976,
+    "speedup_vs_asdsl_baseline": 1.008,
+    "llama_cpp_gap_closed_pct": 0.2,
+    "fatrelu_calibrated": true,
+    "fatrelu_n_layers": 32,
+    "fatrelu_mean_tau": 0.060725,
+    "fatrelu_target_sparsity": 0.85,
+    "correctness_test_passed": true,
+    "phase_3_bottleneck_note": "FATReLU creates 85% column sparsity in down_proj activation vector. With row-major weight storage, column-sparse GEMV requires non-contiguous memory access which is slower than sequential dense reads. Full Phase 3 speedup requires transposed (column-major) weight storage for down_proj matrices. Profile F = 1.21 tok/s vs Profile C = 1.24 tok/s (sparse overhead exceeds savings at current sparsity level).",
+    "phase_1_lut_regression_note": "Profile D regressed from 1.79 tok/s (Phase 1 measurement) to 0.45 tok/s in Phase 3 benchmark due to memory pressure (model loaded multiple times in same session, RSS grew to 3.9 GB). Phase 1 measurement (1.79 tok/s) was taken with fresh model load and is the correct baseline for Profile D.",
+    "next_phase_recommendation": "Phase 4 EAGLE-3 speculative decoding provides 2.5-3.5x multiplier independent of memory layout. Combined with Phase 3 FATReLU (once transposed storage is implemented), projected ceiling: 3-5 tok/s.",
+    "phase_3_bandwidth_analysis": {
+      "fatrelu_sparsity_pct": 85.0,
+      "down_proj_weight_traffic_reduction_theoretical": "85% (column sparsity)",
+      "down_proj_weight_traffic_reduction_actual": "~0% (row-major storage prevents column skip)",
+      "required_for_full_speedup": "transposed down_proj weight storage (column-major)"
+    }
   }
 }

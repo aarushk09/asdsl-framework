@@ -483,6 +483,9 @@ class WeightStore:
         self._slim_meta = None          # loaded from phi4_slim_meta.json
         self._slim_npz = None           # loaded from phi4_slim_meta.npz
         self._repacked_layers: dict = {}  # lazy per-layer repacked buffers
+        # Phase 3: FATReLU sparsity (Profile F)
+        self._use_fatrelu = False
+        self._fatrelu_thresholds: dict[int, float] = {}  # per-layer tau
 
         # SpQR outlier separation (Tier 1C) — for bits <= 3
         self._outlier_values: dict[tuple, np.ndarray] = {}
@@ -1061,6 +1064,28 @@ class WeightStore:
         size_gb = meta.get("statistics", {}).get("estimated_model_size_gb", "?")
         print(f"[SliM] Loaded: {avg_bits} avg bits, ~{size_gb} GB estimated size")
 
+    def load_fatrelu(self, thresholds_path) -> None:
+        """Load FATReLU thresholds from phi4_fatrelu_thresholds.json.
+
+        Sets self._use_fatrelu = True and populates self._fatrelu_thresholds.
+        """
+        import json as _json
+        thresholds_path = Path(thresholds_path)
+        if not thresholds_path.exists():
+            print(f"[FATReLU] WARNING: {thresholds_path} not found — FATReLU disabled")
+            return
+
+        data = _json.loads(thresholds_path.read_text(encoding="utf-8"))
+        raw = data.get("thresholds", {})
+        self._fatrelu_thresholds = {int(k): float(v) for k, v in raw.items()}
+        self._use_fatrelu = True
+
+        n = len(self._fatrelu_thresholds)
+        mean_tau = sum(self._fatrelu_thresholds.values()) / max(n, 1)
+        sparsity = data.get("target_sparsity", 0.85)
+        print(f"[FATReLU] Loaded: {n} layers, mean tau={mean_tau:.4f}, "
+              f"target sparsity={sparsity:.0%}")
+
     def _get_slim_arrays(self, layer_idx: int, name: str):
         """Return (bits_arr, scales_arr, zp_arr) from SliM npz, or None if not found."""
         if self._slim_npz is None:
@@ -1611,6 +1636,12 @@ def forward_layer(
 
     gu = store.matvec(layer_idx, "gate_up_proj", h, use_draft=use_draft)
     act = silu(gu[:, :INTER]) * gu[:, INTER:]
+
+    # Phase 3: FATReLU threshold mask — zero out elements below tau
+    # This creates 85% sparsity in the FFN intermediate, enabling sparse down_proj.
+    if store._use_fatrelu and layer_idx in store._fatrelu_thresholds:
+        tau = store._fatrelu_thresholds[layer_idx]
+        act = act * (act.abs() >= tau).float()
 
     # Tier 3: Activation-sparse GEMV for the down projection.
     # Only worthwhile when sparsity > 80% AND native sparse kernel is available.
@@ -2374,6 +2405,8 @@ def main() -> None:
                         help="Activation sparsity threshold (default: 0.01)")
     parser.add_argument("--slim-meta", type=str, default=None,
                         help="Path to phi4_slim_meta.json for Phase 2 mixed-precision (Profile E)")
+    parser.add_argument("--fatrelu-thresholds", type=str, default=None,
+                        help="Path to phi4_fatrelu_thresholds.json for Phase 3 sparsity (Profile F)")
     parser.add_argument(
         "--no-weight-cache",
         action="store_true",
@@ -2471,6 +2504,9 @@ def main() -> None:
     # Phase 2: load SliM metadata if provided
     if getattr(args, "slim_meta", None):
         store.load_slim(args.slim_meta)
+    # Phase 3: load FATReLU thresholds if provided
+    if getattr(args, "fatrelu_thresholds", None):
+        store.load_fatrelu(args.fatrelu_thresholds)
     t_load = time.perf_counter() - t0
     if getattr(store, "_loaded_from_cache", False):
         print(f"  Weight restore complete in {t_load:.2f}s (persistent cache)")

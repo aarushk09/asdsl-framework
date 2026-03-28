@@ -450,29 +450,18 @@ static void gemv_lut_q4_avx2_impl(
             const int group_bytes = group_size / 2;
 
 #if ASDSL_LUT_USE_SHUFFLE
-            // ── vpshufb + float32 FMA path ───────────────────────────────────
-            // Use _mm_shuffle_epi8 to extract nibbles in interleaved order,
-            // then use the nibble values as indices into the float32 LUT.
-            // This avoids int8 quantization error entirely.
+            // ── vpshufb nibble extraction + float32 gather LUT path ──────────
+            // Uses _mm_shuffle_epi8 for nibble extraction and interleaving,
+            // then _mm_i32gather_ps for float32 LUT lookup.
+            // This is the Phase 1 implementation — correct and faster than
+            // the reference FMA path on DRAM-bound workloads (model > L3 cache).
+            // On cache-resident data, the gather latency (~20 cycles) dominates.
             //
-            // Strategy:
-            //   1. Load 8 packed bytes (16 nibbles)
-            //   2. Extract lo nibbles (even weights) and hi nibbles (odd weights)
-            //   3. Use _mm_shuffle_epi8 to reorder nibbles into linear weight order
-            //      (w[0],w[1],w[2],...,w[15]) using a fixed permutation mask
-            //   4. Widen nibble bytes to int32 for float32 LUT lookup
-            //   5. Use _mm_i32gather_ps to fetch float32 LUT values
-            //   6. Multiply by activations and accumulate with FMA
-            //
-            // The vpshufb is used for nibble REORDERING (not LUT lookup),
-            // which is its correct use case. The float32 gather provides
-            // exact precision without int8 quantization error.
-            //
-            // Permutation mask for interleaving lo and hi nibbles:
-            // lo has: w[0],w[2],w[4],w[6],w[8],w[10],w[12],w[14] in bytes 0-7
-            // hi has: w[1],w[3],w[5],w[7],w[9],w[11],w[13],w[15] in bytes 0-7
-            // We want: w[0],w[1],w[2],w[3],...,w[15] in bytes 0-15
-            // This is exactly _mm_unpacklo_epi8(lo, hi) for the first 8 bytes.
+            // Note: A true vpshufb-only path (without gather) requires the LUT
+            // to be stored as int8/uint8 values. The uint8 encoding lut_u8[k]=k*17
+            // was tested but found to be slower than the gather path on Raptor Lake
+            // due to the additional unpack+convert instructions. The gather path
+            // is retained as the best available implementation.
 
             __m256 dot_acc256 = _mm256_setzero_ps();
             int j = 0;
@@ -489,8 +478,6 @@ static void gemv_lut_q4_avx2_impl(
                 __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask);
 
                 // Interleave to get linear weight order: w[0],w[1],...,w[15]
-                // unpacklo_epi8(lo, hi) = lo[0],hi[0],lo[1],hi[1],...,lo[7],hi[7]
-                //                      = w[0],w[1],w[2],w[3],...,w[14],w[15]
                 __m128i interleaved = _mm_unpacklo_epi8(lo, hi);
 
                 // Widen nibble indices to int32 for float32 gather (4 at a time)
@@ -499,7 +486,7 @@ static void gemv_lut_q4_avx2_impl(
                 __m128i idx2 = _mm_cvtepu8_epi32(_mm_srli_si128(interleaved, 8));
                 __m128i idx3 = _mm_cvtepu8_epi32(_mm_srli_si128(interleaved, 12));
 
-                // Gather float32 LUT values (exact precision, no int8 error)
+                // Gather float32 LUT values (exact precision)
                 __m128 lut0 = _mm_i32gather_ps(lut_f, idx0, 4);
                 __m128 lut1 = _mm_i32gather_ps(lut_f, idx1, 4);
                 __m128 lut2 = _mm_i32gather_ps(lut_f, idx2, 4);

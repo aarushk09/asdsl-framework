@@ -499,6 +499,7 @@ def run_phi4_benchmark(
     qcsd_target_mb_override: float | None = None,
     phi4_acceptance_estimate: float = 0.40,
     slim_meta: str | None = None,
+    fatrelu_thresholds: str | None = None,
 ) -> None:
     phi4 = _load_phi4_module(root)
     idx = phi4.INDEX_FILE
@@ -537,6 +538,15 @@ def run_phi4_benchmark(
         _slim_meta_path = root / "phi4_slim_meta.json"
     if _slim_meta_path and _slim_meta_path.exists():
         store.load_slim(str(_slim_meta_path))
+
+    # Phase 3: load FATReLU thresholds if available
+    _fatrelu_path = None
+    if fatrelu_thresholds:
+        _fatrelu_path = Path(fatrelu_thresholds)
+    elif (root / "phi4_fatrelu_thresholds.json").exists():
+        _fatrelu_path = root / "phi4_fatrelu_thresholds.json"
+    if _fatrelu_path and _fatrelu_path.exists():
+        store.load_fatrelu(str(_fatrelu_path))
     t_load = time.perf_counter() - t_load
     store.warm_cache()
     gc.collect()
@@ -675,6 +685,34 @@ def run_phi4_benchmark(
     else:
         print("[Profile E] skipped: phi4_slim_meta.json not found or not loaded")
 
+    # Profile F: AR + Native GEMV + FATReLU 85% sparsity (Phase 3)
+    metrics_f: list = []
+    tps_f = None
+    peak_f = None
+    if getattr(store, "_use_fatrelu", False):
+        store._use_native_gemv = True
+        store._use_lut_gemv = False
+        store._enable_sparse = True  # enable sparse GEMV for FATReLU-zeroed activations
+        store._sparsity_threshold = 0.0  # use FATReLU mask (already zeroed), not threshold
+        # _use_fatrelu is already True from load_fatrelu() call above
+        with contextlib.redirect_stdout(buf):
+            with phi4.torch.inference_mode():
+                phi4.generate(
+                    prompt,
+                    store,
+                    tokenizer,
+                    max_new_tokens=max_new_tokens,
+                    bench_metrics_out=metrics_f,
+                )
+        gc.collect()
+        peak_f = _peak_rss_mb()
+        m_f = metrics_f[0] if metrics_f else {}
+        tps_f = float(m_f.get("tokens_per_second", 0.0))
+        store._enable_sparse = False  # reset
+        store._sparsity_threshold = 0.01
+    else:
+        print("[Profile F] skipped: phi4_fatrelu_thresholds.json not found or not loaded")
+
     metrics_b: list = []
     with contextlib.redirect_stdout(buf):
         with phi4.torch.inference_mode():
@@ -705,11 +743,12 @@ def run_phi4_benchmark(
         _append_qcsd_acceptance_rate(root, float(m_b["acceptance_rate"]))
         appended_qcsd_history = True
 
-    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_b) if x is not None)
+    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_f, peak_b) if x is not None)
     rss_a_s = f"{peak_a:.0f}" if peak_a is not None else "n/a"
     rss_c_s = f"{peak_c:.0f}" if peak_c is not None else "n/a"
     rss_d_s = f"{peak_d:.0f}" if peak_d is not None else "n/a"
     rss_e_s = f"{peak_e:.0f}" if peak_e is not None else "n/a"
+    rss_f_s = f"{peak_f:.0f}" if peak_f is not None else "n/a"
     rss_b_s = f"{peak_b:.0f}" if peak_b is not None else "n/a"
 
     try:
@@ -778,6 +817,16 @@ def run_phi4_benchmark(
             f"{'E  AR + LUT GEMV + SliM 2.2-bit (Phase 2)':<40} "
             f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
         )
+    if tps_f is not None:
+        print(
+            f"{'F  AR + Native GEMV + FATReLU 85% (Phase 3)':<40} "
+            f"{tps_f:>12.2f} {rss_f_s:>14} {est_footprint_c:>20.0f}"
+        )
+    else:
+        print(
+            f"{'F  AR + Native GEMV + FATReLU 85% (Phase 3)':<40} "
+            f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
+        )
     b_row = (
         "B  Native GEMV + QCSD + Q4 KV est."
         if qcsd_on
@@ -807,7 +856,7 @@ def run_phi4_benchmark(
             f"  Corrected footprint B (AR): primary ~{primary_mb:.0f} MB + Q4 KV est ~{kv_q4_mb:.0f} MB "
             f"= ~{est_footprint_b:.0f} MB"
         )
-    print(f"  Max sampled RSS (load / A / C / D / E / B): {peak_rss:.0f} MB")
+    print(f"  Max sampled RSS (load / A / C / D / E / F / B): {peak_rss:.0f} MB")
     if tps_c > 0:
         d_speedup = tps_d / tps_c if tps_c > 0 else 0.0
         print(f"  Profile D speedup vs C: {d_speedup:.2f}x (LUT vpshufb vs FMA)")
@@ -944,6 +993,13 @@ def main() -> None:
         help="Path to phi4_slim_meta.json for Phase 2 SliM mixed-precision (Profile E). "
              "Default: phi4_slim_meta.json at repo root if it exists.",
     )
+    p.add_argument(
+        "--fatrelu-thresholds",
+        type=str,
+        default=None,
+        help="Path to phi4_fatrelu_thresholds.json for Phase 3 FATReLU sparsity (Profile F). "
+             "Default: phi4_fatrelu_thresholds.json at repo root if it exists.",
+    )
     args = p.parse_args()
     if not 0.0 <= args.sim_acceptance_rate <= 1.0:
         p.error("--sim-acceptance-rate must be between 0 and 1")
@@ -964,6 +1020,7 @@ def main() -> None:
             qcsd_target_mb_override=args.qcsd_target_mb_override,
             phi4_acceptance_estimate=args.phi4_acceptance_estimate,
             slim_meta=getattr(args, "slim_meta", None),
+            fatrelu_thresholds=getattr(args, "fatrelu_thresholds", None),
         )
         return
 
