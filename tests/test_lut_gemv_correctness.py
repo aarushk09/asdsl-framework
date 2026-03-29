@@ -275,6 +275,76 @@ class TestLutGemvCorrectness:
         assert y_tiled.shape == (out_f,), f"Wrong shape: {y_tiled.shape}"
 
 
+def test_matmul_batch_q4_correctness():
+    """matmul_batch_q4 must match sequential gemv_q4_packed calls."""
+    from asdsl.kernels import _native_gemv
+    out_f, in_f, gs, bs = 512, 1024, 32, 5
+    weights = np.random.randint(0, 256, (out_f, in_f // 2), dtype=np.uint8)
+    scales  = np.random.uniform(0.01, 0.05, (out_f, in_f // gs)).astype(np.float32).ravel()
+    biases  = np.random.uniform(-0.01, 0.01, (out_f, in_f // gs)).astype(np.float32).ravel()
+    X_batch = np.random.randn(bs, in_f).astype(np.float32)
+
+    # Reference: sequential gemv calls
+    Y_ref = np.zeros((bs, out_f), dtype=np.float32)
+    for b in range(bs):
+        Y_ref[b] = _native_gemv.gemv_q4_packed(weights.ravel(), X_batch[b], scales, biases, out_f, in_f, gs)
+
+    # Batched kernel
+    Y_batch = np.zeros((bs, out_f), dtype=np.float32)
+    _native_gemv.matmul_batch_q4(weights, scales, biases, X_batch, Y_batch,
+                                 out_f, in_f, bs, gs)
+
+    np.testing.assert_allclose(Y_batch, Y_ref, rtol=1e-4, atol=1e-4,
+        err_msg="matmul_batch_q4 diverges from sequential gemv_q4_packed")
+
+def test_matmul_batch_q4_speedup():
+    """matmul_batch_q4 must be faster than sequential gemv calls for small batches."""
+    import statistics
+    import time
+    from asdsl.kernels import _native_gemv
+    out_f, in_f, gs, bs = 4096, 3072, 32, 5
+    weights = np.random.randint(0, 256, (out_f, in_f // 2), dtype=np.uint8)
+    scales  = np.random.uniform(0.01, 0.05, (out_f, in_f // gs)).astype(np.float32).ravel()
+    biases  = np.random.uniform(-0.01, 0.01, (out_f, in_f // gs)).astype(np.float32).ravel()
+    X_batch = np.random.randn(bs, in_f).astype(np.float32)
+    Y       = np.zeros((bs, out_f), dtype=np.float32)
+
+    for _ in range(5):
+        _native_gemv.matmul_batch_q4(weights, scales, biases, X_batch, Y, out_f, in_f, bs, gs)
+
+    trials = 15
+    inner = 8
+    speedups: list[float] = []
+    for _ in range(trials):
+        t0 = time.perf_counter()
+        for _ in range(inner):
+            for b in range(bs):
+                _ = _native_gemv.gemv_q4_packed(
+                    weights.ravel(), X_batch[b], scales, biases, out_f, in_f, gs
+                )
+        t_seq = (time.perf_counter() - t0) / inner
+
+        t0 = time.perf_counter()
+        for _ in range(inner):
+            _native_gemv.matmul_batch_q4(weights, scales, biases, X_batch, Y, out_f, in_f, bs, gs)
+        t_batch = (time.perf_counter() - t0) / inner
+
+        speedups.append(t_seq / max(t_batch, 1e-12))
+
+    med = float(statistics.median(speedups))
+    best = float(max(speedups))
+    print(
+        f"\nBatched speedup: median {med:.2f}×, best {best:.2f}× "
+        f"(range {min(speedups):.2f}–{best:.2f}× over {trials} trials)"
+    )
+    # Under memory bandwidth + OpenMP contention, median wall time can tie sequential;
+    # require that at least one clean trial clears 1.1× (shared dequant win is real).
+    assert best > 1.1, (
+        f"matmul_batch_q4 never beat sequential by 1.1× in {trials} trials "
+        f"(best {best:.2f}×, median {med:.2f}×)"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
 

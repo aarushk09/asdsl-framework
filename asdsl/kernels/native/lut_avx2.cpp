@@ -751,7 +751,6 @@ static void gemv_lut_q4_tiled_impl(
 
         for (int g = 0; g < num_groups; ++g) {
             const int k0   = g * group_size;
-            const int gbase = g;  // scale index offset relative to row start
 
             // Build TILE_ROWS float32 LUTs — one per row in the tile
             alignas(16) float lut_f[TILE_ROWS][16];
@@ -775,7 +774,7 @@ static void gemv_lut_q4_tiled_impl(
             const float* xp = x + k0;
             const int group_bytes = group_size / 2;
 
-            // Accumulators for this group per tile row
+            // Same math as gemv_lut_q4_avx2_impl: interleave lo/hi nibbles, gather float LUT
             __m256 dot_acc[TILE_ROWS] = {
                 _mm256_setzero_ps(), _mm256_setzero_ps(),
                 _mm256_setzero_ps(), _mm256_setzero_ps()
@@ -784,12 +783,10 @@ static void gemv_lut_q4_tiled_impl(
             int j = 0;
             const uint8_t* gps[TILE_ROWS] = {gp0, gp1, gp2, gp3};
 
-            // Process 8 packed bytes (16 weights) per iteration, per tile row
             for (; j + 8 <= group_bytes; j += 8) {
                 for (int t = 0; t < TILE_ROWS; t++) {
                     __m128i packed = _mm_loadl_epi64(
                         reinterpret_cast<const __m128i*>(gps[t] + j));
-
                     __m128i lo = _mm_and_si128(packed, nibble_mask);
                     __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask);
                     __m128i interleaved = _mm_unpacklo_epi8(lo, hi);
@@ -820,10 +817,8 @@ static void gemv_lut_q4_tiled_impl(
                 }
             }
 
-            // Accumulate into per-row result
             for (int t = 0; t < TILE_ROWS; t++) {
                 float dot = hsum256_ps(dot_acc[t]);
-                // Scalar tail for this row
                 for (int jj = j; jj < group_bytes; ++jj) {
                     uint8_t byte = gps[t][jj];
                     dot += lut_f[t][byte & 0x0F]        * xp[jj * 2];
@@ -832,12 +827,12 @@ static void gemv_lut_q4_tiled_impl(
                 acc[t] += dot + lut_bias[t] * group_sum_x[g];
             }
         }
-
-        for (int t = 0; t < TILE_ROWS; t++)
+        for (int t = 0; t < TILE_ROWS; t++) {
             y[row_base + t] = acc[t];
+        }
     }
 
-    // Scalar fallback for remainder rows (out_features % TILE_ROWS != 0)
+    // Scalar fallback for remainder rows
     for (int row = n_tiles * TILE_ROWS; row < out_features; row++) {
         float row_sum = 0.0f;
         const uint8_t* rp = weights_packed + static_cast<size_t>(row) * packed_stride;

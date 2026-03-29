@@ -554,6 +554,135 @@ static void validate_gemv_args(
 }
 
 /* ===================================================================
+ * Batched Q4 GEMV: matmul_batch_q4
+ *
+ * Computes Y[b, r] = sum_k  dequant(W[r,k]) * X[b,k]
+ *   for all (b, r) simultaneously.
+ *
+ * KEY PROPERTY: W[r, group_g] is dequantized ONCE for a given output row r
+ * and group g, then accumulated into ALL batch rows b=0..B-1 before moving
+ * to the next group.  This gives a B× reduction in dequantization work vs
+ * calling gemv_q4_packed_impl_v2 B times separately.
+ *
+ * Parallelism: OpenMP over output rows r (each row is independent).
+ *
+ * Weight layout: identical to gemv_q4_packed — low nibble = even column.
+ * Scales/biases: flat row-major [M * n_groups] array.
+ * X_batch: [batch_size, K] row-major float32.
+ * Y_batch: [batch_size, M] row-major float32, CALLER ZERO-INITIALISED.
+ * =================================================================== */
+
+static void matmul_batch_q4_impl(
+    const uint8_t* __restrict w_packed,   // [M, K/2]
+    const float*   __restrict scales,     // [M * (K/group_size)]
+    const float*   __restrict biases,     // [M * (K/group_size)]
+    const float*   __restrict X_batch,    // [B, K]
+    float*         __restrict Y_batch,    // [B, M]  caller zero-init
+    int M, int K, int B, int group_size
+) {
+    const int n_groups     = K / group_size;
+    const int packed_stride = K / 2;   // packed bytes per output row
+
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < M; ++r) {
+        const uint8_t* row_w = w_packed + (size_t)r * packed_stride;
+
+        float acc[64] = {};
+        if (B > 64) {
+            for (int b = 0; b < B; ++b)
+                Y_batch[(size_t)b * M + r] = 0.0f;
+        }
+
+        for (int g = 0; g < n_groups; ++g) {
+            const int k0   = g * group_size;
+            const int gidx = r * n_groups + g;
+            const float sc = scales[gidx];
+            const float bi = biases[gidx];
+
+            const uint8_t* gw = row_w + k0 / 2;
+
+            float group_dot[64] = {};
+
+            for (int j = 0; j < group_size; j += 16) {
+                const uint8_t* pp = gw + j / 2;
+
+                const __m128i nibble_mask_128 = _mm_set1_epi8(0x0F);
+
+                __m128i raw = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pp));
+                __m128i lo = _mm_and_si128(raw, nibble_mask_128);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nibble_mask_128);
+                __m128i vals = _mm_unpacklo_epi8(lo, hi);
+
+                __m256 w_f0 = cvt_lo8_u8_ps(vals);
+                __m256 w_f1 = cvt_lo8_u8_ps(_mm_srli_si128(vals, 8));
+
+                __m256 v_sc = _mm256_set1_ps(sc);
+                __m256 v_bi = _mm256_set1_ps(bi);
+                w_f0 = _mm256_fmadd_ps(w_f0, v_sc, v_bi);
+                w_f1 = _mm256_fmadd_ps(w_f1, v_sc, v_bi);
+
+                for (int b = 0; b < B; ++b) {
+                    const float* xp = X_batch + (size_t)b * K + k0 + j;
+                    __m256 x0 = _mm256_loadu_ps(xp);
+                    __m256 x1 = _mm256_loadu_ps(xp + 8);
+                    __m256 d = _mm256_mul_ps(w_f0, x0);
+                    d = _mm256_fmadd_ps(w_f1, x1, d);
+                    group_dot[b] += hsum256_ps(d);
+                }
+
+                _mm_prefetch(reinterpret_cast<const char*>(pp + 64), _MM_HINT_T0);
+            }
+
+            for (int b = 0; b < B && b < 64; ++b) {
+                acc[b] += group_dot[b];
+            }
+        }
+
+        for (int b = 0; b < B && b < 64; ++b) {
+            Y_batch[(size_t)b * M + r] = acc[b];
+        }
+    }
+}
+
+/* PyBind11 wrapper */
+static void py_matmul_batch_q4(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> w_packed,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> scales,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> biases,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> X_batch,
+    py::array_t<float,   py::array::c_style | py::array::forcecast> Y_batch,
+    int M, int K, int B, int group_size
+) {
+    auto wb = w_packed.request();
+    auto sb = scales.request();
+    auto bb = biases.request();
+    auto xb = X_batch.request();
+    auto yb = Y_batch.request();
+
+    if (xb.ndim != 2 || xb.shape[0] != B || xb.shape[1] != K)
+        throw std::invalid_argument("X_batch must be shape (B, K)");
+    if (yb.ndim != 2 || yb.shape[0] != B || yb.shape[1] != M)
+        throw std::invalid_argument("Y_batch must be shape (B, M), caller zero-init");
+    if (wb.size != (int64_t)M * (K / 2))
+        throw std::invalid_argument("w_packed size must equal M * K/2");
+    if (sb.size != (int64_t)M * (K / group_size))
+        throw std::invalid_argument("scales size must equal M * n_groups");
+    if (bb.size != (int64_t)M * (K / group_size))
+        throw std::invalid_argument("biases size must equal M * n_groups");
+
+    {
+        py::gil_scoped_release release;
+        matmul_batch_q4_impl(
+            static_cast<const uint8_t*>(wb.ptr),
+            static_cast<const float*>(sb.ptr),
+            static_cast<const float*>(bb.ptr),
+            static_cast<const float*>(xb.ptr),
+            static_cast<float*>(yb.ptr),
+            M, K, B, group_size);
+    }
+}
+
+/* ===================================================================
  * pybind11 Bindings
  * =================================================================== */
 
@@ -763,6 +892,27 @@ Packed byte layout: low nibble = even column, high nibble = odd column.
         py::arg("scales"),
         py::arg("rows"),
         py::arg("cols"));
+
+    m.def("matmul_batch_q4", &py_matmul_batch_q4,
+        R"doc(
+Batched Q4 GEMV: dequantize each weight group ONCE, accumulate into all B batch rows.
+
+Args:
+    w_packed:   Packed uint8 weights, shape (M, K/2).
+    scales:     Per-group scales, shape (M * n_groups,) flat row-major.
+    biases:     Per-group biases, shape (M * n_groups,) flat row-major.
+    X_batch:    Input batch, shape (B, K) float32, C-contiguous.
+    Y_batch:    Output batch, shape (B, M) float32, MUST be caller-zero-init.
+    M:          Number of output features (rows in W).
+    K:          Input features (columns in W, must be even).
+    B:          Batch size (number of input vectors); max supported = 64.
+    group_size: Quantization group size (default 32).
+
+Modifies Y_batch in-place (adds to it — caller should zero before calling).
+)doc",
+        py::arg("w_packed"), py::arg("scales"), py::arg("biases"),
+        py::arg("X_batch"), py::arg("Y_batch"),
+        py::arg("M"), py::arg("K"), py::arg("B"), py::arg("group_size") = 32);
 
     m.def("check_avx2", &check_avx2_support,
         "Runtime check: does this CPU support AVX2?");

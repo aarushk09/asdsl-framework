@@ -249,7 +249,7 @@ def gemv_q4_packed(
         if nl is not None:
             try:
                 return np.asarray(
-                    nl.gemv_lut_q4_avx2(w_packed, scales, biases, x, M, K, group_size)
+                    nl.gemv_lut_q4_tiled(w_packed, scales, biases, x, M, K, group_size)
                 )
             except Exception as e:
                 logger.warning("LUT kernel failed (%s), falling back to FMA path", e)

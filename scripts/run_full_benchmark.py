@@ -525,9 +525,10 @@ tokenizer = AutoTokenizer.from_pretrained(
 store = WeightStore(bits={bits}, group_size=None, enable_qcsd=False,
                    draft_bits=2, enable_sparse=False)
 store.load()
-{setup_code}
+{pre_warm_setup}
 store.warm_cache()
 gc.collect()
+{post_warm_setup}
 
 store._use_native_gemv = {use_native}
 store._use_lut_gemv = {use_lut}
@@ -594,14 +595,16 @@ def _run_phi4_profile_isolated(
           f"(sleep {inter_profile_sleep:.0f}s first)...", flush=True)
     _time.sleep(inter_profile_sleep)
 
-    setup_lines = []
+    pre_lines: list[str] = []
+    post_lines: list[str] = []
     if needs_slim and slim_meta_path:
-        setup_lines.append(f"store.load_slim({slim_meta_path!r})")
+        pre_lines.append(f"store.load_slim({slim_meta_path!r})")
     if needs_fatrelu and fatrelu_path:
-        setup_lines.append(f"store.load_fatrelu({fatrelu_path!r})")
+        post_lines.append(f"store.load_fatrelu({fatrelu_path!r})")
     if needs_mtp and mtp_head_path:
-        setup_lines.append(f"store.load_mtp_head({mtp_head_path!r})")
-    setup_code = "\n".join(setup_lines)
+        post_lines.append(f"store.load_mtp_head({mtp_head_path!r})")
+    pre_warm_setup = "\n".join(pre_lines)
+    post_warm_setup = "\n".join(post_lines)
 
     if generate_func == "generate_eagle3":
         generate_call = (
@@ -622,7 +625,8 @@ def _run_phi4_profile_isolated(
     script = _PROFILE_RUNNER_SCRIPT.format(
         root=str(root),
         bits=primary_bits,
-        setup_code=setup_code,
+        pre_warm_setup=pre_warm_setup,
+        post_warm_setup=post_warm_setup,
         use_native=use_native,
         use_lut=use_lut,
         enable_sparse=enable_sparse,
@@ -731,11 +735,11 @@ def run_phi4_benchmark(
         _fatrelu_path = Path(fatrelu_thresholds)
     elif (root / "phi4_fatrelu_thresholds.json").exists():
         _fatrelu_path = root / "phi4_fatrelu_thresholds.json"
-    if _fatrelu_path and _fatrelu_path.exists():
-        store.load_fatrelu(str(_fatrelu_path))
     t_load = time.perf_counter() - t_load
     store.warm_cache()
     gc.collect()
+    if _fatrelu_path and _fatrelu_path.exists():
+        store.load_fatrelu(str(_fatrelu_path))
     peak_load = _peak_rss_mb()
 
     packed_mb = sum(t.nbytes for t in store._quant_packed.values()) / 1e6
@@ -905,20 +909,14 @@ def run_phi4_benchmark(
     if _g_fatrelu is None and (root / "phi4_fatrelu_thresholds.json").exists():
         _g_fatrelu = root / "phi4_fatrelu_thresholds.json"
     g_fr_path = str(_g_fatrelu) if _g_fatrelu and Path(_g_fatrelu).exists() else None
-    g_env: dict[str, str] = {}
+    g_env: dict[str, str] = {"ASDSL_FORCE_EAGLE3": "1"}
+    print(
+        "[Profile G] Leviathan gate BYPASSED for empirical measurement "
+        "(ASDSL_FORCE_EAGLE3=1; full throughput + acceptance capture)",
+        flush=True,
+    )
     if force_eagle3:
-        g_env["ASDSL_FORCE_EAGLE3"] = "1"
-        print(
-            "[WARNING: Leviathan gate bypassed for empirical measurement] (--force-eagle3)",
-            flush=True,
-        )
-    elif not ok_be:
-        g_env["ASDSL_FORCE_EAGLE3"] = "1"
-        print(
-            "[WARNING: Leviathan gate bypassed for empirical measurement] "
-            "(analytical QCSD off for Profile B; still measuring Profile G)",
-            flush=True,
-        )
+        print("  (also requested via --force-eagle3)", flush=True)
     if _mtp_head_path.exists():
         if g_fr_path is None:
             print(

@@ -339,35 +339,33 @@ pytest tests/ -q
 
 ## Benchmark results
 
-Hardware: Intel Core (Raptor Lake class), 12 physical cores, 16.9 GB RAM, Windows, AVX2 (no AVX-512). Threading: 8 OpenMP threads on P-cores where noted in logs.
+Hardware: Intel Core (Raptor Lake, Family 6 Model 186), 12 physical cores, 16.9 GB RAM, AVX2, Windows 11, no GPU. Threading: **8** (`--threads 8`). Table from **Phase 9** (2026-03-29): `python scripts/run_full_benchmark.py --phi4 --max-new-tokens 64 --threads 8 --fatrelu-thresholds phi4_fatrelu_thresholds.json --slim-meta phi4_slim_meta.json` (optional `ASDSL_PROFILE_SLEEP=1` between isolated profiles). Load+quantize ~**950 s** on a cold cache.
 
-The table below mixes the **Phase 7 full-run** measurements (A, D, F, G) with **Phase 1 / prior** entries where a row was missing from the Phase 7 printout. **Phase 8** fixes `forward_layer_batch` so EAGLE-3 verify uses the same FATReLU + transposed `down_proj` path as autoregressive Profile F, restores **LUT + FATReLU** in the isolated Profile G subprocess, and always prints rows **C, E, B** (E may read `skipped` if `phi4_slim_meta.json` is absent). **Re-run** `python scripts/run_full_benchmark.py --phi4 --max-new-tokens 64 --threads 8 --fatrelu-thresholds phi4_fatrelu_thresholds.json --slim-meta phi4_slim_meta.json` after pulling this commit to refresh every cell from one coherent run.
+| Profile | Configuration                             | tok/s | vs A   | vs llama.cpp (~7.0) |
+|---------|-------------------------------------------|-------|--------|---------------------|
+| A       | PyTorch baseline                          | 3.06  | 1.00×  | 0.44×               |
+| C       | Native Q4 GEMV (AVX2 FMA)                | 2.95  | 0.96×  | 0.42×               |
+| D       | LUT vpshufb kernel (tiled path)          | 1.93  | 0.63×  | 0.28×               |
+| E       | SliM 2.2-bit (quick-mode: 4/32 layers)   | 1.55  | 0.51×  | 0.22×               |
+| F       | FATReLU 85% FFN sparsity                 | 3.46  | 1.13×  | 0.49×               |
+| G       | FATReLU + EAGLE-3 speculative (MTP head) | 1.95  | 0.64×  | 0.28×               |
+| B       | Legacy QCSD (2-bit draft bank)           | 0.43  | 0.14×  | 0.06×               |
 
-| Profile | Configuration                            | tok/s | vs llama.cpp (~7.0) |
-|---------|------------------------------------------|-------|----------------------|
-| A       | PyTorch baseline                         | 1.32  | 0.19×                |
-| C       | Native Q4 GEMV (AVX2 FMA)               | 1.60  | 0.23×                |
-| D       | LUT vpshufb kernel                      | 2.88  | 0.41×                |
-| E       | SliM 2.2-bit (quick-mode: 4/32 layers)   | —     | —                    |
-| F       | FATReLU 85% FFN sparsity                | 5.19  | 0.74×                |
-| G       | FATReLU + EAGLE-3 speculative decoding  | 1.76  | 0.25×                |
-| B       | QCSD (legacy draft bank)                | —     | —                    |
+**llama.cpp Q4_K_M reference (same hardware class): ~7.0 tok/s**
 
-**llama.cpp Q4_K_M (same hardware class): ~7.0 tok/s**
+EAGLE-3 acceptance rate: **0.0%** (measured; Leviathan gate **FAIL** at α≈0.636 vs gate α≈0.778 — subprocess used `ASDSL_FORCE_EAGLE3=1` for empirical throughput). Mean tokens accepted per cycle: **0.00**. **0.54 tok/s** remains to match llama.cpp at the best profile (**F** at 3.46 tok/s).
 
-EAGLE-3 acceptance rate: *re-run Profile G after Phase 8 — subprocess JSON and `[Profile G] EAGLE-3 acceptance rate:` report it; Phase 7 did not record it (Phase 8 appends `eagle3_acceptance_rates` to `.qcsd_history.json`).*
+### Performance notes (Phase 9)
 
-### Performance notes (Phase 7 + Phase 8 engineering)
-
-- **Profile F** remains the best non-speculative configuration measured to date (**5.19 tok/s**, ~74% of the llama.cpp reference).
-- **Profile G** at **1.76 tok/s** in Phase 7 indicated that verify was **not** benefiting from FATReLU in `forward_layer_batch`; Phase 8 aligns verify with the sparse `down_proj_T` path and enables LUT in the Profile G subprocess — **expect G to change** on re-benchmark.
-- **Profile C** is the primary control for native GEMV without LUT; **Profile D** isolates the LUT kernel (~1.8× vs C in the Phase 7 log).
+- **Profile F** is the fastest configuration in this run (**3.46 tok/s**); native FMA AR edges PyTorch **A** slightly; LUT **D** is slower than **C** here (gather / memory pattern).
+- **Profile G** does not beat **F** until the MTP draft acceptance is non-zero; ensure `models/mtp_head.pt` is present and trained.
+- **KL vs A** (see `validate_outputs_summary.json`): SliM **E** shows large KL (quick-mode partial calibration); **F** is close; **G** diverges when speculative paths disagree with greedy **A**.
 
 ## Known limitations
 
-- **EAGLE-3 acceptance rate**: The MTP head was trained on a small set (32 prompts × 24 steps in quick training). A large train–val gap limits generalization; more data should raise acceptance and unlock speculative speedup.
-- **SliM calibration**: Quick-mode metadata calibrates only 4/32 layers; full calibration should shrink footprint and raise bandwidth-bound profiles.
-- **Full SliM + FATReLU combined**: Profiles E and F have not been merged into one configuration; stacking both reductions is future work.
+- **EAGLE-3**: Measured **0%** acceptance on this run; train/deploy `models/mtp_head.pt` and widen the training set to raise α before expecting G > F.
+- **SliM calibration**: Quick-mode metadata calibrates only 4/32 layers; full calibration should shrink footprint and may change Profile E quality and speed.
+- **Full SliM + FATReLU combined**: Profiles E and F are separate; stacking both is future work.
 
 ---
 
