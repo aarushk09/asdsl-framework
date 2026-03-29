@@ -1,5 +1,9 @@
 {
   "acceptance_rates": [
     0.14285714285714285
+  ],
+  "eagle3_acceptance_rates": [
+    1.0,
+    1.0
   ]
 }

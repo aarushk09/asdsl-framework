@@ -42,7 +42,7 @@ def _qcsd_history_path(root: Path) -> Path:
     return root / _QCSD_HISTORY_FILENAME
 
 
-def _load_qcsd_acceptance_rates(root: Path) -> list[float]:
+def _load_history_rates(root: Path, key: str = "acceptance_rates") -> list[float]:
     path = _qcsd_history_path(root)
     if not path.is_file():
         return []
@@ -50,7 +50,7 @@ def _load_qcsd_acceptance_rates(root: Path) -> list[float]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return []
-    rates = data.get("acceptance_rates")
+    rates = data.get(key)
     if not isinstance(rates, list):
         return []
     out: list[float] = []
@@ -64,23 +64,38 @@ def _load_qcsd_acceptance_rates(root: Path) -> list[float]:
     return out
 
 
-def _mean_qcsd_acceptance_history(root: Path) -> float | None:
-    rates = _load_qcsd_acceptance_rates(root)
+def _mean_history_rate(root: Path, key: str = "acceptance_rates") -> float | None:
+    rates = _load_history_rates(root, key)
     if not rates:
         return None
     return sum(rates) / len(rates)
 
 
-def _append_qcsd_acceptance_rate(root: Path, rate: float) -> None:
-    """Append one measured QCSD acceptance rate for adaptive Leviathan priors."""
+def _append_history_rate(root: Path, rate: float, key: str = "acceptance_rates") -> None:
+    """Append one measured acceptance rate for adaptive Leviathan priors."""
     path = _qcsd_history_path(root)
-    rates = _load_qcsd_acceptance_rates(root)
+    
+    # Load entire history object to modify specific key
+    if path.is_file():
+        try:
+            full_data = json.loads(path.read_text(encoding="utf-8"))
+        except:
+            full_data = {}
+    else:
+        full_data = {}
+        
+    rates = full_data.get(key, [])
+    if not isinstance(rates, list):
+        rates = []
+        
     r = max(0.0, min(1.0, float(rate)))
     rates.append(r)
     if len(rates) > _QCSD_HISTORY_MAX_ENTRIES:
         rates = rates[-_QCSD_HISTORY_MAX_ENTRIES:]
+    
+    full_data[key] = rates
     path.write_text(
-        json.dumps({"acceptance_rates": rates}, indent=2) + "\n",
+        json.dumps(full_data, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -500,7 +515,7 @@ os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_JAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
-from experiments.phi4_cpu_run import WeightStore, generate
+from experiments.phi4_cpu_run import WeightStore, generate, generate_eagle3
 from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(
@@ -521,7 +536,7 @@ store._sparsity_threshold = {sparsity_threshold}
 metrics = []
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    generate({prompt!r}, store, tokenizer,
+    {generate_func}({prompt!r}, store, tokenizer,
              max_new_tokens={max_new_tokens}, bench_metrics_out=metrics)
 
 if metrics:
@@ -548,8 +563,11 @@ def _run_phi4_profile_isolated(
     sparsity_threshold: float = 0.01,
     needs_slim: bool = False,
     needs_fatrelu: bool = False,
+    needs_mtp: bool = False,
     slim_meta_path: str | None = None,
     fatrelu_path: str | None = None,
+    mtp_head_path: str | None = None,
+    generate_func: str = "generate",
     inter_profile_sleep: float = 5.0,
 ) -> tuple[float, None]:
     """Run a single profile in an isolated subprocess.
@@ -568,6 +586,8 @@ def _run_phi4_profile_isolated(
         setup_lines.append(f"store.load_slim({slim_meta_path!r})")
     if needs_fatrelu and fatrelu_path:
         setup_lines.append(f"store.load_fatrelu({fatrelu_path!r})")
+    if needs_mtp and mtp_head_path:
+        setup_lines.append(f"store.load_mtp_head({mtp_head_path!r})")
     setup_code = "\n".join(setup_lines)
 
     script = _PROFILE_RUNNER_SCRIPT.format(
@@ -580,6 +600,7 @@ def _run_phi4_profile_isolated(
         sparsity_threshold=sparsity_threshold,
         prompt=prompt,
         max_new_tokens=max_new_tokens,
+        generate_func=generate_func,
     )
 
     result = subprocess.run(
@@ -695,13 +716,25 @@ def run_phi4_benchmark(
         if qcsd_draft_mb_override is not None
         else draft_mb
     )
-    hist_rates = _load_qcsd_acceptance_rates(root)
+    # Adaptive Leviathan gate logic (D3)
+    _mtp_head_path = root / "models" / "mtp_head.pt"
+    if _mtp_head_path.exists():
+        # Profile G (EAGLE-3) mode available
+        hist_rates = _load_history_rates(root, key="eagle3_acceptance_rates")
+        prior_alpha = 0.65  # Higher prior for EAGLE-3
+        alpha_key = "eagle3_acceptance_rates"
+    else:
+        # Standard QCSD mode
+        hist_rates = _load_history_rates(root, key="acceptance_rates")
+        prior_alpha = phi4_acceptance_estimate # usually 0.40
+        alpha_key = "acceptance_rates"
+
     if hist_rates:
         alpha_for_leviathan = sum(hist_rates) / len(hist_rates)
-        alpha_gate_src = f"history mean over {len(hist_rates)} run(s)"
+        alpha_gate_src = f"history mean over {len(hist_rates)} run(s) [{alpha_key}]"
     else:
-        alpha_for_leviathan = phi4_acceptance_estimate
-        alpha_gate_src = "prior (no .qcsd_history.json)"
+        alpha_for_leviathan = prior_alpha
+        alpha_gate_src = f"prior (no {alpha_key} in .qcsd_history.json)"
     if store._enable_qcsd:
         ok_be, warn_be, s_phi = _qcsd_break_even_ok(
             alpha_for_leviathan, draft_k, draft_check_mb, target_w_mb
@@ -806,6 +839,25 @@ def run_phi4_benchmark(
         print("[Profile F] skipped: phi4_fatrelu_thresholds.json not found or not loaded")
         m_f = {}
 
+    # Profile G: Native GEMV + FATReLU + EAGLE-3 MTP Speculative Decoding (Phase 5) - isolated subprocess
+    tps_g = None
+    peak_g = None
+    _mtp_head_path = root / "models" / "mtp_head.pt"
+    if _mtp_head_path.exists():
+        tps_g, peak_g = _run_phi4_profile_isolated(
+            "G", root, prompt, max_new_tokens, primary_bits,
+            use_native=True, use_lut=False,
+            enable_sparse=True, sparsity_threshold=0.0,
+            needs_fatrelu=True, fatrelu_path=str(_fatrelu_path) if _fatrelu_path else None,
+            needs_mtp=True, mtp_head_path=str(_mtp_head_path),
+            generate_func="generate_eagle3",
+            inter_profile_sleep=_inter_sleep,
+        )
+        m_g: dict = {"tokens_per_second": tps_g}
+    else:
+        print("[Profile G] skipped: models/mtp_head.pt not found")
+        m_g = {}
+
     metrics_b: list = []
     with contextlib.redirect_stdout(buf):
         with phi4.torch.inference_mode():
@@ -833,15 +885,17 @@ def run_phi4_benchmark(
 
     appended_qcsd_history = False
     if qcsd_on and m_b.get("acceptance_rate") is not None:
-        _append_qcsd_acceptance_rate(root, float(m_b["acceptance_rate"]))
+        _hkey = "eagle3_acceptance_rates" if _mtp_head_path.exists() else "acceptance_rates"
+        _append_history_rate(root, float(m_b["acceptance_rate"]), key=_hkey)
         appended_qcsd_history = True
 
-    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_f, peak_b) if x is not None)
+    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_f, peak_g, peak_b) if x is not None)
     rss_a_s = f"{peak_a:.0f}" if peak_a is not None else "n/a"
     rss_c_s = f"{peak_c:.0f}" if peak_c is not None else "n/a"
     rss_d_s = f"{peak_d:.0f}" if peak_d is not None else "n/a"
     rss_e_s = f"{peak_e:.0f}" if peak_e is not None else "n/a"
     rss_f_s = f"{peak_f:.0f}" if peak_f is not None else "n/a"
+    rss_g_s = f"{peak_g:.0f}" if peak_g is not None else "n/a"
     rss_b_s = f"{peak_b:.0f}" if peak_b is not None else "n/a"
 
     try:
@@ -918,6 +972,16 @@ def run_phi4_benchmark(
     else:
         print(
             f"{'F  AR + Native GEMV + FATReLU 85% (Phase 3)':<40} "
+            f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
+        )
+    if tps_g is not None:
+        print(
+            f"{'G  Profile F + EAGLE-3 MTP (Phase 5)':<40} "
+            f"{tps_g:>12.2f} {rss_g_s:>14} {est_footprint_c:>20.0f}"
+        )
+    else:
+        print(
+            f"{'G  Profile F + EAGLE-3 MTP (Phase 5)':<40} "
             f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
         )
     b_row = (

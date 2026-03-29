@@ -738,7 +738,9 @@ class WeightStore:
         x_np = x.detach().cpu().float().contiguous().numpy().ravel()
         sc_np = sc.detach().cpu().float().contiguous().numpy()
         bi_np = bi.detach().cpu().float().contiguous().numpy()
-        out_np = gemv_q4_packed(w_np, x_np, sc_np, bi_np, rows, cols, gs)
+        out_np = gemv_q4_packed(
+            w_np, x_np, sc_np, bi_np, rows, cols, gs, use_lut=self._use_lut_gemv
+        )
         result = torch.from_numpy(out_np).unsqueeze(0)
         outlier_store = (
             self._draft_outlier_values if use_draft else self._outlier_values
@@ -1256,6 +1258,52 @@ class WeightStore:
         print(f"[EAGLE-3] MTP head loaded ({size_mb:.1f} MB, val_top1={val_acc:.1f}%)")
         return True
 
+    def matmul_batch(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
+        """Batched matrix multiplication y = x @ W.T with lazy dequantization cache.
+
+        The dequantized weight is cached in _tmp_dequant_cache for the duration of
+        a speculative verify pass (32 layers × N weights per layer).  Call
+        clear_tmp_cache() once after the entire decode loop to free memory.
+        """
+        key = (layer_idx, name)
+        if key not in self._quant_shapes:
+            w = self.get_weight(layer_idx, name)
+            return torch.matmul(x, w.T)
+
+        if not hasattr(self, "_tmp_dequant_cache"):
+            self._tmp_dequant_cache = {}
+
+        if key not in self._tmp_dequant_cache:
+            rows, cols = self._quant_shapes[key]
+            packed_t = self._quant_packed[key]
+            sc_t = self._quant_sc[key]
+            bi_t = self._quant_bi[key]
+
+            # 4-bit dequantization
+            packed_np = packed_t.numpy().astype(np.uint8)
+            lo = (packed_np & 0x0F).astype(np.float32)
+            hi = ((packed_np >> 4) & 0x0F).astype(np.float32)
+            w_f32 = np.empty((rows, cols), dtype=np.float32)
+            w_f32[:, 0::2] = lo
+            w_f32[:, 1::2] = hi
+
+            n_groups = cols // self.group_size
+            sc_np = sc_t.float().numpy().reshape(rows, n_groups)
+            bi_np = bi_t.float().numpy().reshape(rows, n_groups)
+            sc_exp = np.repeat(sc_np, self.group_size, axis=1)
+            bi_exp = np.repeat(bi_np, self.group_size, axis=1)
+            w_f32 = w_f32 * sc_exp + bi_exp
+
+            w_f32_t = torch.from_numpy(w_f32).to(x.device, dtype=x.dtype)
+            self._tmp_dequant_cache[key] = w_f32_t
+
+        return torch.mm(x, self._tmp_dequant_cache[key].T)
+
+    def clear_tmp_cache(self) -> None:
+        """Clear the temporary dequantized weight cache to release memory."""
+        if hasattr(self, "_tmp_dequant_cache"):
+            self._tmp_dequant_cache.clear()
+
     def _get_token_embedding(self, token_id: int) -> "np.ndarray":
         """Return float32 token embedding vector [hidden_dim] for EAGLE-3."""
         return self.embed_f16[token_id].float().numpy().ravel()
@@ -1350,12 +1398,13 @@ class WeightStore:
 
     def _matvec_slim(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
         """SliM mixed-precision GEMV: uses calibrated scales from phi4_slim_meta."""
+        import time
+        t_start = time.perf_counter()
         from asdsl.kernels import gemv_q4_packed
 
         repacked = self._get_slim_repacked(layer_idx, name)
+        t_repack = time.perf_counter()
         if repacked is None:
-            # Uncalibrated layer: fall through to native GEMV (respects _use_lut_gemv).
-            # Previously called _matvec_q4_packed which bypassed LUT and caused -65% vs C.
             return self._matvec_native_gemv(layer_idx, name, x, use_draft=False)
 
         packed_t, slim_scales, slim_biases = repacked
@@ -1365,12 +1414,22 @@ class WeightStore:
         x_np = x.detach().cpu().float().contiguous().numpy().ravel()
         sc_np = slim_scales.float().numpy()
         bi_np = slim_biases.float().numpy()
+        t_arrays = time.perf_counter()
 
         out_np = gemv_q4_packed(
             w_np, x_np, sc_np, bi_np, rows, cols, self.group_size,
             use_lut=self._use_lut_gemv,
         )
-        return torch.from_numpy(np.asarray(out_np, dtype=np.float32)).unsqueeze(0)
+        t_gemv = time.perf_counter()
+        res = torch.from_numpy(np.asarray(out_np, dtype=np.float32)).unsqueeze(0)
+        t_end = time.perf_counter()
+        
+        # Only print once to avoid console spam
+        if not hasattr(self, "_printed_slim_profile"):
+            print(f"[Slim_Prof] repack: {(t_repack-t_start)*1000:.3f}ms  arrays: {(t_arrays-t_repack)*1000:.3f}ms  gemv: {(t_gemv-t_arrays)*1000:.3f}ms  tensor: {(t_end-t_gemv)*1000:.3f}ms")
+            self._printed_slim_profile = True
+            
+        return res
 
     def matvec(self, layer_idx: int, name: str, x: torch.Tensor,
                use_draft: bool = False) -> torch.Tensor:
@@ -1383,6 +1442,41 @@ class WeightStore:
         if self._use_native_gemv or use_draft:
             return self._matvec_native_gemv(layer_idx, name, x, use_draft=use_draft)
         return self._matvec_quant(layer_idx, name, x)
+
+    def _get_token_embedding(self, token_id: int) -> np.ndarray:
+        """Returns the float32 embedding vector for a token as a numpy array."""
+        return self.embed_f16[token_id].float().cpu().numpy().ravel()
+
+    def load_mtp_head(self, path: str) -> None:
+        """Load trained MTP head for EAGLE-3 speculative decoding (Profile G)."""
+        import torch
+        import os
+        from pathlib import Path
+        path_p = Path(path)
+        if not path_p.exists():
+            print(f"[EAGLE-3] MTP head not found at {path} — disabling.")
+            self._use_eagle3 = False
+            return
+
+        try:
+            ckpt = torch.load(str(path_p), map_location="cpu", weights_only=False)
+            val_acc = ckpt.get("val_top1_accuracy", 0.0)
+            
+            # Map checkpoint keys to names used in _run_mtp_draft
+            self._mtp_head = {
+                "fc1_W": ckpt["fc1_weight"].float().numpy(),
+                "fc1_b": ckpt["fc1_bias"].float().numpy(),
+                "norm_W": ckpt["norm_weight"].float().numpy(),
+                "norm_b": ckpt["norm_bias"].float().numpy(),
+                "proj_W": ckpt["proj_weight"].float().numpy(),
+                "proj_b": ckpt["proj_bias"].float().numpy(),
+                "val_acc": val_acc
+            }
+            self._use_eagle3 = True
+            print(f"[EAGLE-3] Loaded MTP head from {path} (val_acc={val_acc:.1f}%)")
+        except Exception as e:
+            print(f"[EAGLE-3] Error loading MTP head from {path}: {e}")
+            self._use_eagle3 = False
 
     def lm_head_matvec(self, hidden: torch.Tensor) -> torch.Tensor:
         """Compute logits = hidden @ lm_head.T with chunked f16 reads.
@@ -1431,6 +1525,20 @@ class WeightStore:
             has_gemv = False
 
         self._use_native_gemv = has_gemv
+
+        # Phase 4 Prerequisite B: build transposed down_proj weights
+        if getattr(self, "_use_fatrelu", False):
+            self.load_transposed_down_proj()
+
+        # Phase 2 SliM: pre-repack calibrated arrays
+        if getattr(self, "_use_slim", False):
+            import time as _time
+            print("  [SliM] Pre-repacking arrays for calibrated layers...")
+            t0 = _time.time()
+            for i in range(NUM_LAYERS):
+                for name in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
+                    self._get_slim_repacked(i, name)
+            print(f"  [SliM] Repacking done in {_time.time()-t0:.2f}s")
 
         if getattr(self, "_loaded_from_cache", False):
             total = NUM_LAYERS * 4
@@ -1646,6 +1754,8 @@ class WeightStore:
                 print(f"  Inference: native AVX2 GEMV {kl}")
             else:
                 print(f"  Inference: chunked uint8 dequant+matvec (in-place, no AVX GEMV)")
+
+        # (Initialization moved up above the early return to fix benchmarking)
 
     def get_norm(self, layer_idx: int, name: str) -> torch.Tensor:
         return self.layer_norms[layer_idx][name]
@@ -2316,6 +2426,7 @@ def generate_qcsd(
                     hidden_batch, i, store, kv_hist,
                     rope_cos, rope_sin, draft_start_pos,
                 )
+            store.clear_tmp_cache()
 
             hidden_batch = rms_norm(hidden_batch, store.final_norm)
             all_logits = store.lm_head_matmul_batch(hidden_batch)
