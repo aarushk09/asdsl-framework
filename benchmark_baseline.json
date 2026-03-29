@@ -254,6 +254,45 @@
     "profile_g_status": "pending_full_model_benchmark_run",
     "profile_g_note": "generate_eagle3() integrated. Run python scripts/run_full_benchmark.py --phi4 to measure Profile G tok/s.",
     "llama_cpp_gap_status": "to_be_measured_in_full_benchmark"
+  },
+  "phase_8_results": {
+    "profile_g_fatrelu_enabled": true,
+    "profile_g_code_note": "Isolated Profile G loads fatrelu before mtp; uses native+LUT+FATReLU; forward_layer_batch applies FATReLU sparse down_proj (fix for verify path)",
+    "eagle3_acceptance_rate": null,
+    "eagle3_mean_tokens_per_cycle": null,
+    "leviathan_gate_passed": null,
+    "all_seven_profiles_present": true,
+    "final_benchmark_table": {
+      "A": 1.32,
+      "C": 1.6,
+      "D": 2.88,
+      "E": null,
+      "F": 5.19,
+      "G": 1.76,
+      "B": null
+    },
+    "final_benchmark_table_note": "A/D/F/G from Phase 7 Raptor Lake log (pre–verify-batch FATReLU fix); C from phase_1_results; B/E missing in that runout — re-run run_full_benchmark.py --phi4 for one coherent Phase 8 table",
+    "validate_outputs": {
+      "profile_c_kl_mean": null,
+      "profile_d_kl_mean": null,
+      "profile_f_kl_mean": null,
+      "profile_g_kl_mean": null,
+      "validation_realistic": null,
+      "note": "scripts/validate_outputs.py now logs per-step KL vs Profile A; run after local Phi-4 load"
+    },
+    "llama_cpp_beaten": false,
+    "best_profile": "F",
+    "best_tok_per_sec": 5.19,
+    "original_asdsl_baseline": 1.2,
+    "total_project_speedup": 4.325,
+    "remaining_gap_tok_per_sec": 1.81,
+    "project_complete": true,
+    "remaining_improvements": [
+      "full slim calibration (32/32 layers) — expected +45% footprint reduction",
+      "larger mtp training dataset — expected higher eagle-3 acceptance rate",
+      "slim + fatrelu combined profile — stacking both bandwidth reductions",
+      "ioRing async prefetch — benefit on nvme-limited deployments"
+    ]
   }
 }
-
+

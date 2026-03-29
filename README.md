@@ -36,7 +36,7 @@ This is **not** a single monolithic “drop a `.pyd` and forget Python” engine
 |--------|------|
 | **`experiments/phi4_cpu_run.py`** | End-to-end Phi-4 text inference: load local `safetensors`, ASDSL quantize projections, `KVHistory`, RoPE, GQA, MLP, greedy `generate`, optional **QCSD** (`generate_qcsd`). |
 | **`asdsl/kernels/`** | Python APIs (`gemv_q4_packed`, etc.) plus optional **native** modules (`_native_gemv`, `_native_forward`, …) compiled from `asdsl/kernels/native/*.cpp` and `forward_loop.cpp`. |
-| **`scripts/run_full_benchmark.py`** | **Simulator** mode (no weights) or **`--phi4`** mode: three-way throughput table (Profiles **A / C / B**), Leviathan QCSD gate, optional history-backed α, RSS and footprint telemetry. |
+| **`scripts/run_full_benchmark.py`** | **Simulator** mode (no weights) or **`--phi4`** mode: seven-row throughput table (Profiles **A, C, D, E, F, G, B**), Leviathan QCSD gate, optional history-backed α, RSS and footprint telemetry. |
 | **`asdsl/speculative/`** | Dual-model / simulated speculative decoding helpers used by benchmarks and tests. |
 
 If the native extensions are not built, ASDSL falls back to **NumPy** or **PyTorch** paths where implemented; behavior remains correct but slower.
@@ -334,6 +334,40 @@ python scripts/run_full_benchmark.py --phi4 --max-new-tokens 64 --threads 0
 ```bash
 pytest tests/ -q
 ```
+
+---
+
+## Benchmark results
+
+Hardware: Intel Core (Raptor Lake class), 12 physical cores, 16.9 GB RAM, Windows, AVX2 (no AVX-512). Threading: 8 OpenMP threads on P-cores where noted in logs.
+
+The table below mixes the **Phase 7 full-run** measurements (A, D, F, G) with **Phase 1 / prior** entries where a row was missing from the Phase 7 printout. **Phase 8** fixes `forward_layer_batch` so EAGLE-3 verify uses the same FATReLU + transposed `down_proj` path as autoregressive Profile F, restores **LUT + FATReLU** in the isolated Profile G subprocess, and always prints rows **C, E, B** (E may read `skipped` if `phi4_slim_meta.json` is absent). **Re-run** `python scripts/run_full_benchmark.py --phi4 --max-new-tokens 64 --threads 8 --fatrelu-thresholds phi4_fatrelu_thresholds.json --slim-meta phi4_slim_meta.json` after pulling this commit to refresh every cell from one coherent run.
+
+| Profile | Configuration                            | tok/s | vs llama.cpp (~7.0) |
+|---------|------------------------------------------|-------|----------------------|
+| A       | PyTorch baseline                         | 1.32  | 0.19×                |
+| C       | Native Q4 GEMV (AVX2 FMA)               | 1.60  | 0.23×                |
+| D       | LUT vpshufb kernel                      | 2.88  | 0.41×                |
+| E       | SliM 2.2-bit (quick-mode: 4/32 layers)   | —     | —                    |
+| F       | FATReLU 85% FFN sparsity                | 5.19  | 0.74×                |
+| G       | FATReLU + EAGLE-3 speculative decoding  | 1.76  | 0.25×                |
+| B       | QCSD (legacy draft bank)                | —     | —                    |
+
+**llama.cpp Q4_K_M (same hardware class): ~7.0 tok/s**
+
+EAGLE-3 acceptance rate: *re-run Profile G after Phase 8 — subprocess JSON and `[Profile G] EAGLE-3 acceptance rate:` report it; Phase 7 did not record it (Phase 8 appends `eagle3_acceptance_rates` to `.qcsd_history.json`).*
+
+### Performance notes (Phase 7 + Phase 8 engineering)
+
+- **Profile F** remains the best non-speculative configuration measured to date (**5.19 tok/s**, ~74% of the llama.cpp reference).
+- **Profile G** at **1.76 tok/s** in Phase 7 indicated that verify was **not** benefiting from FATReLU in `forward_layer_batch`; Phase 8 aligns verify with the sparse `down_proj_T` path and enables LUT in the Profile G subprocess — **expect G to change** on re-benchmark.
+- **Profile C** is the primary control for native GEMV without LUT; **Profile D** isolates the LUT kernel (~1.8× vs C in the Phase 7 log).
+
+## Known limitations
+
+- **EAGLE-3 acceptance rate**: The MTP head was trained on a small set (32 prompts × 24 steps in quick training). A large train–val gap limits generalization; more data should raise acceptance and unlock speculative speedup.
+- **SliM calibration**: Quick-mode metadata calibrates only 4/32 layers; full calibration should shrink footprint and raise bandwidth-bound profiles.
+- **Full SliM + FATReLU combined**: Profiles E and F have not been merged into one configuration; stacking both reductions is future work.
 
 ---
 

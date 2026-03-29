@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -30,7 +31,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable, Any
 
 # Suppress TensorFlow / JAX import attempts in transformers (they're incompatible
 # with NumPy 2.x on this machine and aren't needed for text-only inference).
@@ -74,6 +75,16 @@ def set_thread_count(n: int) -> None:
         os.environ[var] = str(n)
     torch.set_num_threads(n)
     _configure_cpu_torch_runtime()
+    
+    # Force process affinity to n cores (if they are 0..n-1, usually P-cores)
+    try:
+        import psutil
+        p = psutil.Process()
+        # On this 4P+8E machine, 0-7 are the hyperthreaded P-cores
+        p.cpu_affinity(list(range(min(n, 16))))
+    except ImportError:
+        pass
+        
     try:
         from asdsl.kernels import _native_gemv as _ng
 
@@ -250,8 +261,13 @@ def try_restore_weight_cache(store: WeightStore, path: Path) -> bool:
                 store._quant_packed[(i, nm)] = tensors[pk].reshape(r, c // 2)
             elif uk in fk:
                 store._quant_u8[(i, nm)] = tensors[uk].reshape(r, c)
+                store._quant_u8_np[(i, nm)] = store._quant_u8[(i, nm)].numpy().ravel()
             else:
                 return False
+            
+            store._quant_packed_np[(i, nm)] = store._quant_packed[(i, nm)].numpy().ravel() if (i, nm) in store._quant_packed else None
+            store._quant_sc_np[(i, nm)] = store._quant_sc[(i, nm)].float().numpy().ravel()
+            store._quant_bi_np[(i, nm)] = store._quant_bi[(i, nm)].float().numpy().ravel()
 
         if store._enable_qcsd:
             for (i, nm) in shapes.keys():
@@ -271,8 +287,13 @@ def try_restore_weight_cache(store: WeightStore, path: Path) -> bool:
                         store._draft_quant_u8[(i, nm)] = raw.reshape(r, c)
                     else:
                         store._draft_quant_u8[(i, nm)] = raw
+                    store._draft_quant_u8_np[(i, nm)] = store._draft_quant_u8[(i, nm)].numpy().ravel()
                 else:
                     return False
+                
+                store._draft_quant_packed_np[(i, nm)] = store._draft_quant_packed[(i, nm)].numpy().ravel() if (i, nm) in store._draft_quant_packed else None
+                store._draft_quant_sc_np[(i, nm)] = store._draft_quant_sc[(i, nm)].float().numpy().ravel()
+                store._draft_quant_bi_np[(i, nm)] = store._draft_quant_bi[(i, nm)].float().numpy().ravel()
                 dov_k = f"dov_{i}_{nm}"
                 if dov_k in fk:
                     ov = tensors[dov_k].numpy()
@@ -424,6 +445,8 @@ def silu(x: torch.Tensor) -> torch.Tensor:
 # Target chunk size for streaming dequant+BLAS matvec.
 # Each chunk must fit in CPU L2/L3 cache to avoid redundant DRAM traffic.
 _TARGET_CHUNK_BYTES = 8 * 1024 * 1024  # 8 MB – fits L3 comfortably
+_POOL_SIZE = 128 * 1024 * 1024  # 128 MB scratch pool for verify batch dequant
+
 
 
 class WeightStore:
@@ -467,12 +490,32 @@ class WeightStore:
         self.lm_head: torch.Tensor | None = None
         self.final_norm: torch.Tensor | None = None
         self._weight_cache: dict[tuple, torch.Tensor] = {}
+        self._dequant_cache: dict[tuple, torch.Tensor] = {}
+        self._in_verify_phase = False
         self._quant_u8: dict[tuple, torch.Tensor] = {}
-        # bits==4 primary: packed uint8 (rows, cols // 2), no pre-unpacked expansion.
         self._quant_packed: dict[tuple, torch.Tensor] = {}
         self._quant_sc: dict[tuple, torch.Tensor] = {}
         self._quant_bi: dict[tuple, torch.Tensor] = {}
         self._quant_shapes: dict[tuple, tuple] = {}
+        
+        # Pre-cached numpy views for fast dispatch
+        self._quant_packed_np: dict[tuple, np.ndarray] = {}
+        self._quant_u8_np: dict[tuple, np.ndarray] = {}
+        self._quant_sc_np: dict[tuple, np.ndarray] = {}
+        self._quant_bi_np: dict[tuple, np.ndarray] = {}
+        
+        self._draft_quant_packed: dict[tuple, torch.Tensor] = {}
+        self._draft_quant_packed_np: dict[tuple, np.ndarray] = {}
+        self._draft_quant_u8: dict[tuple, torch.Tensor] = {}
+        self._draft_quant_u8_np: dict[tuple, np.ndarray] = {}
+        self._draft_quant_sc: dict[tuple, torch.Tensor] = {}
+        self._draft_quant_sc_np: dict[tuple, np.ndarray] = {}
+        self._draft_quant_bi: dict[tuple, torch.Tensor] = {}
+        self._draft_quant_bi_np: dict[tuple, np.ndarray] = {}
+
+        # Chunked matmul buffer
+        self._pool = torch.empty(_POOL_SIZE, dtype=torch.uint8)
+
 
         # Native LUT/GEMV fast path
         self._use_native_gemv = False
@@ -520,6 +563,15 @@ class WeightStore:
         self._use_eagle3: bool = False
         self._mtp_head: dict | None = None
         self._last_final_hidden: "np.ndarray | None" = None
+
+    def enter_verify_phase(self) -> None:
+        """Enable temporary dequantization caching for the speculative verify phase."""
+        self._in_verify_phase = True
+
+    def exit_verify_phase(self) -> None:
+        """Clear and disable the temporary dequantization cache."""
+        self._dequant_cache.clear()
+        self._in_verify_phase = False
 
     # ------------------------------------------------------------------
     def load(self) -> None:
@@ -723,21 +775,20 @@ class WeightStore:
         from asdsl.kernels import gemv_q4_packed
 
         key = (layer_idx, name)
-        if use_draft and key in self._draft_quant_packed:
-            w_t = self._draft_quant_packed[key]
-            sc = self._draft_quant_sc[key]
-            bi = self._draft_quant_bi[key]
+        if use_draft and key in self._draft_quant_packed_np:
+            w_np = self._draft_quant_packed_np[key]
+            sc_np = self._draft_quant_sc_np[key]
+            bi_np = self._draft_quant_bi_np[key]
             gs = self._draft_group_size
         else:
-            w_t = self._quant_packed[key]
-            sc = self._quant_sc[key]
-            bi = self._quant_bi[key]
+            w_np = self._quant_packed_np[key]
+            sc_np = self._quant_sc_np[key]
+            bi_np = self._quant_bi_np[key]
             gs = self.group_size
+            
         rows, cols = self._quant_shapes[key]
-        w_np = w_t.numpy().reshape(-1)
         x_np = x.detach().cpu().float().contiguous().numpy().ravel()
-        sc_np = sc.detach().cpu().float().contiguous().numpy()
-        bi_np = bi.detach().cpu().float().contiguous().numpy()
+        
         out_np = gemv_q4_packed(
             w_np, x_np, sc_np, bi_np, rows, cols, gs, use_lut=self._use_lut_gemv
         )
@@ -943,11 +994,16 @@ class WeightStore:
         x_flat = X_batch.reshape(-1, cols).float()
         k_batch = x_flat.shape[0]
 
-        if self._use_native_gemv:
-            w_np = packed.detach().cpu().numpy().reshape(-1)
-            x_np = x_flat.detach().cpu().float().contiguous().numpy()
-            sc_np = sc.detach().cpu().float().contiguous().numpy()
-            bi_np = bi.detach().cpu().float().contiguous().numpy()
+        if self._use_native_gemv and not self._in_verify_phase:
+            w_np = self._quant_packed_np.get(key)
+            if w_np is None:
+                w_np = packed.detach().cpu().numpy().reshape(-1)
+                self._quant_packed_np[key] = w_np
+                
+            x_np = x_flat.detach().cpu().numpy()
+            sc_np = self._quant_sc_np[key]
+            bi_np = self._quant_bi_np[key]
+            
             out_np = gemv_q4_packed(
                 w_np, x_np, sc_np, bi_np, rows, cols, self.group_size,
                 use_lut=self._use_lut_gemv,
@@ -977,16 +1033,28 @@ class WeightStore:
             end = min(start + chunk_rows, rows)
             n = end - start
             flat_len = n * cols
-            buf = self._pool[:flat_len]
-            chunk_packed = packed_np[start:end].reshape(-1)
-            unpacked = _unpack_bits(chunk_packed, 4)[: n * cols]
-            buf.copy_(torch.from_numpy(unpacked.astype(np.uint8)))
-            vals = buf.view(n, groups_per_row, self.group_size)
-            gs = start * groups_per_row
-            ge = end * groups_per_row
-            vals.mul_(sc[gs:ge].float().view(n, groups_per_row, 1))
-            vals.add_(bi[gs:ge].float().view(n, groups_per_row, 1))
-            torch.mm(vals.view(n, cols), x_flat.T, out=result[start:end, :])
+            
+            cache_key = (key, start, end, "f32")
+            if self._in_verify_phase and cache_key in self._dequant_cache:
+                vals_f32 = self._dequant_cache[cache_key]
+            else:
+                chunk_packed = packed_np[start:end].reshape(-1)
+                unpacked = _unpack_bits(chunk_packed, 4)[: n * cols]
+                w_indices = torch.from_numpy(unpacked.astype(np.uint8))
+                
+                buf = self._pool[:flat_len]
+                buf.copy_(w_indices)
+                vals = buf.view(n, groups_per_row, self.group_size)
+                gs = start * groups_per_row
+                ge = end * groups_per_row
+                vals_f32 = vals.mul(sc[gs:ge].float().view(n, groups_per_row, 1))
+                vals_f32.add_(bi[gs:ge].float().view(n, groups_per_row, 1))
+                vals_f32 = vals_f32.view(n, cols).clone() # detach from pool
+                
+                if self._in_verify_phase:
+                    self._dequant_cache[cache_key] = vals_f32
+
+            torch.mm(vals_f32, x_flat.T, out=result[start:end, :])
 
         return result.T.view(*X_batch.shape[:-1], rows)
 
@@ -1259,50 +1327,65 @@ class WeightStore:
         return True
 
     def matmul_batch(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
-        """Batched matrix multiplication y = x @ W.T with lazy dequantization cache.
+        """Batched matrix multiplication y = x @ W.T.
 
-        The dequantized weight is cached in _tmp_dequant_cache for the duration of
-        a speculative verify pass (32 layers × N weights per layer).  Call
-        clear_tmp_cache() once after the entire decode loop to free memory.
+        Fast path: calls native ``matmul_batch_q4`` which dequantizes each weight
+        group exactly once and applies it to all B batch rows — O(B) work vs O(B²)
+        for B separate dequant+GEMV calls.  No float32 weight matrix is ever
+        materialised in memory.
+
+        Fallback: standard float32 dequant + numpy MM (slow; only when native ext
+        is unavailable).
         """
         key = (layer_idx, name)
         if key not in self._quant_shapes:
             w = self.get_weight(layer_idx, name)
             return torch.matmul(x, w.T)
 
-        if not hasattr(self, "_tmp_dequant_cache"):
-            self._tmp_dequant_cache = {}
+        rows, cols = self._quant_shapes[key]
+        packed_np = self._quant_packed[key].numpy()   # uint8 [rows, cols/2]
+        sc_np     = self._quant_sc[key].float().numpy().ravel()   # [rows * n_groups]
+        bi_np     = self._quant_bi[key].float().numpy().ravel()   # [rows * n_groups]
 
-        if key not in self._tmp_dequant_cache:
-            rows, cols = self._quant_shapes[key]
-            packed_t = self._quant_packed[key]
-            sc_t = self._quant_sc[key]
-            bi_t = self._quant_bi[key]
+        x_np = x.float().numpy()   # [B, cols]
+        B    = x_np.shape[0]
 
-            # 4-bit dequantization
-            packed_np = packed_t.numpy().astype(np.uint8)
-            lo = (packed_np & 0x0F).astype(np.float32)
-            hi = ((packed_np >> 4) & 0x0F).astype(np.float32)
-            w_f32 = np.empty((rows, cols), dtype=np.float32)
-            w_f32[:, 0::2] = lo
-            w_f32[:, 1::2] = hi
+        # --- Native fast path ---
+        try:
+            from asdsl.kernels import _native_gemv as _ng_local  # type: ignore
+            if hasattr(_ng_local, "matmul_batch_q4"):
+                Y = np.zeros((B, rows), dtype=np.float32)
+                _ng_local.matmul_batch_q4(
+                    np.ascontiguousarray(packed_np, dtype=np.uint8),
+                    np.ascontiguousarray(sc_np, dtype=np.float32),
+                    np.ascontiguousarray(bi_np, dtype=np.float32),
+                    np.ascontiguousarray(x_np, dtype=np.float32),
+                    Y,
+                    rows, cols, B, self.group_size,
+                )
+                return torch.from_numpy(Y).to(x.dtype)
+        except (ImportError, AttributeError):
+            pass
 
-            n_groups = cols // self.group_size
-            sc_np = sc_t.float().numpy().reshape(rows, n_groups)
-            bi_np = bi_t.float().numpy().reshape(rows, n_groups)
-            sc_exp = np.repeat(sc_np, self.group_size, axis=1)
-            bi_exp = np.repeat(bi_np, self.group_size, axis=1)
-            w_f32 = w_f32 * sc_exp + bi_exp
-
-            w_f32_t = torch.from_numpy(w_f32).to(x.device, dtype=x.dtype)
-            self._tmp_dequant_cache[key] = w_f32_t
-
-        return torch.mm(x, self._tmp_dequant_cache[key].T)
+        # --- Fallback: float32 dequant + numpy MM ---
+        n_groups = cols // self.group_size
+        packed_u8 = packed_np.astype(np.uint8)
+        lo = (packed_u8 & 0x0F).astype(np.float32)
+        hi = ((packed_u8 >> 4) & 0x0F).astype(np.float32)
+        w_f32 = np.empty((rows, cols), dtype=np.float32)
+        w_f32[:, 0::2] = lo
+        w_f32[:, 1::2] = hi
+        sc_2d = sc_np.reshape(rows, n_groups)
+        bi_2d = bi_np.reshape(rows, n_groups)
+        sc_exp = np.repeat(sc_2d, self.group_size, axis=1)
+        bi_exp = np.repeat(bi_2d, self.group_size, axis=1)
+        w_f32 = w_f32 * sc_exp + bi_exp
+        result = (x_np @ w_f32.T).astype(np.float32)
+        return torch.from_numpy(result).to(x.dtype)
 
     def clear_tmp_cache(self) -> None:
-        """Clear the temporary dequantized weight cache to release memory."""
-        if hasattr(self, "_tmp_dequant_cache"):
-            self._tmp_dequant_cache.clear()
+        """No-op: retained for API compatibility; native path has no cache."""
+        pass
 
     def _get_token_embedding(self, token_id: int) -> "np.ndarray":
         """Return float32 token embedding vector [hidden_dim] for EAGLE-3."""
@@ -1604,6 +1687,11 @@ class WeightStore:
                         self._quant_sc[key] = sc
                         self._quant_bi[key] = bi
 
+                        # Populate NumPy views for fast native dispatch
+                        self._quant_packed_np[key] = packed_np.ravel()
+                        self._quant_sc_np[key] = sc.numpy().ravel()
+                        self._quant_bi_np[key] = bi.numpy().ravel()
+
                         if self._enable_qcsd and "_draft_" + name in self.layers.get(i, {}):
                             qt_d = self.layers[i]["_draft_" + name]
                             d_numel = rows * cols
@@ -1634,6 +1722,12 @@ class WeightStore:
                                 d_bi = (-d_zr * d_sc).to(torch.float32)
                             self._draft_quant_sc[key] = d_sc
                             self._draft_quant_bi[key] = d_bi
+                            self._draft_quant_sc_np[key] = d_sc.numpy().ravel()
+                            self._draft_quant_bi_np[key] = d_bi.numpy().ravel()
+                            if key in self._draft_quant_packed:
+                                self._draft_quant_packed_np[key] = self._draft_quant_packed[key].numpy().ravel()
+                            if key in self._draft_quant_u8:
+                                self._draft_quant_u8_np[key] = self._draft_quant_u8[key].numpy().ravel()
 
                         done += 1
 
@@ -1808,6 +1902,11 @@ class KVHistory:
         for i, n in snap["lens"].items():
             self._len[i] = n
 
+    def restore_len(self, n: int) -> None:
+        """Truncate KV cache to exactly n tokens (zero-copy rollback)."""
+        for i in range(NUM_LAYERS):
+            self._len[i] = n
+
     @property
     def num_tokens(self) -> int:
         return self._len[0]
@@ -1827,6 +1926,7 @@ class ASDSLKVTracker:
             head_dim=HEAD_DIM,
             max_blocks=256,
             block_size=16,
+            quantize_kv=False,
         )
         self._cache = BlockSparseKVCache(cfg)
 
@@ -2042,7 +2142,42 @@ def forward_layer_batch(
     gu = store.matmul_batch(layer_idx, "gate_up_proj", h)
     act = silu(gu[:, :INTER]) * gu[:, INTER:]
 
-    hidden_batch = residual + store.matmul_batch(layer_idx, "down_proj", act)
+    # FATReLU + transposed sparse down_proj (must match forward_layer for EAGLE-3 / QCSD verify)
+    if store._use_fatrelu and layer_idx in store._fatrelu_thresholds:
+        tau = store._fatrelu_thresholds[layer_idx]
+        act = act * (act.abs() >= tau).float()
+
+    use_T_sparse = store._use_fatrelu and layer_idx in store._down_proj_T
+    if use_T_sparse:
+        try:
+            from asdsl.kernels._native_sparse_gemv import sparse_down_proj_T as _sparse_T
+
+            dT = store._down_proj_T[layer_idx]
+            act_np_all = act.detach().cpu().float().numpy()
+            outs: list[torch.Tensor] = []
+            for ki in range(K):
+                act_np = act_np_all[ki].ravel()
+                active_rows = np.where(np.abs(act_np) > 1e-9)[0].astype(np.int32)
+                if len(active_rows) > 0:
+                    y_down_np = _sparse_T(
+                        dT["packed"].ravel(),
+                        dT["scales"],
+                        dT["biases"],
+                        act_np,
+                        active_rows,
+                        dT["in_dim"],
+                        dT["out_dim"],
+                        store.group_size,
+                    )
+                    outs.append(torch.from_numpy(y_down_np).unsqueeze(0))
+                else:
+                    outs.append(torch.zeros(1, HIDDEN, dtype=torch.float32))
+            down_b = torch.cat(outs, dim=0).to(device=hidden_batch.device, dtype=hidden_batch.dtype)
+            hidden_batch = residual + down_b
+        except Exception:
+            hidden_batch = residual + store.matmul_batch(layer_idx, "down_proj", act)
+    else:
+        hidden_batch = residual + store.matmul_batch(layer_idx, "down_proj", act)
     return hidden_batch
 
 
@@ -2057,6 +2192,7 @@ def generate(
     max_new_tokens: int = 50,
     system_prompt: str = "You are a helpful AI assistant.",
     bench_metrics_out: list | None = None,
+    logits_hook: Optional[Callable[[np.ndarray], None]] = None,
 ) -> str:
     print("\n" + "=" * 66)
     print("ASDSL x Phi-4 - CPU Inference")
@@ -2137,6 +2273,9 @@ def generate(
     pos = len(input_ids)
     with torch.inference_mode():
         for _step in range(max_new_tokens):
+            if logits_hook is not None and logits is not None:
+                logits_hook(logits.detach().cpu().float().numpy().ravel())
+
             next_token = int(logits.argmax())
             generated.append(next_token)
 
@@ -2374,153 +2513,151 @@ def generate_qcsd(
     speculative_cycles = 0
 
     pos = len(input_ids)
-    with torch.inference_mode():
-        while len(generated) < max_new_tokens:
-            current_token = int(logits.argmax())
+    store.enter_verify_phase()
+    try:
+        with torch.inference_mode():
+            while len(generated) < max_new_tokens:
+                current_token = int(logits.argmax())
 
-            if current_token in EOS_TOKEN_IDS:
-                generated.append(current_token)
-                tok_text = tokenizer.convert_tokens_to_string(
-                    tokenizer.convert_ids_to_tokens([current_token])
-                )
-                print(tok_text, end="", flush=True)
-                break
-
-            # ── DRAFT PHASE ──────────────────────────────────────
-            # Run draft weights (e.g. 2-bit bank) autoregressively for K steps.
-            kv_snap = kv_hist.snapshot()
-            draft_start_pos = pos
-            draft_tokens: list[int] = []
-            draft_tok = current_token
-
-            for k_step in range(draft_k):
-                draft_logits = run_forward(
-                    draft_tok, draft_start_pos + k_step, kv_hist,
-                    need_logits=True, use_draft=True,
-                )
-                next_draft = int(draft_logits.argmax())
-                draft_tokens.append(next_draft)
-                draft_tok = next_draft
-                if next_draft in EOS_TOKEN_IDS:
+                if current_token in EOS_TOKEN_IDS:
+                    generated.append(current_token)
+                    tok_text = tokenizer.convert_tokens_to_string(
+                        tokenizer.convert_ids_to_tokens([current_token])
+                    )
+                    print(tok_text, end="", flush=True)
                     break
 
-            total_draft += len(draft_tokens)
-            kv_hist.restore(kv_snap)
+                # ── DRAFT PHASE ──────────────────────────────────────
+                kv_snap = kv_hist.snapshot()
+                draft_start_pos = pos
+                draft_tokens: list[int] = []
+                draft_tok = current_token
 
-            # ── VERIFY PHASE (BATCHED TARGET) ──────────────────
-            L = len(draft_tokens)
-            if L == 0:
-                verify_tokens = [current_token]
-            else:
-                verify_tokens = [current_token] + draft_tokens[:-1]
-            n_verify = len(verify_tokens)
+                for k_step in range(draft_k):
+                    draft_logits = run_forward(
+                        draft_tok, draft_start_pos + k_step, kv_hist,
+                        need_logits=True, use_draft=True,
+                    )
+                    next_draft = int(draft_logits.argmax())
+                    draft_tokens.append(next_draft)
+                    draft_tok = next_draft
+                    if next_draft in EOS_TOKEN_IDS:
+                        break
 
-            hidden_batch = torch.stack(
-                [store.embed_f16[tid].float() for tid in verify_tokens]
-            )
+                total_draft += len(draft_tokens)
+                kv_hist.restore_len(draft_start_pos)
 
-            speculative_cycles += 1
-            _verify_calls += 1
-            for i in range(NUM_LAYERS):
-                hidden_batch = forward_layer_batch(
-                    hidden_batch, i, store, kv_hist,
-                    rope_cos, rope_sin, draft_start_pos,
-                )
-            store.clear_tmp_cache()
-
-            hidden_batch = rms_norm(hidden_batch, store.final_norm)
-            all_logits = store.lm_head_matmul_batch(hidden_batch)
-
-            for vi in range(n_verify):
-                k_new_list, v_new_list = [], []
-                for layer in range(NUM_LAYERS):
-                    cache_idx = kv_hist._len[layer] - n_verify + vi
-                    k_new_list.append(kv_hist.k_buf[layer][cache_idx].numpy())
-                    v_new_list.append(kv_hist.v_buf[layer][cache_idx].numpy())
-                asdsl_tracker.record_token(k_new_list, v_new_list)
-
-            # Emit greedy next token (matches standard AR).
-            generated.append(current_token)
-            print(
-                tokenizer.convert_tokens_to_string(
-                    tokenizer.convert_ids_to_tokens([current_token])
-                ),
-                end="",
-                flush=True,
-            )
-
-            accepted: list[int] = []
-            correction: int | None = None
-            for k_idx in range(L):
-                ref_tok = int(all_logits[k_idx].argmax())
-                if ref_tok == draft_tokens[k_idx]:
-                    accepted.append(draft_tokens[k_idx])
+                # ── VERIFY PHASE (BATCHED TARGET) ──────────────────
+                L = len(draft_tokens)
+                if L == 0:
+                    verify_tokens = [current_token]
                 else:
-                    correction = ref_tok
-                    break
+                    verify_tokens = [current_token] + draft_tokens[:-1]
+                n_verify = len(verify_tokens)
 
-            stop_decode = False
-            for tok in accepted:
-                generated.append(tok)
-                print(
-                    tokenizer.convert_tokens_to_string(
-                        tokenizer.convert_ids_to_tokens([tok])
-                    ),
-                    end="",
-                    flush=True,
+                hidden_batch = torch.stack(
+                    [store.embed_f16[tid].float() for tid in verify_tokens]
                 )
-                if tok in EOS_TOKEN_IDS:
-                    stop_decode = True
-                    break
 
-            total_accepted += len(accepted)
+                speculative_cycles += 1
+                _verify_calls += 1
+                for i in range(NUM_LAYERS):
+                    hidden_batch = forward_layer_batch(
+                        hidden_batch, i, store, kv_hist,
+                        rope_cos, rope_sin, draft_start_pos,
+                    )
+                store.clear_tmp_cache()
 
-            if stop_decode:
-                break
+                hidden_batch = rms_norm(hidden_batch, store.final_norm)
+                all_logits = store.lm_head_matmul_batch(hidden_batch)
 
-            # ── KV ALIGNMENT ─────────────────────────────────────
-            # Batched verify wrote n_verify slots starting at draft_start_pos.
-            # Roll back uncommitted suffix, then append correction or last draft.
-            if L == 0:
-                logits = all_logits[0]
-                pos += 1
-            elif correction is not None:
-                n_keep_verify = 1 + len(accepted)
-                if n_keep_verify < n_verify:
-                    trimmed = kv_hist.snapshot()
+                for vi in range(n_verify):
+                    k_new_list, v_new_list = [], []
                     for layer in range(NUM_LAYERS):
-                        trimmed["lens"][layer] -= n_verify - n_keep_verify
-                    kv_hist.restore(trimmed)
-                _verify_extra_run_forward += 1
-                logits = run_forward(
-                    correction, draft_start_pos + n_keep_verify, kv_hist,
-                    need_logits=True, use_draft=False,
-                )
-                generated.append(correction)
+                        cache_idx = kv_hist._len[layer] - n_verify + vi
+                        k_new_list.append(kv_hist.k_buf[layer][cache_idx].numpy())
+                        v_new_list.append(kv_hist.v_buf[layer][cache_idx].numpy())
+                    asdsl_tracker.record_token(k_new_list, v_new_list)
+
+                # Emit greedy next token (matches standard AR).
+                generated.append(current_token)
                 print(
                     tokenizer.convert_tokens_to_string(
-                        tokenizer.convert_ids_to_tokens([correction])
+                        tokenizer.convert_ids_to_tokens([current_token])
                     ),
                     end="",
                     flush=True,
                 )
-                pos += n_keep_verify + 1
-                if correction in EOS_TOKEN_IDS:
-                    break
-            else:
-                # All draft tokens matched target greedy predictions.
-                _verify_extra_run_forward += 1
-                logits = run_forward(
-                    draft_tokens[-1], draft_start_pos + n_verify, kv_hist,
-                    need_logits=True, use_draft=False,
-                )
-                pos += n_verify + 1
-                if draft_tokens[-1] in EOS_TOKEN_IDS:
+
+                accepted: list[int] = []
+                correction: int | None = None
+                for k_idx in range(L):
+                    ref_tok = int(all_logits[k_idx].argmax())
+                    if ref_tok == draft_tokens[k_idx]:
+                        accepted.append(draft_tokens[k_idx])
+                    else:
+                        correction = ref_tok
+                        break
+
+                stop_decode = False
+                for tok in accepted:
+                    generated.append(tok)
+                    print(
+                        tokenizer.convert_tokens_to_string(
+                            tokenizer.convert_ids_to_tokens([tok])
+                        ),
+                        end="",
+                        flush=True,
+                    )
+                    if tok in EOS_TOKEN_IDS:
+                        stop_decode = True
+                        break
+
+                total_accepted += len(accepted)
+
+                if stop_decode:
                     break
 
-            if len(generated) >= max_new_tokens:
-                generated[:] = generated[:max_new_tokens]
-                break
+                # ── KV ALIGNMENT ─────────────────────────────────────
+                if L == 0:
+                    logits = all_logits[0]
+                    pos += 1
+                elif correction is not None:
+                    n_keep_verify = 1 + len(accepted)
+                    if n_keep_verify < n_verify:
+                        kv_hist.restore_len(draft_start_pos + n_keep_verify)
+                    _verify_extra_run_forward += 1
+                    logits = run_forward(
+                        correction, draft_start_pos + n_keep_verify, kv_hist,
+                        need_logits=True, use_draft=False,
+                    )
+                    generated.append(correction)
+                    print(
+                        tokenizer.convert_tokens_to_string(
+                            tokenizer.convert_ids_to_tokens([correction])
+                        ),
+                        end="",
+                        flush=True,
+                    )
+                    pos += n_keep_verify + 1
+                    if correction in EOS_TOKEN_IDS:
+                        break
+                else:
+                    # All draft tokens matched target greedy predictions.
+                    _verify_extra_run_forward += 1
+                    logits = run_forward(
+                        draft_tokens[-1], draft_start_pos + n_verify, kv_hist,
+                        need_logits=True, use_draft=False,
+                    )
+                    pos += n_verify + 1
+                    if draft_tokens[-1] in EOS_TOKEN_IDS:
+                        break
+
+                if len(generated) >= max_new_tokens:
+                    generated[:] = generated[:max_new_tokens]
+                    break
+    finally:
+        store.exit_verify_phase()
 
     t_decode = time.perf_counter() - t_decode_start
     n_tokens = len(generated)
@@ -2631,6 +2768,8 @@ def generate_eagle3(
     system_prompt: str = "You are a helpful AI assistant.",
     draft_k: int = 4,
     bench_metrics_out: list | None = None,
+    force_eagle3: bool = False,
+    logits_hook: Optional[Callable[[np.ndarray], None]] = None,
 ) -> str:
     """Generate tokens using EAGLE-3 MTP speculative decoding (Profile G).
 
@@ -2639,6 +2778,15 @@ def generate_eagle3(
     Verify phase is identical to generate_qcsd: batched forward_layer_batch.
     """
     import torch
+
+    if os.environ.get("ASDSL_FORCE_EAGLE3", "").strip() in ("1", "true", "yes"):
+        force_eagle3 = True
+    if force_eagle3:
+        print(
+            "[WARNING: Leviathan gate bypassed for empirical measurement] "
+            "(ASDSL_FORCE_EAGLE3 or force_eagle3=True)",
+            flush=True,
+        )
 
     if not store._use_eagle3:
         print("[EAGLE-3] MTP head not loaded — using greedy fallback")
@@ -2665,8 +2813,13 @@ def generate_eagle3(
     kv_hist = KVHistory(max_seq=max_seq)
     asdsl_tracker = ASDSLKVTracker()
 
-    def run_forward(token_id: int, pos: int, kv: KVHistory,
-                    need_logits: bool = True) -> "torch.Tensor | None":
+    def run_forward(
+        token_id: int,
+        pos: int,
+        kv: KVHistory,
+        need_logits: bool = True,
+        hook_logits: bool = False,
+    ) -> "torch.Tensor | None":
         hidden = store.embed_f16[token_id].float().unsqueeze(0)
         k_new, v_new = [], []
         for i in range(NUM_LAYERS):
@@ -2680,7 +2833,10 @@ def generate_eagle3(
         hidden = rms_norm(hidden, store.final_norm)
         # Update _last_final_hidden for MTP draft
         store._last_final_hidden = hidden.detach().cpu().float().numpy().ravel()
-        return store.lm_head_matvec(hidden)
+        logits_out = store.lm_head_matvec(hidden)
+        if hook_logits and logits_hook is not None:
+            logits_hook(logits_out.detach().cpu().float().numpy().ravel())
+        return logits_out
 
     # Prefill
     print("Prefill: ", end="", flush=True)
@@ -2702,115 +2858,148 @@ def generate_eagle3(
     t_decode_start = time.perf_counter()
     speculative_cycles = 0
 
-    pos = len(input_ids)
-    with torch.inference_mode():
-        while len(generated) < max_new_tokens:
-            current_token = int(logits.argmax())
+    durations = {
+        "draft": 0.0,
+        "verify_layers": 0.0,
+        "verify_head": 0.0,
+        "tracker": 0.0,
+        "alignment": 0.0,
+    }
 
-            if current_token in EOS_TOKEN_IDS:
+    pos = len(input_ids)
+    store.enter_verify_phase()
+    try:
+        with torch.inference_mode():
+            while len(generated) < max_new_tokens:
+                if logits_hook is not None and logits is not None:
+                    logits_hook(logits.detach().cpu().float().numpy().ravel())
+                current_token = int(logits.argmax())
+
+                if current_token in EOS_TOKEN_IDS:
+                    generated.append(current_token)
+                    print(tokenizer.convert_tokens_to_string(
+                        tokenizer.convert_ids_to_tokens([current_token])), end="", flush=True)
+                    break
+
+                # ── EAGLE-3 DRAFT PHASE ──────────────────────────────
+                t_d0 = time.perf_counter()
+                kv_snap = kv_hist.snapshot()
+                draft_start_pos = pos
+                draft_tokens: list[int] = _run_mtp_draft(store, current_token, k=draft_k)
+
+                total_draft += len(draft_tokens)
+                kv_hist.restore_len(draft_start_pos)
+                durations["draft"] += time.perf_counter() - t_d0
+
+                # ── VERIFY PHASE (BATCHED PRIMARY MODEL) ─────────────
+                L = len(draft_tokens)
+                verify_tokens = [current_token] + draft_tokens[:-1] if L > 0 else [current_token]
+                n_verify = len(verify_tokens)
+
+                hidden_batch = torch.stack(
+                    [store.embed_f16[tid].float() for tid in verify_tokens]
+                )
+
+                speculative_cycles += 1
+                t_v0 = time.perf_counter()
+                for i in range(NUM_LAYERS):
+                    hidden_batch = forward_layer_batch(
+                        hidden_batch, i, store, kv_hist, rope_cos, rope_sin, draft_start_pos)
+                durations["verify_layers"] += time.perf_counter() - t_v0
+
+                t_h0 = time.perf_counter()
+                hidden_batch = rms_norm(hidden_batch, store.final_norm)
+                all_logits = store.lm_head_matmul_batch(hidden_batch)
+                durations["verify_head"] += time.perf_counter() - t_h0
+
+                # Update _last_final_hidden from last verify position
+                store._last_final_hidden = (
+                    hidden_batch[-1].detach().cpu().float().numpy().ravel()
+                )
+
+                # Record KV tracker
+                t_tr0 = time.perf_counter()
+                for vi in range(n_verify):
+                    k_new_list, v_new_list = [], []
+                    for layer in range(NUM_LAYERS):
+                        cache_idx = kv_hist._len[layer] - n_verify + vi
+                        k_new_list.append(kv_hist.k_buf[layer][cache_idx].numpy())
+                        v_new_list.append(kv_hist.v_buf[layer][cache_idx].numpy())
+                    asdsl_tracker.record_token(k_new_list, v_new_list)
+                durations["tracker"] += time.perf_counter() - t_tr0
+
+                # Emit current_token
                 generated.append(current_token)
                 print(tokenizer.convert_tokens_to_string(
                     tokenizer.convert_ids_to_tokens([current_token])), end="", flush=True)
-                break
 
-            # ── EAGLE-3 DRAFT PHASE ──────────────────────────────
-            kv_snap = kv_hist.snapshot()
-            draft_start_pos = pos
-            draft_tokens: list[int] = _run_mtp_draft(store, current_token, k=draft_k)
+                # Acceptance check
+                accepted: list[int] = []
+                correction: int | None = None
+                for k_idx in range(L):
+                    ref_tok = int(all_logits[k_idx].argmax())
+                    if ref_tok == draft_tokens[k_idx]:
+                        accepted.append(draft_tokens[k_idx])
+                    else:
+                        correction = ref_tok
+                        break
 
-            total_draft += len(draft_tokens)
-            kv_hist.restore(kv_snap)   # draft did not write KV — pure numpy forward
+                stop_decode = False
+                for k_idx, tok in enumerate(accepted):
+                    if logits_hook is not None:
+                        logits_hook(all_logits[k_idx].detach().cpu().float().numpy().ravel())
+                    generated.append(tok)
+                    print(tokenizer.convert_tokens_to_string(
+                        tokenizer.convert_ids_to_tokens([tok])), end="", flush=True)
+                    if tok in EOS_TOKEN_IDS:
+                        stop_decode = True; break
 
-            # ── VERIFY PHASE (BATCHED PRIMARY MODEL) ─────────────
-            L = len(draft_tokens)
-            verify_tokens = [current_token] + draft_tokens[:-1] if L > 0 else [current_token]
-            n_verify = len(verify_tokens)
+                total_accepted += len(accepted)
+                total_accepted_per_cycle.append(len(accepted))
 
-            hidden_batch = torch.stack(
-                [store.embed_f16[tid].float() for tid in verify_tokens]
-            )
+                if stop_decode:
+                    break
 
-            speculative_cycles += 1
-            for i in range(NUM_LAYERS):
-                hidden_batch = forward_layer_batch(
-                    hidden_batch, i, store, kv_hist, rope_cos, rope_sin, draft_start_pos)
-
-            hidden_batch = rms_norm(hidden_batch, store.final_norm)
-            all_logits = store.lm_head_matmul_batch(hidden_batch)
-
-            # Update _last_final_hidden from last verify position
-            store._last_final_hidden = (
-                hidden_batch[-1].detach().cpu().float().numpy().ravel()
-            )
-
-            # Record KV tracker
-            for vi in range(n_verify):
-                k_new_list, v_new_list = [], []
-                for layer in range(NUM_LAYERS):
-                    cache_idx = kv_hist._len[layer] - n_verify + vi
-                    k_new_list.append(kv_hist.k_buf[layer][cache_idx].numpy())
-                    v_new_list.append(kv_hist.v_buf[layer][cache_idx].numpy())
-                asdsl_tracker.record_token(k_new_list, v_new_list)
-
-            # Emit current_token
-            generated.append(current_token)
-            print(tokenizer.convert_tokens_to_string(
-                tokenizer.convert_ids_to_tokens([current_token])), end="", flush=True)
-
-            # Acceptance check
-            accepted: list[int] = []
-            correction: int | None = None
-            for k_idx in range(L):
-                ref_tok = int(all_logits[k_idx].argmax())
-                if ref_tok == draft_tokens[k_idx]:
-                    accepted.append(draft_tokens[k_idx])
+                # KV alignment
+                t_al0 = time.perf_counter()
+                if L == 0:
+                    logits = all_logits[0]
+                    pos += 1
+                elif correction is not None:
+                    n_keep = 1 + len(accepted)
+                    if n_keep < n_verify:
+                        kv_hist.restore_len(draft_start_pos + n_keep)
+                    logits = run_forward(
+                        correction,
+                        draft_start_pos + n_keep,
+                        kv_hist,
+                        need_logits=True,
+                        hook_logits=True,
+                    )
+                    generated.append(correction)
+                    print(tokenizer.convert_tokens_to_string(
+                        tokenizer.convert_ids_to_tokens([correction])), end="", flush=True)
+                    pos += n_keep + 1
+                    if correction in EOS_TOKEN_IDS:
+                        break
                 else:
-                    correction = ref_tok
+                    logits = run_forward(
+                        draft_tokens[-1],
+                        draft_start_pos + n_verify,
+                        kv_hist,
+                        need_logits=True,
+                        hook_logits=True,
+                    )
+                    pos += n_verify + 1
+                    if draft_tokens[-1] in EOS_TOKEN_IDS:
+                        break
+                durations["alignment"] += time.perf_counter() - t_al0
+
+                if len(generated) >= max_new_tokens:
+                    generated[:] = generated[:max_new_tokens]
                     break
-
-            stop_decode = False
-            for tok in accepted:
-                generated.append(tok)
-                print(tokenizer.convert_tokens_to_string(
-                    tokenizer.convert_ids_to_tokens([tok])), end="", flush=True)
-                if tok in EOS_TOKEN_IDS:
-                    stop_decode = True; break
-
-            total_accepted += len(accepted)
-            total_accepted_per_cycle.append(len(accepted))
-
-            if stop_decode:
-                break
-
-            # KV alignment
-            if L == 0:
-                logits = all_logits[0]
-                pos += 1
-            elif correction is not None:
-                n_keep = 1 + len(accepted)
-                if n_keep < n_verify:
-                    snap = kv_hist.snapshot()
-                    for layer in range(NUM_LAYERS):
-                        snap["lens"][layer] -= n_verify - n_keep
-                    kv_hist.restore(snap)
-                logits = run_forward(
-                    correction, draft_start_pos + n_keep, kv_hist, need_logits=True)
-                generated.append(correction)
-                print(tokenizer.convert_tokens_to_string(
-                    tokenizer.convert_ids_to_tokens([correction])), end="", flush=True)
-                pos += n_keep + 1
-                if correction in EOS_TOKEN_IDS:
-                    break
-            else:
-                logits = run_forward(
-                    draft_tokens[-1], draft_start_pos + n_verify, kv_hist, need_logits=True)
-                pos += n_verify + 1
-                if draft_tokens[-1] in EOS_TOKEN_IDS:
-                    break
-
-            if len(generated) >= max_new_tokens:
-                generated[:] = generated[:max_new_tokens]
-                break
+    finally:
+        store.exit_verify_phase()
 
     t_decode = time.perf_counter() - t_decode_start
     n_tokens = len(generated)
@@ -2828,6 +3017,12 @@ def generate_eagle3(
     print(f"EAGLE-3   : acceptance rate {accept_rate:.1%}  |  "
           f"mean tokens/cycle {mean_acc_per_cycle:.2f}  |  "
           f"drafted {total_draft} / accepted {total_accepted}")
+    print(f"Profiling (per cycle):")
+    print(f"  Draft   : {durations['draft']/max(1, speculative_cycles):.3f}s")
+    print(f"  Verify L: {durations['verify_layers']/max(1, speculative_cycles):.3f}s")
+    print(f"  Verify H: {durations['verify_head']/max(1, speculative_cycles):.3f}s")
+    print(f"  Tracker : {durations['tracker']/max(1, speculative_cycles):.3f}s")
+    print(f"  Align   : {durations['alignment']/max(1, speculative_cycles):.3f}s")
     print("=" * 66)
 
     if bench_metrics_out is not None:
@@ -2995,6 +3190,22 @@ def main() -> None:
     parser.add_argument("--fatrelu-thresholds", type=str, default=None,
                         help="Path to phi4_fatrelu_thresholds.json for Phase 3 sparsity (Profile F)")
     parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="Bench profile: G = FATReLU + LUT + EAGLE-3 MTP (requires --bits 4, local mtp_head.pt)",
+    )
+    parser.add_argument(
+        "--emit-json",
+        action="store_true",
+        help="With --profile G, print one-line JSON metrics (tok/s, acceptance, flags)",
+    )
+    parser.add_argument(
+        "--force-eagle3",
+        action="store_true",
+        help="Set ASDSL_FORCE_EAGLE3 / force_eagle3 for empirical EAGLE-3 runs",
+    )
+    parser.add_argument(
         "--no-weight-cache",
         action="store_true",
         help="Disable persistent safetensors weight cache (env PHI4_NO_WEIGHT_CACHE=1)",
@@ -3104,6 +3315,49 @@ def main() -> None:
         print(f"  Layers ready: {len(store.layers)}/32  "
               f"| Norms ready: {len(store.layer_norms)}/32")
     store.warm_cache()
+
+    if args.profile == "G":
+        if args.bits != 4:
+            print("ERROR: --profile G requires --bits 4")
+            sys.exit(1)
+        root_repo = Path(__file__).resolve().parent.parent
+        mtp_p = root_repo / "models" / "mtp_head.pt"
+        if not mtp_p.exists():
+            print("ERROR: models/mtp_head.pt not found")
+            sys.exit(1)
+        frp = args.fatrelu_thresholds or str(root_repo / "phi4_fatrelu_thresholds.json")
+        store.load_fatrelu(frp)
+        store.load_mtp_head(str(mtp_p))
+        store._use_native_gemv = True
+        store._use_lut_gemv = True
+        store._enable_sparse = True
+        store._sparsity_threshold = 0.0
+        if args.force_eagle3:
+            os.environ["ASDSL_FORCE_EAGLE3"] = "1"
+        metrics_g: list = []
+        generate_eagle3(
+            args.prompt,
+            store,
+            tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            bench_metrics_out=metrics_g,
+            force_eagle3=args.force_eagle3,
+        )
+        if args.emit_json:
+            m0 = metrics_g[0] if metrics_g else {}
+            out = {
+                "profile": "G",
+                "tok_per_sec": float(m0.get("tokens_per_second", 0.0)),
+                "acceptance_rate": m0.get("acceptance_rate"),
+                "mean_tokens_per_cycle": m0.get("mean_tokens_accepted_per_cycle"),
+                "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
+                "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
+            }
+            print(json.dumps(out))
+        del store, tokenizer
+        gc.collect()
+        return
+
     if _weight_cache_enabled() and not getattr(store, "_loaded_from_cache", False):
         cpath = weight_cache_path_for_store(store)
         save_weight_store_cache(store, cpath)

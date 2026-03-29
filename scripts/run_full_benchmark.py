@@ -514,6 +514,7 @@ sys.path.insert(0, {root!r})
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_JAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+{extra_env_lines}
 
 from experiments.phi4_cpu_run import WeightStore, generate, generate_eagle3
 from transformers import AutoTokenizer
@@ -536,17 +537,27 @@ store._sparsity_threshold = {sparsity_threshold}
 metrics = []
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    {generate_func}({prompt!r}, store, tokenizer,
-             max_new_tokens={max_new_tokens}, bench_metrics_out=metrics)
+    {generate_call}
 
 if metrics:
     m = metrics[0]
-    print("__PROFILE_RESULT__" + json.dumps({{
+    payload = {{
         "tps": float(m.get("tokens_per_second", 0.0)),
         "rss": None,
-    }}))
+        "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
+        "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
+    }}
+    if m.get("acceptance_rate") is not None:
+        payload["acceptance_rate"] = float(m["acceptance_rate"])
+    if m.get("mean_tokens_accepted_per_cycle") is not None:
+        payload["mean_tokens_accepted_per_cycle"] = float(m["mean_tokens_accepted_per_cycle"])
+    print("__PROFILE_RESULT__" + json.dumps(payload))
 else:
-    print("__PROFILE_RESULT__" + json.dumps({{"tps": 0.0, "rss": None}}))
+    print("__PROFILE_RESULT__" + json.dumps({{
+        "tps": 0.0, "rss": None,
+        "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
+        "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
+    }}))
 '''
 
 
@@ -569,10 +580,12 @@ def _run_phi4_profile_isolated(
     mtp_head_path: str | None = None,
     generate_func: str = "generate",
     inter_profile_sleep: float = 5.0,
-) -> tuple[float, None]:
+    subprocess_extra_env: dict[str, str] | None = None,
+) -> tuple[float, None, dict]:
     """Run a single profile in an isolated subprocess.
 
-    Returns (tps, rss) where rss is None (no cross-process RSS available).
+    Returns (tps, rss, extras) where rss is None and extras is the JSON payload
+    minus ``tps`` (acceptance_rate, fatrelu_enabled, etc.).
     """
     import subprocess
     import time as _time
@@ -590,6 +603,22 @@ def _run_phi4_profile_isolated(
         setup_lines.append(f"store.load_mtp_head({mtp_head_path!r})")
     setup_code = "\n".join(setup_lines)
 
+    if generate_func == "generate_eagle3":
+        generate_call = (
+            f"generate_eagle3({prompt!r}, store, tokenizer, "
+            f"max_new_tokens={max_new_tokens}, bench_metrics_out=metrics)"
+        )
+    else:
+        generate_call = (
+            f"generate({prompt!r}, store, tokenizer, "
+            f"max_new_tokens={max_new_tokens}, bench_metrics_out=metrics)"
+        )
+
+    extra_env_lines = ""
+    if subprocess_extra_env:
+        for env_k, env_v in subprocess_extra_env.items():
+            extra_env_lines += f"os.environ[{env_k!r}] = {env_v!r}\n"
+
     script = _PROFILE_RUNNER_SCRIPT.format(
         root=str(root),
         bits=primary_bits,
@@ -600,23 +629,31 @@ def _run_phi4_profile_isolated(
         sparsity_threshold=sparsity_threshold,
         prompt=prompt,
         max_new_tokens=max_new_tokens,
-        generate_func=generate_func,
+        generate_call=generate_call,
+        extra_env_lines=extra_env_lines,
     )
+
+    run_env = os.environ.copy()
+    if subprocess_extra_env:
+        run_env.update(subprocess_extra_env)
 
     result = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
         timeout=600,
+        env=run_env,
     )
 
     tps = 0.0
+    extras: dict = {}
     marker = "__PROFILE_RESULT__"
     for line in result.stdout.splitlines():
         if line.startswith(marker):
             try:
                 data = json.loads(line[len(marker):])
                 tps = float(data.get("tps", 0.0))
+                extras = {k: v for k, v in data.items() if k != "tps"}
             except (json.JSONDecodeError, ValueError):
                 pass
 
@@ -626,7 +663,7 @@ def _run_phi4_profile_isolated(
         print(result.stderr[-2000:] if result.stderr else "(no stderr)", file=sys.stderr)
 
     print(f"[Profile {profile_name}] isolated result: {tps:.3f} tok/s", flush=True)
-    return tps, None
+    return tps, None, extras
 
 
 def run_phi4_benchmark(
@@ -642,7 +679,14 @@ def run_phi4_benchmark(
     phi4_acceptance_estimate: float = 0.40,
     slim_meta: str | None = None,
     fatrelu_thresholds: str | None = None,
+    emit_regression_json: str | None = None,
+    validate_outputs: bool = False,
+    force_eagle3: bool = False,
+    quick: bool = False,
 ) -> None:
+    if quick:
+        max_new_tokens = min(max_new_tokens, 8)
+
     phi4 = _load_phi4_module(root)
     idx = phi4.INDEX_FILE
     if not idx.exists():
@@ -735,6 +779,8 @@ def run_phi4_benchmark(
     else:
         alpha_for_leviathan = prior_alpha
         alpha_gate_src = f"prior (no {alpha_key} in .qcsd_history.json)"
+    ok_be = True
+    s_phi = 1.0
     if store._enable_qcsd:
         ok_be, warn_be, s_phi = _qcsd_break_even_ok(
             alpha_for_leviathan, draft_k, draft_check_mb, target_w_mb
@@ -744,6 +790,11 @@ def run_phi4_benchmark(
             print("WARNING:", warn_be)
             print(
                 f"  (Analytical Leviathan S={s_phi:.3f}x; falling back to AR for Profile B.)"
+            )
+            print(
+                "  Note: static c=draft_mb/target_mb does not reflect FATReLU target speedup; "
+                "Profile G may still be measured with FATReLU + MTP (see --force-eagle3).",
+                flush=True,
             )
             store._enable_qcsd = False
 
@@ -798,8 +849,12 @@ def run_phi4_benchmark(
     # Profile D: AR + LUT Q4 GEMV (vpshufb, Phase 1) - isolated subprocess
     tps_d = 0.0
     peak_d = None
-    _inter_sleep = float(os.environ.get("ASDSL_PROFILE_SLEEP", "5"))
-    tps_d, peak_d = _run_phi4_profile_isolated(
+    _inter_sleep = (
+        0.5
+        if quick
+        else float(os.environ.get("ASDSL_PROFILE_SLEEP", "5"))
+    )
+    tps_d, peak_d, _ex_d = _run_phi4_profile_isolated(
         "D", root, prompt, max_new_tokens, primary_bits,
         use_native=True, use_lut=True,
         enable_sparse=False, sparsity_threshold=0.01,
@@ -811,23 +866,25 @@ def run_phi4_benchmark(
     # Profile E: AR + LUT GEMV + SliM 2.2-bit mixed precision (Phase 2) - isolated subprocess
     tps_e = None
     peak_e = None
-    if getattr(store, "_use_slim", False) and _slim_meta_path:
-        tps_e, peak_e = _run_phi4_profile_isolated(
+    if _slim_meta_path and _slim_meta_path.exists():
+        tps_e, peak_e, _ex_e = _run_phi4_profile_isolated(
             "E", root, prompt, max_new_tokens, primary_bits,
             use_native=True, use_lut=True,
             needs_slim=True, slim_meta_path=str(_slim_meta_path),
             inter_profile_sleep=_inter_sleep,
         )
-        m_e: dict = {"tokens_per_second": tps_e}
+        m_e = {"tokens_per_second": tps_e}
     else:
         print("[Profile E] skipped: phi4_slim_meta.json not found or not loaded")
+        tps_e = None
+        peak_e = None
         m_e = {}
 
     # Profile F: AR + Native GEMV + FATReLU 85% sparsity (Phase 3) - isolated subprocess
     tps_f = None
     peak_f = None
     if getattr(store, "_use_fatrelu", False) and _fatrelu_path:
-        tps_f, peak_f = _run_phi4_profile_isolated(
+        tps_f, peak_f, _ex_f = _run_phi4_profile_isolated(
             "F", root, prompt, max_new_tokens, primary_bits,
             use_native=True, use_lut=False,
             enable_sparse=True, sparsity_threshold=0.0,
@@ -839,21 +896,71 @@ def run_phi4_benchmark(
         print("[Profile F] skipped: phi4_fatrelu_thresholds.json not found or not loaded")
         m_f = {}
 
-    # Profile G: Native GEMV + FATReLU + EAGLE-3 MTP Speculative Decoding (Phase 5) - isolated subprocess
+    # Profile G: Native GEMV + LUT + FATReLU + EAGLE-3 MTP (F stacked with EAGLE-3)
     tps_g = None
     peak_g = None
+    ex_g: dict = {}
     _mtp_head_path = root / "models" / "mtp_head.pt"
+    _g_fatrelu = _fatrelu_path
+    if _g_fatrelu is None and (root / "phi4_fatrelu_thresholds.json").exists():
+        _g_fatrelu = root / "phi4_fatrelu_thresholds.json"
+    g_fr_path = str(_g_fatrelu) if _g_fatrelu and Path(_g_fatrelu).exists() else None
+    g_env: dict[str, str] = {}
+    if force_eagle3:
+        g_env["ASDSL_FORCE_EAGLE3"] = "1"
+        print(
+            "[WARNING: Leviathan gate bypassed for empirical measurement] (--force-eagle3)",
+            flush=True,
+        )
+    elif not ok_be:
+        g_env["ASDSL_FORCE_EAGLE3"] = "1"
+        print(
+            "[WARNING: Leviathan gate bypassed for empirical measurement] "
+            "(analytical QCSD off for Profile B; still measuring Profile G)",
+            flush=True,
+        )
     if _mtp_head_path.exists():
-        tps_g, peak_g = _run_phi4_profile_isolated(
+        if g_fr_path is None:
+            print(
+                "[Profile G] WARNING: phi4_fatrelu_thresholds.json missing — "
+                "FATReLU + transposed down_proj will not load in subprocess",
+                flush=True,
+            )
+        tps_g, peak_g, ex_g = _run_phi4_profile_isolated(
             "G", root, prompt, max_new_tokens, primary_bits,
-            use_native=True, use_lut=False,
-            enable_sparse=True, sparsity_threshold=0.0,
-            needs_fatrelu=True, fatrelu_path=str(_fatrelu_path) if _fatrelu_path else None,
-            needs_mtp=True, mtp_head_path=str(_mtp_head_path),
+            use_native=True,
+            use_lut=True,
+            enable_sparse=True,
+            sparsity_threshold=0.0,
+            needs_fatrelu=bool(g_fr_path),
+            fatrelu_path=g_fr_path,
+            needs_mtp=True,
+            mtp_head_path=str(_mtp_head_path),
             generate_func="generate_eagle3",
             inter_profile_sleep=_inter_sleep,
+            subprocess_extra_env=g_env if g_env else None,
         )
-        m_g: dict = {"tokens_per_second": tps_g}
+        m_g = {"tokens_per_second": tps_g}
+        if tps_g is not None:
+            ar_g = ex_g.get("acceptance_rate")
+            if ar_g is not None:
+                print(f"[Profile G] EAGLE-3 acceptance rate: {float(ar_g):.1%}")
+                mpc = ex_g.get("mean_tokens_accepted_per_cycle")
+                if mpc is not None:
+                    print(f"[Profile G] Mean tokens accepted/cycle: {float(mpc):.2f}")
+                levi_ok = float(ar_g) >= 0.636
+                print(
+                    f"[Profile G] Leviathan gate: {'PASS' if levi_ok else 'FAIL'} "
+                    f"(break-even alpha ~0.636)",
+                    flush=True,
+                )
+            else:
+                print("WARNING: acceptance_rate not in Profile G result", flush=True)
+            if ex_g.get("fatrelu_enabled") is False:
+                print(
+                    "WARNING: Profile G subprocess reports fatrelu_enabled=false",
+                    flush=True,
+                )
     else:
         print("[Profile G] skipped: models/mtp_head.pt not found")
         m_g = {}
@@ -888,6 +995,11 @@ def run_phi4_benchmark(
         _hkey = "eagle3_acceptance_rates" if _mtp_head_path.exists() else "acceptance_rates"
         _append_history_rate(root, float(m_b["acceptance_rate"]), key=_hkey)
         appended_qcsd_history = True
+
+    appended_eagle3_from_g = False
+    if ex_g.get("acceptance_rate") is not None and _mtp_head_path.exists():
+        _append_history_rate(root, float(ex_g["acceptance_rate"]), key="eagle3_acceptance_rates")
+        appended_eagle3_from_g = True
 
     peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_f, peak_g, peak_b) if x is not None)
     rss_a_s = f"{peak_a:.0f}" if peak_a is not None else "n/a"
@@ -1053,11 +1165,45 @@ def run_phi4_benchmark(
             f"  Appended measured acceptance to {_QCSD_HISTORY_FILENAME} "
             f"(used on next run for Leviathan gate)."
         )
+    if appended_eagle3_from_g:
+        print(
+            f"  Appended Profile G EAGLE-3 acceptance to {_QCSD_HISTORY_FILENAME} "
+            f"(eagle3_acceptance_rates).",
+            flush=True,
+        )
     print(
         "  KV column: A and C use FP32 KV geometry; B adds theoretical Q4 KV payload "
         "(``KVHistory`` in phi4_cpu_run remains FP32; Q4 is planning/comparison)."
     )
     print("=" * 72)
+    
+    if emit_regression_json:
+        res_map = {
+            "A": {"tok/s": tps_a},
+            "C": {"tok/s": tps_c},
+            "D": {"tok/s": tps_d},
+            "E": {"tok/s": tps_e},
+            "F": {"tok/s": tps_f},
+            "G": {"tok/s": tps_g},
+            "B": {"tok/s": tps_b},
+        }
+        print(f"Writing regression results to {emit_regression_json}...")
+        with open(emit_regression_json, "w") as f:
+            json.dump({"results": res_map}, f, indent=2)
+
+    if validate_outputs:
+        print("\nRunning KL Divergence Validation...")
+        subprocess.run(
+            [
+                sys.executable,
+                str(root / "scripts" / "validate_outputs.py"),
+                "--prompt",
+                prompt,
+                "--max-new-tokens",
+                "32",
+            ],
+            check=False,
+        )
 
 
 def main() -> None:
@@ -1151,11 +1297,32 @@ def main() -> None:
              "Default: phi4_slim_meta.json at repo root if it exists.",
     )
     p.add_argument(
+        "--emit-regression-json",
+        type=str,
+        default=None,
+        help="Emit result JSON for regression checking.",
+    )
+    p.add_argument(
+        "--validate-outputs",
+        action="store_true",
+        help="Run KL divergence validation script after benchmark.",
+    )
+    p.add_argument(
         "--fatrelu-thresholds",
         type=str,
         default=None,
         help="Path to phi4_fatrelu_thresholds.json for Phase 3 FATReLU sparsity (Profile F). "
              "Default: phi4_fatrelu_thresholds.json at repo root if it exists.",
+    )
+    p.add_argument(
+        "--force-eagle3",
+        action="store_true",
+        help="Phi-4: set ASDSL_FORCE_EAGLE3 for Profile G subprocess (empirical run).",
+    )
+    p.add_argument(
+        "--quick",
+        action="store_true",
+        help="Phi-4: cap --max-new-tokens at 8 and shorten inter-profile sleep for smoke runs.",
     )
     args = p.parse_args()
     if not 0.0 <= args.sim_acceptance_rate <= 1.0:
@@ -1178,6 +1345,10 @@ def main() -> None:
             phi4_acceptance_estimate=args.phi4_acceptance_estimate,
             slim_meta=getattr(args, "slim_meta", None),
             fatrelu_thresholds=getattr(args, "fatrelu_thresholds", None),
+            emit_regression_json=args.emit_regression_json,
+            validate_outputs=args.validate_outputs,
+            force_eagle3=args.force_eagle3,
+            quick=args.quick,
         )
         return
 
