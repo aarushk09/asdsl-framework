@@ -994,7 +994,10 @@ class WeightStore:
         x_flat = X_batch.reshape(-1, cols).float()
         k_batch = x_flat.shape[0]
 
-        if self._use_native_gemv and not self._in_verify_phase:
+        # Phase 10: native path must run during batched verify too; the dequant+torch.mm
+        # fallback differs numerically from AR ``forward_layer`` (native GEMV), so MTP
+        # drafts trained on native activations never matched verify argmax (0% acceptance).
+        if self._use_native_gemv:
             w_np = self._quant_packed_np.get(key)
             if w_np is None:
                 w_np = packed.detach().cpu().numpy().reshape(-1)
@@ -1386,10 +1389,6 @@ class WeightStore:
     def clear_tmp_cache(self) -> None:
         """No-op: retained for API compatibility; native path has no cache."""
         pass
-
-    def _get_token_embedding(self, token_id: int) -> "np.ndarray":
-        """Return float32 token embedding vector [hidden_dim] for EAGLE-3."""
-        return self.embed_f16[token_id].float().numpy().ravel()
 
     def _get_slim_arrays(self, layer_idx: int, name: str):
         """Return (bits_arr, scales_arr, zp_arr) from SliM npz, or None if not found."""
@@ -2706,56 +2705,58 @@ def generate_qcsd(
 
 def _run_mtp_draft(
     store: "WeightStore",
-    current_token_id: int,
+    embed_source_token_id: int,
     k: int = 4,
 ) -> list[int]:
     """Run EAGLE-3 MTP head autoregressively for k draft tokens.
 
     Requires store._use_eagle3 = True and store._last_final_hidden to be set.
 
+    ``embed_source_token_id`` is the **last token already in the sequence**
+    (same as ``train_mtp_head.collect_training_pairs``: concat(h, embed(last_tok)))
+    to predict the greedy next token). This is **not** the greedy ``current_token``
+    about to be emitted.
+
+    Uses ``torch.nn.functional.layer_norm`` + ``gelu`` to match ``train_mtp_head``.
+
     Returns: list of up to k draft token ids.
     """
-    import numpy as np
+    import torch
+    import torch.nn.functional as F
 
     if not store._use_eagle3 or store._mtp_head is None:
         return []
 
     head = store._mtp_head
-    fc1_W  = head["fc1_W"]    # [1024, 6144]
-    fc1_b  = head["fc1_b"]    # [1024]
-    norm_W = head["norm_W"]   # [1024]
-    norm_b = head["norm_b"]   # [1024]
-    proj_W = head["proj_W"]   # [3072, 1024]
-    proj_b = head["proj_b"]   # [3072]
+    fc1_W = torch.from_numpy(head["fc1_W"]).float()
+    fc1_b = torch.from_numpy(head["fc1_b"]).float()
+    norm_W = torch.from_numpy(head["norm_W"]).float()
+    norm_b = torch.from_numpy(head["norm_b"]).float()
+    proj_W = torch.from_numpy(head["proj_W"]).float()
+    proj_b = torch.from_numpy(head["proj_b"]).float()
 
-    prev_hidden = store._last_final_hidden.copy()  # [3072]
-    cur_tok     = current_token_id
+    prev_hidden = torch.from_numpy(store._last_final_hidden.copy()).float()
+    cur_embed_src = embed_source_token_id
     drafts: list[int] = []
 
     for _ in range(k):
-        tok_emb = store._get_token_embedding(cur_tok)          # [3072]
-        x = np.concatenate([prev_hidden, tok_emb])              # [6144]
-
-        # FC1
-        h = x @ fc1_W.T + fc1_b                                # [1024]
-        # LayerNorm
-        mean = h.mean(); std = h.std() + 1e-5
-        h = (h - mean) / std * norm_W + norm_b
-        # GELU approximation
-        h = h * 0.5 * (1.0 + np.tanh(0.7978845608 * (h + 0.044715 * h**3)))
-        # Proj back to PHI4_HIDDEN
-        h_proj = h @ proj_W.T + proj_b                         # [3072]
-
-        # lm_head: use lm_head_matvec (chunked to avoid OOM on vocab projection)
-        import torch
-        h_t = torch.from_numpy(h_proj).float().unsqueeze(0)    # [1, 3072]
-        logits_t = store.lm_head_matvec(h_t)                   # [vocab] or [1, vocab]
+        tok_emb = torch.from_numpy(store._get_token_embedding(cur_embed_src)).float()
+        x = torch.cat([prev_hidden, tok_emb], dim=0)
+        h = F.linear(x.unsqueeze(0), fc1_W, fc1_b).squeeze(0)
+        h = F.layer_norm(
+            h.unsqueeze(0),
+            (h.shape[-1],),
+            norm_W,
+            norm_b,
+            eps=1e-5,
+        ).squeeze(0)
+        h = F.gelu(h)
+        h_proj = F.linear(h.unsqueeze(0), proj_W, proj_b).squeeze(0)
+        logits_t = store.lm_head_matvec(h_proj.unsqueeze(0))
         next_tok = int(logits_t.argmax())
         drafts.append(next_tok)
-
-        # Update state for next step
-        prev_hidden = h_proj     # reuse proj output as next prev_hidden
-        cur_tok = next_tok
+        prev_hidden = h_proj
+        cur_embed_src = next_tok
 
     return drafts
 
@@ -2828,11 +2829,11 @@ def generate_eagle3(
             k_np, v_np = kv.get_last_np(i)
             k_new.append(k_np); v_new.append(v_np)
         asdsl_tracker.record_token(k_new, v_new)
+        hidden = rms_norm(hidden, store.final_norm)
+        # MTP needs post-norm hidden even when we skip lm_head (warm-forward for draft).
+        store._last_final_hidden = hidden.detach().cpu().float().numpy().ravel()
         if not need_logits:
             return None
-        hidden = rms_norm(hidden, store.final_norm)
-        # Update _last_final_hidden for MTP draft
-        store._last_final_hidden = hidden.detach().cpu().float().numpy().ravel()
         logits_out = store.lm_head_matvec(hidden)
         if hook_logits and logits_hook is not None:
             logits_hook(logits_out.detach().cpu().float().numpy().ravel())
@@ -2883,9 +2884,13 @@ def generate_eagle3(
 
                 # ── EAGLE-3 DRAFT PHASE ──────────────────────────────
                 t_d0 = time.perf_counter()
-                kv_snap = kv_hist.snapshot()
                 draft_start_pos = pos
-                draft_tokens: list[int] = _run_mtp_draft(store, current_token, k=draft_k)
+                # Advance KV once with current_token so _last_final_hidden matches
+                # training (post-T0 hidden, embed(T0) predicts T1). Without this,
+                # MTP re-predicts T0 while verify compares draft[0] to T1 -> 0% acceptance.
+                run_forward(current_token, pos, kv_hist, need_logits=False)
+                draft_tokens: list[int] = _run_mtp_draft(
+                    store, current_token, k=draft_k)
 
                 total_draft += len(draft_tokens)
                 kv_hist.restore_len(draft_start_pos)
@@ -3329,7 +3334,7 @@ def main() -> None:
         store.load_fatrelu(frp)
         store.load_mtp_head(str(mtp_p))
         store._use_native_gemv = True
-        store._use_lut_gemv = True
+        store._use_lut_gemv = False
         store._enable_sparse = True
         store._sparsity_threshold = 0.0
         if args.force_eagle3:

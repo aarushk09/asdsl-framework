@@ -3,7 +3,7 @@
 EAGLE-3 MTP (Multi-Token Prediction) head training for ASDSL speculative decoding.
 
 Architecture (regularized variant — Phase 5):
-  Input:  concat(prev_final_hidden[3072], current_token_embed[3072]) = [6144]
+  Input:  concat(prev_final_hidden[3072], **previous** token embed[3072]) = [6144]
   fc1:    Linear(6144, 1024, bias=True)
   norm:   LayerNorm(1024)
   gelu:   GELU activation
@@ -80,11 +80,13 @@ def collect_training_pairs(
     prompts: list[str],
     max_steps: int = 24,
     verbose: bool = True,
-) -> tuple[list, list]:
-    """Collect (prev_final_hidden, next_token_id) pairs.
+) -> tuple[list, list, list]:
+    """Collect triples (prev_final_hidden, last_token_id, next_token_id).
 
-    prev_final_hidden: post-rms_norm final hidden state [3072]
-    next_token_id:     the greedy next token predicted from that hidden state
+    prev_final_hidden: post-rms_norm hidden **before** emitting next_token_id
+    last_token_id:     last token already in the sequence (embedding is fed to MTP)
+    next_token_id:     greedy next token (MTP target) — same as ``generate_eagle3``
+        which uses ``concat(_last_final_hidden, embed(current_token))``.
     """
     import gc
     import numpy as np
@@ -100,7 +102,8 @@ def collect_training_pairs(
         raise
 
     hiddens: list[np.ndarray] = []
-    token_ids: list[int] = []
+    last_tok_ids: list[int] = []
+    next_tok_ids: list[int] = []
 
     print(f"  Collecting {len(prompts)} prompts × {max_steps} steps...")
 
@@ -127,17 +130,19 @@ def collect_training_pairs(
                     hidden = forward_layer(
                         hidden, i, store, kv_hist, rope_cos, rope_sin, pos)
             prev_hidden = rms_norm(hidden, store.final_norm)
+            # Last token in KV before first decode step (matches _run_mtp_draft input).
+            last_tok = int(input_ids[-1])
 
-            # Decode: collect (prev_hidden → next_token) pairs
+            # Decode: collect (prev_hidden, last_tok, next_tok) triples
             pos = len(input_ids)
             for step in range(max_steps):
                 logits = store.lm_head_matvec(prev_hidden)
                 next_tok = int(logits.argmax())
 
-                # Record pair: prev_hidden predicts next_tok
                 h_np = prev_hidden.detach().cpu().float().numpy().ravel()  # [3072]
                 hiddens.append(h_np)
-                token_ids.append(next_tok)
+                last_tok_ids.append(last_tok)
+                next_tok_ids.append(next_tok)
 
                 # Advance: embed next_tok → run through layers → new hidden
                 hidden = store.embed_f16[next_tok].float().unsqueeze(0)
@@ -145,6 +150,7 @@ def collect_training_pairs(
                     hidden = forward_layer(
                         hidden, i, store, kv_hist, rope_cos, rope_sin, pos)
                 prev_hidden = rms_norm(hidden, store.final_norm)
+                last_tok = next_tok
                 pos += 1
 
         del kv_hist
@@ -152,7 +158,7 @@ def collect_training_pairs(
         if verbose:
             print(f"  Prompt {pi+1}/{len(prompts)}: {len(hiddens)} pairs total")
 
-    return hiddens, token_ids
+    return hiddens, last_tok_ids, next_tok_ids
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +224,17 @@ def train_mtp_head(
     store = WeightStore(bits=4, enable_qcsd=False)
     store.load()
     store.warm_cache()
+    # Profile G runs with FATReLU + transposed down_proj; training must collect
+    # hidden states from the same forward path or MTP sees OOD activations → 0% acceptance.
+    _fr = ROOT / "phi4_fatrelu_thresholds.json"
+    if _fr.exists():
+        store.load_fatrelu(str(_fr))
+        print("[EAGLE-3] FATReLU thresholds loaded for collection (matches Profile G forward)")
     gc.collect()
 
     print("[EAGLE-3] Collecting training pairs...")
     t0 = time.perf_counter()
-    hiddens, token_ids = collect_training_pairs(
+    hiddens, last_tok_ids, next_tok_ids = collect_training_pairs(
         store, tokenizer, prompts, max_steps=max_steps, verbose=verbose
     )
     t_collect = time.perf_counter() - t0
@@ -236,22 +248,18 @@ def train_mtp_head(
     lm_head_f16 = store.lm_head          # [vocab, 3072] float16 Tensor
     embed_f16   = store.embed_f16        # [vocab, 3072] float16 Tensor
 
-    # Build input tensors: X = concat(prev_hidden, token_embed), Y = target token
+    # X = concat(prev_hidden, embed(**last**_token)); Y = next greedy token
     print("[EAGLE-3] Building tensors...")
     X_list, Y_list = [], []
     for i in range(n_total):
-        prev_h  = torch.from_numpy(hiddens[i]).float()           # [3072]
-        tok_id  = token_ids[i]
-        tok_emb = embed_f16[tok_id].float()                       # [3072]
+        prev_h = torch.from_numpy(hiddens[i]).float()           # [3072]
+        tok_emb = embed_f16[last_tok_ids[i]].float()            # [3072]
         X_list.append(torch.cat([prev_h, tok_emb], dim=0))       # [6144]
-        # Target: the token that the model would generate next
-        # For step i we recorded (hidden_i → token_i).
-        # We want to predict token_i from hidden_i.
-        Y_list.append(tok_id)
+        Y_list.append(next_tok_ids[i])
 
     X = torch.stack(X_list)                                       # [N, 6144]
     Y = torch.tensor(Y_list, dtype=torch.long)                    # [N]
-    del hiddens, token_ids, X_list, Y_list, store
+    del hiddens, last_tok_ids, next_tok_ids, X_list, Y_list, store
     gc.collect()
 
     # Train/val split
@@ -266,7 +274,7 @@ def train_mtp_head(
 
     # Model + optimizer
     print(f"[EAGLE-3] Training MTP head (input={INPUT_DIM}, hidden={MTP_HIDDEN}, "
-          f"proj→{PHI4_HIDDEN}, vocab={lm_head_f16.shape[0]})...")
+          f"proj to {PHI4_HIDDEN}, vocab={lm_head_f16.shape[0]})...")
     model = _build_model(lm_head_f16, dropout_rate=dropout_rate)
     # Only optimize non-frozen params (lm_head is register_buffer)
     trainable = [p for n, p in model.named_parameters() if "lm_head" not in n]
@@ -278,6 +286,9 @@ def train_mtp_head(
     best_epoch      =  0
     patience_ctr    =  0
     best_state      = None
+    # Val set can be tiny (quick mode); tie-break with train acc so we do not
+    # keep epoch 1 when val stays 0% but train improves.
+    best_score: tuple[float, float] = (-1.0, -1.0)
 
     for epoch in range(n_epochs):
         # --- train ---
@@ -306,13 +317,14 @@ def train_mtp_head(
             va_logits = model(X_va)
             val_acc1  = (va_logits.argmax(1) == Y_va).float().mean().item() * 100
 
-        # Early stopping + best checkpoint
-        if val_acc1 > best_val_acc1:
-            best_val_acc1   = val_acc1
+        # Early stopping + best checkpoint (lexicographic val, then train)
+        score = (val_acc1, train_acc1)
+        if score > best_score:
+            best_score = score
+            best_val_acc1 = val_acc1
             best_train_acc1 = train_acc1
-            best_epoch      = epoch + 1
-            patience_ctr    = 0
-            # Deep-copy trainable weights (lm_head buffer excluded — not in state_dict? No, it IS)
+            best_epoch = epoch + 1
+            patience_ctr = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()
                           if k != "lm_head"}
         else:
@@ -497,7 +509,7 @@ def main() -> None:
         "phi4_hidden_dim":     PHI4_HIDDEN,
     }
     stats_path.write_text(json.dumps(summary, indent=2))
-    print(f"[EAGLE-3] Stats → {stats_path}")
+    print(f"[EAGLE-3] Stats -> {stats_path}")
 
     if stats["val_top1"] < 5.0:
         print("[EAGLE-3] WARNING: val top-1 < 5% — head may need more data")

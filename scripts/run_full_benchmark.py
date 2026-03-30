@@ -738,8 +738,9 @@ def run_phi4_benchmark(
     t_load = time.perf_counter() - t_load
     store.warm_cache()
     gc.collect()
-    if _fatrelu_path and _fatrelu_path.exists():
-        store.load_fatrelu(str(_fatrelu_path))
+    # Phase 10: Profiles A/C must run dense AR (no FATReLU / transposed down_proj).
+    # load_fatrelu() is deferred until after C — it was incorrectly applied here,
+    # making A/C run the sparse forward and skewing C vs A.
     peak_load = _peak_rss_mb()
 
     packed_mb = sum(t.nbytes for t in store._quant_packed.values()) / 1e6
@@ -850,6 +851,11 @@ def run_phi4_benchmark(
     m_c = metrics_c[0] if metrics_c else {}
     tps_c = float(m_c.get("tokens_per_second", 0.0))
 
+    if _fatrelu_path and _fatrelu_path.exists():
+        store.load_fatrelu(str(_fatrelu_path))
+        gc.collect()
+        peak_load = max(peak_load, _peak_rss_mb())
+
     # Profile D: AR + LUT Q4 GEMV (vpshufb, Phase 1) - isolated subprocess
     tps_d = 0.0
     peak_d = None
@@ -887,7 +893,7 @@ def run_phi4_benchmark(
     # Profile F: AR + Native GEMV + FATReLU 85% sparsity (Phase 3) - isolated subprocess
     tps_f = None
     peak_f = None
-    if getattr(store, "_use_fatrelu", False) and _fatrelu_path:
+    if _fatrelu_path and _fatrelu_path.exists():
         tps_f, peak_f, _ex_f = _run_phi4_profile_isolated(
             "F", root, prompt, max_new_tokens, primary_bits,
             use_native=True, use_lut=False,
@@ -927,7 +933,7 @@ def run_phi4_benchmark(
         tps_g, peak_g, ex_g = _run_phi4_profile_isolated(
             "G", root, prompt, max_new_tokens, primary_bits,
             use_native=True,
-            use_lut=True,
+            use_lut=False,
             enable_sparse=True,
             sparsity_threshold=0.0,
             needs_fatrelu=bool(g_fr_path),
@@ -1210,7 +1216,12 @@ def main() -> None:
 
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--phi4", action="store_true", help="Use local Phi-4 weights (slow, large RAM)")
-    p.add_argument("--prompt", type=str, default="Say hello in one short sentence.")
+    p.add_argument(
+        "--prompt",
+        type=str,
+        default="The fundamental theorem of calculus states that",
+        help="Decode prompt (longer default avoids immediate EOS so EAGLE-3 acceptance is measurable).",
+    )
     p.add_argument("--max-new-tokens", type=int, default=32)
     p.add_argument("--gamma", type=int, default=7, help="QCSD draft width (sim and phi4 --draft-k)")
     p.add_argument("--vocab-size", type=int, default=200064)

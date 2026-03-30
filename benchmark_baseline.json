@@ -306,6 +306,39 @@
     "all_tests_passing": true,
     "timestamp": "2026-03-29T23:18:45Z",
     "note": "repository HEAD after push is the canonical phase 9 commit hash"
+  },
+  "phase_10_results": {
+    "anomalies_diagnosed": {
+      "profile_c_lt_profile_a_root_cause": "Parent benchmark called load_fatrelu() before Profiles A/C, so both ran the FATReLU+sparse forward; native GEMV no longer had a clean advantage. Fixed by deferring load_fatrelu until after A and C.",
+      "profile_f_regression_root_cause": "Same as above: in-process A/C were not true baselines; isolated F was already healthy once measured without parent pollution. Throughput varies strongly with prompt length, KV size, and session load.",
+      "eagle3_zero_acceptance_root_cause": "(1) Training used concat(h, embed(next_tok)) while inference used embed(last context) wrong by one token; (2) draft ran from prefill hidden without a warm forward of current_token; (3) batched verify skipped native GEMV, so verify argmax != AR native logits; (4) MTP trained on dense forward but Profile G used LUT until aligned to native; (5) short default prompt hit EOS in one cycle making acceptance 0/4."
+    },
+    "fixes_applied": {
+      "warm_cache_side_effects": true,
+      "hidden_state_capture_point": "run_forward always sets _last_final_hidden after final RMSNorm; before draft, run_forward(current_token,pos,need_logits=False) restores post-T0 hidden for MTP",
+      "mtp_head_retrained": true
+    },
+    "benchmark_prompt_default": "The fundamental theorem of calculus states that",
+    "eagle3_acceptance_rate": 0.08928571428571429,
+    "eagle3_mean_tokens_per_cycle": 0.36,
+    "leviathan_gate_passed": false,
+    "final_benchmark_table": {
+      "A": 2.12,
+      "C": 2.35,
+      "D": 1.46,
+      "E": 1.57,
+      "F": 2.74,
+      "G": 1.09,
+      "B": 2.42
+    },
+    "final_benchmark_command_note": "2026-03-30: ASDSL_PROFILE_SLEEP=1, --max-new-tokens 64 --threads 8, cold load+quantize ~981s",
+    "profile_c_gt_profile_a": true,
+    "profile_g_gt_profile_f": false,
+    "llama_cpp_beaten": false,
+    "best_profile": "F",
+    "best_tok_per_sec": 2.74,
+    "total_speedup_vs_1_20": 2.283333333333333,
+    "remaining_gap_tok_per_sec": 4.26
   }
 }
 

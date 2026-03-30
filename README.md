@@ -339,31 +339,31 @@ pytest tests/ -q
 
 ## Benchmark results
 
-Hardware: Intel Core (Raptor Lake, Family 6 Model 186), 12 physical cores, 16.9 GB RAM, AVX2, Windows 11, no GPU. Threading: **8** (`--threads 8`). Table from **Phase 9** (2026-03-29): `python scripts/run_full_benchmark.py --phi4 --max-new-tokens 64 --threads 8 --fatrelu-thresholds phi4_fatrelu_thresholds.json --slim-meta phi4_slim_meta.json` (optional `ASDSL_PROFILE_SLEEP=1` between isolated profiles). Load+quantize ~**950 s** on a cold cache.
+Hardware: Intel Core (Raptor Lake, Family 6 Model 186), 12 physical cores, 16.9 GB RAM, AVX2, Windows 11, no GPU. Threading: **8** (`--threads 8`). **Phase 10** (2026-03-30): `python scripts/run_full_benchmark.py --phi4 --max-new-tokens 64 --threads 8 --fatrelu-thresholds phi4_fatrelu_thresholds.json --slim-meta phi4_slim_meta.json` with default prompt **`The fundamental theorem of calculus states that`** (longer text avoids immediate EOS so EAGLE-3 acceptance is statistically meaningful). `ASDSL_PROFILE_SLEEP=1` between isolated profiles. Load+quantize ~**981 s** cold.
 
 | Profile | Configuration                             | tok/s | vs A   | vs llama.cpp (~7.0) |
 |---------|-------------------------------------------|-------|--------|---------------------|
-| A       | PyTorch baseline                          | 3.06  | 1.00×  | 0.44×               |
-| C       | Native Q4 GEMV (AVX2 FMA)                | 2.95  | 0.96×  | 0.42×               |
-| D       | LUT vpshufb kernel (tiled path)          | 1.93  | 0.63×  | 0.28×               |
-| E       | SliM 2.2-bit (quick-mode: 4/32 layers)   | 1.55  | 0.51×  | 0.22×               |
-| F       | FATReLU 85% FFN sparsity                 | 3.46  | 1.13×  | 0.49×               |
-| G       | FATReLU + EAGLE-3 speculative (MTP head) | 1.95  | 0.64×  | 0.28×               |
-| B       | Legacy QCSD (2-bit draft bank)           | 0.43  | 0.14×  | 0.06×               |
+| A       | PyTorch baseline                          | 2.12  | 1.00×  | 0.30×               |
+| C       | Native Q4 GEMV (AVX2 FMA)                | 2.35  | 1.11×  | 0.34×               |
+| D       | LUT vpshufb kernel (tiled path)          | 1.46  | 0.69×  | 0.21×               |
+| E       | SliM 2.2-bit (quick-mode: 4/32 layers)   | 1.57  | 0.74×  | 0.22×               |
+| F       | FATReLU 85% FFN sparsity                 | 2.74  | 1.29×  | 0.39×               |
+| G       | FATReLU + EAGLE-3 speculative (MTP head) | 1.09  | 0.51×  | 0.16×               |
+| B       | Native GEMV + AR (QCSD off this run)     | 2.42  | 1.14×  | 0.35×               |
 
 **llama.cpp Q4_K_M reference (same hardware class): ~7.0 tok/s**
 
-EAGLE-3 acceptance rate: **0.0%** (measured; Leviathan gate **FAIL** at α≈0.636 vs gate α≈0.778 — subprocess used `ASDSL_FORCE_EAGLE3=1` for empirical throughput). Mean tokens accepted per cycle: **0.00**. **0.54 tok/s** remains to match llama.cpp at the best profile (**F** at 3.46 tok/s).
+EAGLE-3 acceptance rate: **~8.9%** (Profile G subprocess, 64 new tokens on the calculus prompt). Mean tokens accepted per cycle: **~0.36**. Leviathan gate **FAIL** (break-even α ~0.636); subprocess still uses `ASDSL_FORCE_EAGLE3=1` for measurement. **Profile G remains below Profile F** because draft+verify overhead exceeds savings at this α; raising acceptance toward **~35–45%+** (at fixed draft cost) is required before G can exceed F on this stack.
 
-### Performance notes (Phase 9)
+### Performance notes (Phase 10)
 
-- **Profile F** is the fastest configuration in this run (**3.46 tok/s**); native FMA AR edges PyTorch **A** slightly; LUT **D** is slower than **C** here (gather / memory pattern).
-- **Profile G** does not beat **F** until the MTP draft acceptance is non-zero; ensure `models/mtp_head.pt` is present and trained.
-- **KL vs A** (see `validate_outputs_summary.json`): SliM **E** shows large KL (quick-mode partial calibration); **F** is close; **G** diverges when speculative paths disagree with greedy **A**.
+- **Profile C** is faster than **A** again once FATReLU is **not** loaded before the A/C timings.
+- **LUT Profile D** is slower than native **C** on this Raptor Lake run (expected for this workload; see phase notes).
+- **EAGLE-3** was fixed end-to-end (training pairs, warm-forward before draft, native batched verify, FATReLU-aligned collection, retrained `models/mtp_head.pt`). Short prompts that EOS in one cycle can still print **0%** acceptance (0 accepted / small draft count).
 
 ## Known limitations
 
-- **EAGLE-3**: Measured **0%** acceptance on this run; train/deploy `models/mtp_head.pt` and widen the training set to raise α before expecting G > F.
+- **EAGLE-3 throughput**: At **~9%** acceptance, **G < F**; need higher α (more/broader MTP training, larger draft_k only if α supports it) or cheaper verify to beat **F** and approach llama.cpp.
 - **SliM calibration**: Quick-mode metadata calibrates only 4/32 layers; full calibration should shrink footprint and may change Profile E quality and speed.
 - **Full SliM + FATReLU combined**: Profiles E and F are separate; stacking both is future work.
 
