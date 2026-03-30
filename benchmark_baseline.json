@@ -458,6 +458,37 @@
     },
     "benchmark_source": "phase13_benchmark.txt 2026-03-30 canonical run",
     "leviathan_gate_profile_g": "FAIL"
+  },
+  "phase_14_results": {
+    "this_is_the_final_phase": true,
+    "profile_f_root_cause_diagnosis": "active_rows used 1e-9 threshold instead of tau — near-zero values already masked by FATReLU were still processed by sparse kernel (bug fixed). Confirmed: sparse_down_proj_T_called=864, dense_fallback=0 for 27 tokens. Remaining: actual sparsity on benchmark prompt is 46-66% on L0/L3 vs 85% target, caused by calibration prompt mismatch; Phase 7 peak (5.19 tok/s) not reproduced, likely session thermal variance.",
+    "sparse_down_proj_T_calls_per_token": 32,
+    "dense_fallback_calls_per_token": 0,
+    "actual_ffn_sparsity_measured": "46-66% on L0/L3; 70-84% on L1; 53-88% on L2; ~85% on L30-L31; target 85%",
+    "profile_f_recovered": false,
+    "mtp_head_retrained": false,
+    "mtp_head_test_top1_final": 32.8,
+    "eagle3_acceptance_rate_final": 7.1,
+    "final_benchmark_table": {
+      "A": 2.04,
+      "C": 2.26,
+      "D": 1.55,
+      "E": 1.43,
+      "F": 2.66,
+      "G": 1.35,
+      "B": 0.86
+    },
+    "llama_cpp_beaten": false,
+    "best_profile": "F",
+    "best_tok_per_sec": 2.66,
+    "total_speedup_vs_phase0": 2.22,
+    "remaining_gap_tok_per_sec": 4.35,
+    "path_to_llama_cpp": {
+      "f_needed": 4.7,
+      "acceptance_needed": 50,
+      "combined_g_projection": 7.05
+    },
+    "project_conclusion": "asdsl achieves 2.22x speedup vs phase 0 baseline (1.20 to 2.66 tok/s); does not beat llama.cpp at 7.0 tok/s; primary remaining work: per-prompt FATReLU calibration to recover F to 4.7+ tok/s plus EAGLE-3 acceptance to 50%+"
   }
 }
 

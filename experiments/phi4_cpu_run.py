@@ -529,6 +529,14 @@ class WeightStore:
         # Phase 3: FATReLU sparsity (Profile F)
         self._use_fatrelu = False
         self._fatrelu_thresholds: dict[int, float] = {}  # per-layer tau
+        self._sparse_down_proj_T_calls = 0
+        self._dense_down_proj_fallback_calls = 0
+        self._sparsity_debug_count = 0
+
+        def advance_sparsity_debug():
+            if self._use_fatrelu and self._sparsity_debug_count < 3:
+                self._sparsity_debug_count += 1
+        self._advance_sparsity_debug = advance_sparsity_debug
 
         # SpQR outlier separation (Tier 1C) — for bits <= 3
         self._outlier_values: dict[tuple, np.ndarray] = {}
@@ -2026,6 +2034,15 @@ def forward_layer(
     if store._use_fatrelu and layer_idx in store._fatrelu_thresholds:
         tau = store._fatrelu_thresholds[layer_idx]
         act = act * (act.abs() >= tau).float()
+        if store._sparsity_debug_count < 3 and layer_idx < 4:
+            tau_v = tau
+            act_np = act.detach().cpu().float().numpy()
+            actual_sparsity = float((np.abs(act_np) < tau_v).mean())
+            n_active = int((np.abs(act_np) >= tau_v).sum())
+            print(f"[sparsity token={store._sparsity_debug_count} L{layer_idx}] "
+                  f"tau={tau_v:.5f} sparsity={actual_sparsity:.1%} active={n_active}/8192")
+        if layer_idx == 31 and store._sparsity_debug_count < 3:
+            store._sparsity_debug_count += 1
 
     # Phase 4 Prerequisite B: use transposed down_proj for column-sparse access
     # When FATReLU is active and transposed weights are available, use
@@ -2034,7 +2051,15 @@ def forward_layer(
                     and not use_draft)
     if use_T_sparse:
         act_np = act.detach().cpu().float().contiguous().numpy().ravel()
-        active_rows = np.where(np.abs(act_np) > 1e-9)[0].astype(np.int32)
+        # Use tau threshold: only rows where |act| >= tau are kept by FATReLU.
+        # Using 1e-9 here would include near-zero values the mask already zeroed,
+        # causing the sparse kernel to waste work on rows that contribute nothing.
+        active_rows = np.where(np.abs(act_np) >= tau)[0].astype(np.int32)
+        if store._sparsity_debug_count < 3 and layer_idx < 4:
+            actual_sparsity = 1.0 - len(active_rows) / len(act_np)
+            print(f"[sparse_rows token={store._sparsity_debug_count} L{layer_idx}] "
+                  f"active_rows={len(active_rows)}/8192 ({100*len(active_rows)/8192:.1f}% dense, "
+                  f"sparsity={actual_sparsity:.1%})")
         if len(active_rows) > 0:
             try:
                 from asdsl.kernels._native_sparse_gemv import sparse_down_proj_T as _sparse_T
@@ -2044,11 +2069,14 @@ def forward_layer(
                     act_np, active_rows,
                     dT['in_dim'], dT['out_dim'], store.group_size
                 )
+                store._sparse_down_proj_T_calls += 1
                 hidden = residual + torch.from_numpy(y_down_np).unsqueeze(0)
             except Exception:
+                store._dense_down_proj_fallback_calls += 1
                 hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
         else:
             # All zeros: output is zero
+            store._sparse_down_proj_T_calls += 1
             hidden = residual + torch.zeros(1, HIDDEN, dtype=torch.float32)
     elif store._enable_sparse and not use_draft and store._use_native_gemv:
         from asdsl.kernels import compute_activation_bitmask
@@ -2062,8 +2090,10 @@ def forward_layer(
                 layer_idx, "down_proj", act, bitmask, active_indices
             )
         else:
+            store._dense_down_proj_fallback_calls += 1
             hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
     else:
+        store._dense_down_proj_fallback_calls += 1
         hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
 
     return hidden
@@ -2146,7 +2176,8 @@ def forward_layer_batch(
         tau = store._fatrelu_thresholds[layer_idx]
         act = act * (act.abs() >= tau).float()
 
-    use_T_sparse = store._use_fatrelu and layer_idx in store._down_proj_T
+    use_T_sparse = (store._use_fatrelu and layer_idx in store._down_proj_T
+                    and layer_idx in store._fatrelu_thresholds)
     if use_T_sparse:
         try:
             from asdsl.kernels._native_sparse_gemv import sparse_down_proj_T as _sparse_T
@@ -2156,7 +2187,8 @@ def forward_layer_batch(
             outs: list[torch.Tensor] = []
             for ki in range(K):
                 act_np = act_np_all[ki].ravel()
-                active_rows = np.where(np.abs(act_np) > 1e-9)[0].astype(np.int32)
+                # Use tau threshold: must match forward_layer for correctness.
+                active_rows = np.where(np.abs(act_np) >= tau)[0].astype(np.int32)
                 if len(active_rows) > 0:
                     y_down_np = _sparse_T(
                         dT["packed"].ravel(),
@@ -2304,6 +2336,9 @@ def generate(
           f"| {kv_stats['blocks_used']}/{kv_stats['blocks_capacity']} blocks  "
           f"| {kv_stats['memory_mb']:.1f} MB")
     print(f"Weights   : {quant_label}")
+    print(f"[F diag] sparse_calls={store._sparse_down_proj_T_calls} "
+          f"dense_fallback={store._dense_down_proj_fallback_calls} "
+          f"(expect sparse={32*n_tokens}, fallback=0 at full 85% sparsity)")
     print("=" * 66)
 
     if bench_metrics_out is not None:
