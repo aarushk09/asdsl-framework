@@ -2858,6 +2858,9 @@ def generate_eagle3(
     total_accepted_per_cycle: list[int] = []
     t_decode_start = time.perf_counter()
     speculative_cycles = 0
+    total_verify_passes = 0
+    total_alignment_run_forward = 0
+    total_bonus_one_row_pass = 0
 
     durations = {
         "draft": 0.0,
@@ -2898,6 +2901,11 @@ def generate_eagle3(
 
                 # ── VERIFY PHASE (BATCHED PRIMARY MODEL) ─────────────
                 L = len(draft_tokens)
+                # L rows: [current] + draft[:-1] — same acceptance checks as QCSD.
+                # When all L drafts match, bonus logits come from a separate 1-row
+                # batched pass over draft[-1] (same FLOPs as old run_forward, but no
+                # wasted extra verify row on reject cycles — L+1-wide verify every
+                # cycle was ~3× cost on reject: 2 verify rows + correction forward).
                 verify_tokens = [current_token] + draft_tokens[:-1] if L > 0 else [current_token]
                 n_verify = len(verify_tokens)
 
@@ -2906,6 +2914,7 @@ def generate_eagle3(
                 )
 
                 speculative_cycles += 1
+                total_verify_passes += 1
                 t_v0 = time.perf_counter()
                 for i in range(NUM_LAYERS):
                     hidden_batch = forward_layer_batch(
@@ -2913,14 +2922,9 @@ def generate_eagle3(
                 durations["verify_layers"] += time.perf_counter() - t_v0
 
                 t_h0 = time.perf_counter()
-                hidden_batch = rms_norm(hidden_batch, store.final_norm)
-                all_logits = store.lm_head_matmul_batch(hidden_batch)
+                hidden_norm = rms_norm(hidden_batch, store.final_norm)
+                all_logits = store.lm_head_matmul_batch(hidden_norm)
                 durations["verify_head"] += time.perf_counter() - t_h0
-
-                # Update _last_final_hidden from last verify position
-                store._last_final_hidden = (
-                    hidden_batch[-1].detach().cpu().float().numpy().ravel()
-                )
 
                 # Record KV tracker
                 t_tr0 = time.perf_counter()
@@ -2965,15 +2969,21 @@ def generate_eagle3(
                 if stop_decode:
                     break
 
-                # KV alignment
+                # KV alignment — all-accepted: reuse verify batch row L (bonus logits +
+                # final hidden). Reject: trim KV and run one target forward for correction.
                 t_al0 = time.perf_counter()
                 if L == 0:
                     logits = all_logits[0]
+                    store._last_final_hidden = (
+                        hidden_norm[0].detach().cpu().float().numpy().ravel()
+                    )
                     pos += 1
                 elif correction is not None:
                     n_keep = 1 + len(accepted)
                     if n_keep < n_verify:
                         kv_hist.restore_len(draft_start_pos + n_keep)
+                    # Rejection: need target forward from correction token (unavoidable).
+                    total_alignment_run_forward += 1
                     logits = run_forward(
                         correction,
                         draft_start_pos + n_keep,
@@ -2988,12 +2998,23 @@ def generate_eagle3(
                     if correction in EOS_TOKEN_IDS:
                         break
                 else:
-                    logits = run_forward(
-                        draft_tokens[-1],
-                        draft_start_pos + n_verify,
-                        kv_hist,
-                        need_logits=True,
-                        hook_logits=True,
+                    # All drafts matched: one batched row for draft[-1] (bonus logits +
+                    # _last_final_hidden). Replaces run_forward(draft[-1]) so reject
+                    # cycles are not charged an unnecessary serial forward on accept.
+                    total_bonus_one_row_pass += 1
+                    bonus_row = store.embed_f16[draft_tokens[-1]].float().unsqueeze(0)
+                    for i in range(NUM_LAYERS):
+                        bonus_row = forward_layer_batch(
+                            bonus_row, i, store, kv_hist, rope_cos, rope_sin,
+                            draft_start_pos + L,
+                        )
+                    bonus_h = rms_norm(bonus_row, store.final_norm)
+                    bonus_logits = store.lm_head_matmul_batch(bonus_h)
+                    logits = bonus_logits[0]
+                    if logits_hook is not None:
+                        logits_hook(logits.detach().cpu().float().numpy().ravel())
+                    store._last_final_hidden = (
+                        bonus_h[0].detach().cpu().float().numpy().ravel()
                     )
                     pos += n_verify + 1
                     if draft_tokens[-1] in EOS_TOKEN_IDS:
@@ -3028,6 +3049,13 @@ def generate_eagle3(
     print(f"  Verify H: {durations['verify_head']/max(1, speculative_cycles):.3f}s")
     print(f"  Tracker : {durations['tracker']/max(1, speculative_cycles):.3f}s")
     print(f"  Align   : {durations['alignment']/max(1, speculative_cycles):.3f}s")
+    _cyc = max(1, speculative_cycles)
+    print(
+        f"[EAGLE-3] {_cyc} cycles: verify_passes={total_verify_passes} "
+        f"reject_run_forward={total_alignment_run_forward} "
+        f"bonus_1row_batch={total_bonus_one_row_pass} "
+        f"(target: 0 serial run_forward on all-accept; reject still needs 1)"
+    )
     print("=" * 66)
 
     if bench_metrics_out is not None:
@@ -3039,6 +3067,9 @@ def generate_eagle3(
             "mean_tokens_accepted_per_cycle": mean_acc_per_cycle,
             "draft_k": draft_k,
             "eagle3_speculative_cycles": speculative_cycles,
+            "eagle3_verify_passes": total_verify_passes,
+            "eagle3_alignment_run_forward": total_alignment_run_forward,
+            "eagle3_bonus_one_row_pass": total_bonus_one_row_pass,
         })
 
     return response_text

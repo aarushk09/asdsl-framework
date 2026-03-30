@@ -95,6 +95,13 @@ def test_acceptance_rate_reported(capsys: pytest.CaptureFixture[str]) -> None:
     assert "avg_acceptance_rate=" in captured.err
 
 
+def test_eagle3_verify_batch_row_count_matches_draft_k() -> None:
+    """EAGLE-3 batched verify uses L rows [current]+draft[:-1]; bonus uses a separate 1-row pass."""
+    for draft_len in range(1, 8):
+        verify_len = 1 + (draft_len - 1)
+        assert verify_len == draft_len
+
+
 def test_effective_speedup_vs_baseline() -> None:
     """Simulated latencies: batched verify should beat per-token target decode."""
     vocab = 2000

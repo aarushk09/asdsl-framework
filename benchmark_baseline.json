@@ -385,6 +385,35 @@
     "note_on_profile_d": "LUT vpshufb is consistently slower than native FMA GEMV on Raptor Lake due to gather latency exceeding shuffle benefit; architectural mismatch for this hardware generation; not a regression",
     "final_benchmark_source": "phase11_baseline_run.txt (run 1); run 2 F=3.09 tok/s G acceptance 10.2% for variance check",
     "leviathan_gate_profile_g": "FAIL"
+  },
+  "phase_12_results": {
+    "bug_fixed": "generate_eagle3 all-accept path used run_forward(draft[-1]) after verify; reject path still requires run_forward(correction). All-accept now uses a single-row forward_layer_batch over draft[-1] for bonus logits and _last_final_hidden (no serial run_forward). Avoided unconditional L+1-wide verify that wasted an extra row on every reject cycle.",
+    "correction_passes_per_cycle_before": 1.0,
+    "correction_passes_per_cycle_after": 0.0,
+    "correction_passes_note": "0.0 = serial run_forward calls on all-accept bonus path after verify; reject cycles still use one run_forward(correction) per cycle (mean ~0.89 at ~11% accept-all-draft cycles)",
+    "eagle3_acceptance_rate": 11.1,
+    "eagle3_tokens_per_cycle_expected": 1.111,
+    "eagle3_tokens_per_cycle_leviathan_cost": 1.0,
+    "profile_f_tok_per_sec": 2.98,
+    "profile_g_tok_per_sec": 1.22,
+    "profile_g_vs_profile_f": 0.409,
+    "eagle3_net_positive": false,
+    "final_benchmark_table": {
+      "A": 2.18,
+      "C": 2.4,
+      "D": 1.74,
+      "E": 1.67,
+      "F": 2.98,
+      "G": 1.22,
+      "B": 0.92
+    },
+    "llama_cpp_beaten": false,
+    "best_tok_per_sec": 2.98,
+    "best_profile": "F",
+    "total_speedup_vs_1_20": 2.4833333333333334,
+    "remaining_gap_tok_per_sec": 4.02,
+    "benchmark_source": "phase12_benchmark.txt 2026-03-30 canonical run",
+    "leviathan_gate_profile_g": "FAIL"
   }
 }
 

@@ -353,37 +353,35 @@ CLI flags that override these values print **`[CONFIG] WARNING:`** unless you pa
 
 ## Benchmark results
 
-Hardware: Intel Core (Raptor Lake, Family 6 Model 186), 12 physical cores, 16.9 GB RAM, AVX2, Windows 11, no GPU. **Phase 11** (2026-03-30): `ASDSL_PROFILE_SLEEP=3` and  
-`python scripts/run_full_benchmark.py --phi4 --threads 8 --fatrelu-thresholds phi4_fatrelu_thresholds.json --slim-meta phi4_slim_meta.json`  
-with prompt / `max_new_tokens` / `draft_k` taken from **`benchmark_config.json`** (no overrides). MTP head retrained with **OOD test_top1** early stopping; **draft_k=1** after `choose_draft_k.py`. Two consecutive Profile **F** runs: **3.12** and **3.09** tok/s (~**1%** spread). Load+quantize parent process ~**934–945 s** on these runs.
+Hardware: Intel Core (Raptor Lake, Family 6 Model 186), 12 physical cores, 16.9 GB RAM, AVX2, Windows 11, no GPU. **Phase 12** (2026-03-30): same canonical command and **`benchmark_config.json`** as Phase 11. **EAGLE-3 change:** when every draft in a cycle matches the target verify, the bonus logits and `_last_final_hidden` now come from a **single-row `forward_layer_batch`** over `draft[-1]` instead of **`run_forward`**, so the all-accept path no longer uses the serial forward wrapper; reject cycles still call **`run_forward(correction)`** once. Load+quantize parent process ~**1093 s** on the recorded run.
 
 ## Final results
 
 | Profile | Configuration                            | tok/s | vs baseline | vs llama.cpp |
 |---------|------------------------------------------|-------|-------------|--------------|
-| A       | PyTorch baseline                         | 2.40  | 1.00×       | 0.34×        |
-| C       | Native Q4 GEMV (AVX2 FMA)               | 2.56  | 1.07×       | 0.37×        |
-| D       | LUT vpshufb (slower on Raptor Lake†)     | 1.82  | 0.76×       | 0.26×        |
-| E       | SliM 2.2-bit + LUT (4/32 layers)        | 1.74  | 0.73×       | 0.25×        |
-| F       | FATReLU 85% FFN sparsity                | 3.12  | 1.30×       | 0.45×        |
-| G       | FATReLU + EAGLE-3 MTP (draft_k=1)       | 1.32  | 0.55×       | 0.19×        |
-| B       | Legacy QCSD (2-bit draft bank)          | 0.99  | 0.41×       | 0.14×        |
+| A       | PyTorch baseline                         | 2.18  | 1.00×       | 0.31×        |
+| C       | Native Q4 GEMV (AVX2 FMA)               | 2.40  | 1.10×       | 0.34×        |
+| D       | LUT vpshufb (slower on Raptor Lake†)     | 1.74  | 0.80×       | 0.25×        |
+| E       | SliM 2.2-bit + LUT (4/32 layers)        | 1.67  | 0.77×       | 0.24×        |
+| F       | FATReLU 85% FFN sparsity                | 2.98  | 1.37×       | 0.43×        |
+| G       | FATReLU + EAGLE-3 MTP (draft_k=1)       | 1.22  | 0.56×       | 0.17×        |
+| B       | Legacy QCSD (2-bit draft bank)          | 0.92  | 0.42×       | 0.13×        |
 
 †Profile D is slower than Profile C on this hardware because `_mm_i32gather_ps` latency (~20 cycles) on Raptor Lake often outweighs the vpshufb shuffle path. The LUT approach tends to pay off more on AMD Zen 4 or ARM Neoverse class cores.
 
 **llama.cpp Q4_K_M reference (same hardware class): ~7.0 tok/s**
 
-EAGLE-3 acceptance rate: **~13.5%** (Profile G subprocess, first canonical run; second run **~10.2%**). Mean tokens accepted per cycle: **~0.54** (first run). Leviathan gate for **G** at **draft_k=1**: **FAIL** (break-even α ~**22.1%**). **Profile G remains below Profile F** (1.32 vs 3.12 tok/s): net speculative gain is still insufficient at measured α and verify cost.
+EAGLE-3 acceptance rate: **~11.1%** (Profile G subprocess, Phase 12 run). Mean tokens accepted per cycle: **~0.44**. Decode summary prints **`reject_run_forward`** vs **`bonus_1row_batch`** per run. Leviathan gate for **G** at **draft_k=1**: **FAIL** (break-even α ~**22.1%**). **Profile G remains below Profile F** on this run (1.22 vs 2.98 tok/s).
 
-### Performance notes (Phase 11)
+### Performance notes (Phase 12)
 
-- **Canonical config** removes prompt / token-count drift as the dominant explanation for Profile F spread between phases.
-- **MTP training** now optimizes **test_top1** on held-out prompts (including the benchmark prompt); full run reached **~32.8%** test top-1 with early stopping on test plateaus.
-- **draft_k** is **1** here because at **α ≈ 0.33** (proxy from test top-1) Leviathan **S** peaks at **k=1**; **k=2** falls slightly below **1.0×**.
+- **Phase 11 → 12:** Throughput varies with cold load and RSS; compare **F** and **G** from the **same** benchmark session (table above).
+- **EAGLE-3:** An earlier **(L+1)-wide verify every cycle** experiment regressed **G** by doing useless verify rows on reject-heavy runs; production fix keeps **L-row** verify and moves the all-accept continuation to a **dedicated 1-row batch** (same matmul work as the old `run_forward` bonus, without widening verify).
+- **QCSD Profile B** still reports **`extra target run_forward after verify`** from **`generate_qcsd`**; that path is unchanged in Phase 12.
 
 ## Known limitations
 
-- **EAGLE-3 throughput**: At **~9%** acceptance, **G < F**; need higher α (more/broader MTP training, larger draft_k only if α supports it) or cheaper verify to beat **F** and approach llama.cpp.
+- **EAGLE-3 throughput**: At **~11%** acceptance, **G < F**; need higher α (more/broader MTP training, larger draft_k only if α supports it) or cheaper verify to beat **F** and approach llama.cpp.
 - **SliM calibration**: Quick-mode metadata calibrates only 4/32 layers; full calibration should shrink footprint and may change Profile E quality and speed.
 - **Full SliM + FATReLU combined**: Profiles E and F are separate; stacking both is future work.
 
