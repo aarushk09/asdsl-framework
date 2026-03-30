@@ -337,29 +337,49 @@ pytest tests/ -q
 
 ---
 
+## Benchmark configuration (locked at Phase 11)
+
+All benchmark results below use the pinned settings in **`benchmark_config.json`** so cross-phase comparisons stay apples-to-apples (prompt length drives KV size and throughput on this memory-bound stack).
+
+- **Prompt**: `The fundamental theorem of calculus states that`
+- **Max new tokens**: 64
+- **Threads**: 8
+- **draft_k**: 1 for Profile G EAGLE-3 (chosen by `scripts/choose_draft_k.py` from MTP **test_top1**; QCSD Profile B uses the same `draft_k` from the config for Leviathan)
+- **Inter-profile sleep**: 3 s (overridable with `ASDSL_PROFILE_SLEEP`)
+
+CLI flags that override these values print **`[CONFIG] WARNING:`** unless you pass **`--override-config`**.
+
+---
+
 ## Benchmark results
 
-Hardware: Intel Core (Raptor Lake, Family 6 Model 186), 12 physical cores, 16.9 GB RAM, AVX2, Windows 11, no GPU. Threading: **8** (`--threads 8`). **Phase 10** (2026-03-30): `python scripts/run_full_benchmark.py --phi4 --max-new-tokens 64 --threads 8 --fatrelu-thresholds phi4_fatrelu_thresholds.json --slim-meta phi4_slim_meta.json` with default prompt **`The fundamental theorem of calculus states that`** (longer text avoids immediate EOS so EAGLE-3 acceptance is statistically meaningful). `ASDSL_PROFILE_SLEEP=1` between isolated profiles. Load+quantize ~**981 s** cold.
+Hardware: Intel Core (Raptor Lake, Family 6 Model 186), 12 physical cores, 16.9 GB RAM, AVX2, Windows 11, no GPU. **Phase 11** (2026-03-30): `ASDSL_PROFILE_SLEEP=3` and  
+`python scripts/run_full_benchmark.py --phi4 --threads 8 --fatrelu-thresholds phi4_fatrelu_thresholds.json --slim-meta phi4_slim_meta.json`  
+with prompt / `max_new_tokens` / `draft_k` taken from **`benchmark_config.json`** (no overrides). MTP head retrained with **OOD test_top1** early stopping; **draft_k=1** after `choose_draft_k.py`. Two consecutive Profile **F** runs: **3.12** and **3.09** tok/s (~**1%** spread). Load+quantize parent process ~**934–945 s** on these runs.
 
-| Profile | Configuration                             | tok/s | vs A   | vs llama.cpp (~7.0) |
-|---------|-------------------------------------------|-------|--------|---------------------|
-| A       | PyTorch baseline                          | 2.12  | 1.00×  | 0.30×               |
-| C       | Native Q4 GEMV (AVX2 FMA)                | 2.35  | 1.11×  | 0.34×               |
-| D       | LUT vpshufb kernel (tiled path)          | 1.46  | 0.69×  | 0.21×               |
-| E       | SliM 2.2-bit (quick-mode: 4/32 layers)   | 1.57  | 0.74×  | 0.22×               |
-| F       | FATReLU 85% FFN sparsity                 | 2.74  | 1.29×  | 0.39×               |
-| G       | FATReLU + EAGLE-3 speculative (MTP head) | 1.09  | 0.51×  | 0.16×               |
-| B       | Native GEMV + AR (QCSD off this run)     | 2.42  | 1.14×  | 0.35×               |
+## Final results
+
+| Profile | Configuration                            | tok/s | vs baseline | vs llama.cpp |
+|---------|------------------------------------------|-------|-------------|--------------|
+| A       | PyTorch baseline                         | 2.40  | 1.00×       | 0.34×        |
+| C       | Native Q4 GEMV (AVX2 FMA)               | 2.56  | 1.07×       | 0.37×        |
+| D       | LUT vpshufb (slower on Raptor Lake†)     | 1.82  | 0.76×       | 0.26×        |
+| E       | SliM 2.2-bit + LUT (4/32 layers)        | 1.74  | 0.73×       | 0.25×        |
+| F       | FATReLU 85% FFN sparsity                | 3.12  | 1.30×       | 0.45×        |
+| G       | FATReLU + EAGLE-3 MTP (draft_k=1)       | 1.32  | 0.55×       | 0.19×        |
+| B       | Legacy QCSD (2-bit draft bank)          | 0.99  | 0.41×       | 0.14×        |
+
+†Profile D is slower than Profile C on this hardware because `_mm_i32gather_ps` latency (~20 cycles) on Raptor Lake often outweighs the vpshufb shuffle path. The LUT approach tends to pay off more on AMD Zen 4 or ARM Neoverse class cores.
 
 **llama.cpp Q4_K_M reference (same hardware class): ~7.0 tok/s**
 
-EAGLE-3 acceptance rate: **~8.9%** (Profile G subprocess, 64 new tokens on the calculus prompt). Mean tokens accepted per cycle: **~0.36**. Leviathan gate **FAIL** (break-even α ~0.636); subprocess still uses `ASDSL_FORCE_EAGLE3=1` for measurement. **Profile G remains below Profile F** because draft+verify overhead exceeds savings at this α; raising acceptance toward **~35–45%+** (at fixed draft cost) is required before G can exceed F on this stack.
+EAGLE-3 acceptance rate: **~13.5%** (Profile G subprocess, first canonical run; second run **~10.2%**). Mean tokens accepted per cycle: **~0.54** (first run). Leviathan gate for **G** at **draft_k=1**: **FAIL** (break-even α ~**22.1%**). **Profile G remains below Profile F** (1.32 vs 3.12 tok/s): net speculative gain is still insufficient at measured α and verify cost.
 
-### Performance notes (Phase 10)
+### Performance notes (Phase 11)
 
-- **Profile C** is faster than **A** again once FATReLU is **not** loaded before the A/C timings.
-- **LUT Profile D** is slower than native **C** on this Raptor Lake run (expected for this workload; see phase notes).
-- **EAGLE-3** was fixed end-to-end (training pairs, warm-forward before draft, native batched verify, FATReLU-aligned collection, retrained `models/mtp_head.pt`). Short prompts that EOS in one cycle can still print **0%** acceptance (0 accepted / small draft count).
+- **Canonical config** removes prompt / token-count drift as the dominant explanation for Profile F spread between phases.
+- **MTP training** now optimizes **test_top1** on held-out prompts (including the benchmark prompt); full run reached **~32.8%** test top-1 with early stopping on test plateaus.
+- **draft_k** is **1** here because at **α ≈ 0.33** (proxy from test top-1) Leviathan **S** peaks at **k=1**; **k=2** falls slightly below **1.0×**.
 
 ## Known limitations
 

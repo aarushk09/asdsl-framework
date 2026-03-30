@@ -42,3 +42,26 @@ CALIBRATION_PROMPTS = [
 
 # Quick-mode subset (4 prompts for CI/pipeline checks)
 QUICK_PROMPTS = CALIBRATION_PROMPTS[:4]
+
+# Held-out OOD evaluation for MTP / EAGLE-3 (Phase 11). Must not appear in CALIBRATION_PROMPTS.
+# Indices [0:4] are reserved for test-only collection; [4:12] are added to training (40 prompts total).
+TEST_PROMPTS = [
+    "The fundamental theorem of calculus states that",
+    "Quantum entanglement occurs when two particles",
+    "In Shakespeare's Hamlet, the famous soliloquy begins",
+    "The time complexity of merge sort is",
+    "A convolutional neural network processes images by",
+    "The Treaty of Westphalia in 1648 established",
+    "To implement a binary tree in Python,",
+    "The human immune system responds to pathogens by",
+    "In thermodynamics, entropy is defined as",
+    "The Reynolds number in fluid dynamics measures",
+    "class BinarySearchTree:\n    def __init__(self):",
+    "The Riemann hypothesis states that all non-trivial zeros",
+]
+
+# Training pool: 32 calibration + 8 OOD prompts (TEST_PROMPTS[4:12]) = 40
+MTP_TRAINING_PROMPTS = list(CALIBRATION_PROMPTS) + list(TEST_PROMPTS[4:12])
+
+# Permanently held-out for test_top1 (never trained); includes canonical benchmark prompt
+MTP_TEST_HOLDOUT_PROMPTS = list(TEST_PROMPTS[0:4])

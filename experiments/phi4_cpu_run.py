@@ -3152,10 +3152,25 @@ def chat(
 # Main
 # ---------------------------------------------------------------------------
 
+def _default_benchmark_prompt() -> str:
+    root = Path(__file__).resolve().parent.parent
+    p = root / "benchmark_config.json"
+    if not p.is_file():
+        return "What is 2+2?"
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+        return str(cfg.get("prompt", "What is 2+2?"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return "What is 2+2?"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phi-4 CPU inference via ASDSL")
-    parser.add_argument("--prompt", default="What is 2+2?",
-                        help="Single-turn prompt (ignored when --chat is used)")
+    parser.add_argument(
+        "--prompt",
+        default=_default_benchmark_prompt(),
+        help="Single-turn prompt (default from benchmark_config.json when present)",
+    )
     parser.add_argument("--chat", action="store_true",
                         help="Start an interactive multi-turn chat session")
     parser.add_argument("--max-new-tokens", type=int, default=80)

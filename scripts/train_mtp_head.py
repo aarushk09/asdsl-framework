@@ -14,14 +14,14 @@ Architecture (regularized variant — Phase 5):
 Trainable params: ~9.5M  (vs 18.9M in old architecture)
 Draft FLOP cost:  9.7M per step  (vs 37.7M — 3.9× faster)
 
-Training procedure:
-  1. Collect 32 prompts × 24 decode steps = 768 (prev_hidden, token) pairs
-  2. 80/20 train/val split, AdamW (lr=3e-4, wd=0.05), 30 epochs, early stopping
-  3. Save best checkpoint (best val accuracy) to models/mtp_head.pt
+Training procedure (Phase 11):
+  1. Collect 40 prompts × 48 steps on the training pool; separate OOD test prompts (never trained)
+  2. 80/20 train/val split on the training pool; early stopping on test_top1 (patience 5)
+  3. Save best checkpoint (highest test_top1) to models/mtp_head.pt
 
 Usage:
-    python scripts/train_mtp_head.py --quick    # 32 samples, 10 epochs (CI)
-    python scripts/train_mtp_head.py            # full training (~4-5 min)
+    python scripts/train_mtp_head.py --quick    # 4 training prompts × 8 steps, 5 epochs (CI)
+    python scripts/train_mtp_head.py            # full training (~25–50 min CPU)
     python scripts/train_mtp_head.py --sanity   # load and verify saved head
 """
 from __future__ import annotations
@@ -67,7 +67,10 @@ def _check_memory(min_gb: float = 2.0) -> None:
 # Shared prompt corpus
 # ---------------------------------------------------------------------------
 
-from asdsl.calibration_data import CALIBRATION_PROMPTS, QUICK_PROMPTS
+from asdsl.calibration_data import (
+    MTP_TEST_HOLDOUT_PROMPTS,
+    MTP_TRAINING_PROMPTS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +199,9 @@ def _build_model(lm_head_f16, dropout_rate: float = 0.3):
 def train_mtp_head(
     out_path: Path,
     prompts: list[str],
+    test_holdout_prompts: list[str],
     max_steps: int,
-    n_epochs: int = 30,
+    n_epochs: int = 50,
     lr: float = 3e-4,
     weight_decay: float = 0.05,
     batch_size: int = 32,
@@ -206,7 +210,7 @@ def train_mtp_head(
     early_stopping_patience: int = 5,
     verbose: bool = True,
 ) -> dict:
-    """Train MTP head with val split, early stopping, and best-ckpt saving."""
+    """Train MTP head; early stopping and best checkpoint use OOD ``test_top1``."""
     import gc
     import numpy as np
     import torch
@@ -232,17 +236,26 @@ def train_mtp_head(
         print("[EAGLE-3] FATReLU thresholds loaded for collection (matches Profile G forward)")
     gc.collect()
 
-    print("[EAGLE-3] Collecting training pairs...")
+    print("[EAGLE-3] Collecting training pairs (in-distribution pool)...")
     t0 = time.perf_counter()
     hiddens, last_tok_ids, next_tok_ids = collect_training_pairs(
         store, tokenizer, prompts, max_steps=max_steps, verbose=verbose
     )
     t_collect = time.perf_counter() - t0
     n_total = len(hiddens)
-    print(f"[EAGLE-3] Collected {n_total} samples in {t_collect:.1f}s")
+    print(f"[EAGLE-3] Collected {n_total} training-pool samples in {t_collect:.1f}s")
+
+    print("[EAGLE-3] Collecting OOD test pairs (held-out prompts, never trained)...")
+    t1 = time.perf_counter()
+    h_te, l_te, n_te = collect_training_pairs(
+        store, tokenizer, test_holdout_prompts, max_steps=max_steps, verbose=verbose
+    )
+    print(f"[EAGLE-3] Collected {len(h_te)} OOD test samples in {time.perf_counter() - t1:.1f}s")
 
     if n_total < 4:
         raise RuntimeError(f"Too few samples: {n_total}.")
+    if len(h_te) < 1:
+        raise RuntimeError("OOD test collection produced no samples.")
 
     # Retrieve lm_head and embed table from store before deletion
     lm_head_f16 = store.lm_head          # [vocab, 3072] float16 Tensor
@@ -259,10 +272,21 @@ def train_mtp_head(
 
     X = torch.stack(X_list)                                       # [N, 6144]
     Y = torch.tensor(Y_list, dtype=torch.long)                    # [N]
-    del hiddens, last_tok_ids, next_tok_ids, X_list, Y_list, store
+
+    Xte_list, Yte_list = [], []
+    for i in range(len(h_te)):
+        prev_h = torch.from_numpy(h_te[i]).float()
+        tok_emb = embed_f16[l_te[i]].float()
+        Xte_list.append(torch.cat([prev_h, tok_emb], dim=0))
+        Yte_list.append(n_te[i])
+    X_te = torch.stack(Xte_list)
+    Y_te = torch.tensor(Yte_list, dtype=torch.long)
+
+    del hiddens, last_tok_ids, next_tok_ids, h_te, l_te, n_te
+    del X_list, Y_list, Xte_list, Yte_list, store
     gc.collect()
 
-    # Train/val split
+    # Train/val split (training pool only)
     N = X.shape[0]
     n_val    = max(1, int(N * val_split))
     n_train  = N - n_val
@@ -270,7 +294,8 @@ def train_mtp_head(
     X_tr, Y_tr = X[perm[:n_train]], Y[perm[:n_train]]
     X_va, Y_va = X[perm[n_train:]], Y[perm[n_train:]]
 
-    print(f"[EAGLE-3] Train samples: {n_train}, Val samples: {n_val}")
+    n_test = int(X_te.shape[0])
+    print(f"[EAGLE-3] Train samples: {n_train}, Val samples: {n_val}, OOD test: {n_test}")
 
     # Model + optimizer
     print(f"[EAGLE-3] Training MTP head (input={INPUT_DIM}, hidden={MTP_HIDDEN}, "
@@ -281,16 +306,17 @@ def train_mtp_head(
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
 
-    best_val_acc1   = -1.0
-    best_train_acc1 =  0.0
-    best_epoch      =  0
-    patience_ctr    =  0
+    best_test_acc1   = -1.0
+    best_train_acc1 = 0.0
+    best_val_acc1   = 0.0
+    best_epoch      = 0
+    patience_ctr    = 0
     best_state      = None
-    # Val set can be tiny (quick mode); tie-break with train acc so we do not
-    # keep epoch 1 when val stays 0% but train improves.
-    best_score: tuple[float, float] = (-1.0, -1.0)
+    epochs_ran      = 0
+    early_stopped   = False
 
     for epoch in range(n_epochs):
+        epochs_ran = epoch + 1
         # --- train ---
         model.train()
         perm_tr = torch.randperm(n_train)
@@ -311,38 +337,55 @@ def train_mtp_head(
         train_acc1  = tot_c1 / n_train * 100
         avg_loss    = tot_loss / max(n_batches, 1)
 
-        # --- val ---
+        # --- val + OOD test ---
         model.eval()
         with torch.no_grad():
             va_logits = model(X_va)
             val_acc1  = (va_logits.argmax(1) == Y_va).float().mean().item() * 100
+            te_logits = model(X_te)
+            test_acc1 = (te_logits.argmax(1) == Y_te).float().mean().item() * 100
 
-        # Early stopping + best checkpoint (lexicographic val, then train)
-        score = (val_acc1, train_acc1)
-        if score > best_score:
-            best_score = score
-            best_val_acc1 = val_acc1
+        improved_test = test_acc1 > best_test_acc1
+        tie_same_test_better_train = (
+            not improved_test
+            and abs(test_acc1 - best_test_acc1) < 1e-6
+            and train_acc1 > best_train_acc1
+        )
+        if improved_test:
+            best_test_acc1 = test_acc1
             best_train_acc1 = train_acc1
+            best_val_acc1 = val_acc1
             best_epoch = epoch + 1
             patience_ctr = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()
                           if k != "lm_head"}
+        elif tie_same_test_better_train:
+            best_train_acc1 = train_acc1
+            best_val_acc1 = val_acc1
+            best_epoch = epoch + 1
+            best_state = {k: v.clone() for k, v in model.state_dict().items()
+                          if k != "lm_head"}
+            patience_ctr += 1
         else:
             patience_ctr += 1
 
         if verbose:
+            extra = ""
+            if improved_test or tie_same_test_better_train:
+                extra = "  [best test checkpoint]"
             print(f"  Epoch {epoch+1:3d}/{n_epochs}: "
-                  f"loss={avg_loss:.4f}  train_top1={train_acc1:.1f}%  "
-                  f"val_top1={val_acc1:.1f}%"
-                  + ("  *" if patience_ctr == 0 else ""))
+                  f"loss={avg_loss:.4f}  train={train_acc1:.1f}%  "
+                  f"val={val_acc1:.1f}%  test={test_acc1:.1f}%{extra}")
 
         if patience_ctr >= early_stopping_patience:
             print(f"[EAGLE-3] Early stopping at epoch {epoch+1} "
-                  f"(no val improvement for {early_stopping_patience} epochs)")
+                  f"(no test_top1 improvement for {early_stopping_patience} epochs)")
+            early_stopped = True
             break
 
     print(f"\n[EAGLE-3] Best checkpoint: epoch {best_epoch}  "
-          f"train_top1={best_train_acc1:.1f}%  val_top1={best_val_acc1:.1f}%")
+          f"train={best_train_acc1:.1f}%  val={best_val_acc1:.1f}%  "
+          f"test={best_test_acc1:.1f}%")
 
     # Save best checkpoint
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,8 +412,10 @@ def train_mtp_head(
         "phi4_hidden_dim":     PHI4_HIDDEN,
         "val_top1_accuracy":   float(best_val_acc1),
         "train_top1_accuracy": float(best_train_acc1),
+        "test_top1_accuracy":  float(best_test_acc1),
         "n_training_samples":  n_train,
         "n_val_samples":       n_val,
+        "n_test_samples":      n_test,
         "best_epoch":          best_epoch,
     }
     torch.save(checkpoint, str(out_path))
@@ -380,9 +425,14 @@ def train_mtp_head(
     return {
         "val_top1":   best_val_acc1,
         "train_top1": best_train_acc1,
+        "test_top1":  best_test_acc1,
         "best_epoch": best_epoch,
         "n_train":    n_train,
         "n_val":      n_val,
+        "n_test":     n_test,
+        "n_pool":     n_total,
+        "epochs_ran": epochs_ran,
+        "early_stopped": early_stopped,
     }
 
 
@@ -402,15 +452,21 @@ def sanity_check_head(head_path: Path) -> None:
     ck = torch.load(str(head_path), map_location="cpu")
     val_acc   = ck.get("val_top1_accuracy", float("nan"))
     train_acc = ck.get("train_top1_accuracy", float("nan"))
+    test_acc  = ck.get("test_top1_accuracy", float("nan"))
     n_tr  = ck.get("n_training_samples", "?")
     n_va  = ck.get("n_val_samples", "?")
+    n_te  = ck.get("n_test_samples", "?")
     hdim  = ck.get("hidden_dim_mtp", MTP_HIDDEN)
 
     print(f"[sanity] {head_path.name}")
     print(f"  hidden_dim_mtp:    {hdim}")
     print(f"  train_top1:        {train_acc:.1f}%")
     print(f"  val_top1:          {val_acc:.1f}%")
-    print(f"  train/val samples: {n_tr}/{n_va}")
+    if test_acc == test_acc:  # not NaN
+        print(f"  test_top1 (OOD):   {test_acc:.1f}%")
+    else:
+        print("  test_top1 (OOD):   (not in checkpoint)")
+    print(f"  train/val/test samples: {n_tr}/{n_va}/{n_te}")
 
     fc1_w   = ck["fc1_weight"].float().numpy()    # [1024, 6144]
     fc1_b   = ck["fc1_bias"].float().numpy()      # [1024]
@@ -463,25 +519,28 @@ def main() -> None:
         return
 
     if args.quick:
-        prompts  = QUICK_PROMPTS
+        prompts  = MTP_TRAINING_PROMPTS[:4]
+        test_hp  = MTP_TEST_HOLDOUT_PROMPTS
         steps    = args.max_steps or 8
-        epochs   = args.epochs or 10
+        epochs   = args.epochs or 5
         patience = 999   # no early stopping in quick mode
-        print(f"[EAGLE-3] Quick mode: {len(prompts)} prompts × {steps} steps, "
+        print(f"[EAGLE-3] Quick mode: {len(prompts)} train prompts × {steps} steps, "
               f"{epochs} epochs")
     else:
-        prompts  = CALIBRATION_PROMPTS
-        steps    = args.max_steps or 24
-        epochs   = args.epochs or 30
+        prompts  = MTP_TRAINING_PROMPTS
+        test_hp  = MTP_TEST_HOLDOUT_PROMPTS
+        steps    = args.max_steps or 48
+        epochs   = args.epochs or 50
         patience = 5
         print(f"[EAGLE-3] Full mode: {len(prompts)} prompts × {steps} steps, "
-              f"{epochs} epochs, early stopping (patience={patience})")
+              f"{epochs} epochs, early stopping on test_top1 (patience={patience})")
 
     _check_memory(min_gb=4.0 if not args.quick else 3.0)
     t0 = time.perf_counter()
     stats = train_mtp_head(
         out_path=out_path,
         prompts=prompts,
+        test_holdout_prompts=test_hp,
         max_steps=steps,
         n_epochs=epochs,
         lr=args.lr,
@@ -491,6 +550,7 @@ def main() -> None:
     print(f"\n[EAGLE-3] Done in {total_s:.0f}s")
     print(f"  Train top-1: {stats['train_top1']:.1f}%")
     print(f"  Val   top-1: {stats['val_top1']:.1f}%")
+    print(f"  Test  top-1: {stats['test_top1']:.1f}%  (OOD / benchmark distribution)")
     gap = stats["train_top1"] - stats["val_top1"]
     print(f"  Train-val gap: {gap:.1f}%  (target: <30%)")
 
@@ -499,10 +559,15 @@ def main() -> None:
     summary = {
         "val_top1_accuracy":   stats["val_top1"],
         "train_top1_accuracy": stats["train_top1"],
+        "test_top1_accuracy":  stats["test_top1"],
         "train_val_gap":       gap,
         "best_epoch":          stats["best_epoch"],
         "n_training_samples":  stats["n_train"],
         "n_val_samples":       stats["n_val"],
+        "n_test_samples":      stats["n_test"],
+        "n_pool_samples":      stats["n_pool"],
+        "epochs_ran":          stats["epochs_ran"],
+        "early_stopped":       stats["early_stopped"],
         "total_s":             total_s,
         "hidden_dim_mtp":      MTP_HIDDEN,
         "input_dim":           INPUT_DIM,

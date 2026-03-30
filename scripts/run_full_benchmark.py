@@ -29,6 +29,7 @@ import gc
 import importlib.util
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -123,6 +124,48 @@ def _require_phi4_index_or_exit(repo_root: Path) -> None:
         file=sys.stderr,
     )
     sys.exit(2)
+
+
+def load_benchmark_config(path: str | Path | None = None) -> dict:
+    """Load pinned ``benchmark_config.json``; returns {} if missing."""
+    path = (
+        Path(path)
+        if path is not None
+        else Path(__file__).resolve().parent.parent / "benchmark_config.json"
+    )
+    if not path.is_file():
+        print(f"[CONFIG] {path} not found — using CLI fallbacks")
+        return {}
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    print(f"[CONFIG] Loaded canonical benchmark config from {path}")
+    print(
+        f"[CONFIG] prompt={cfg.get('prompt')!r} max_new_tokens={cfg.get('max_new_tokens')} "
+        f"threads={cfg.get('threads')} draft_k={cfg.get('draft_k')}"
+    )
+    return cfg
+
+
+def _leviathan_S(alpha: float, k: int, c: float = 0.221) -> float:
+    if alpha <= 0.0:
+        return 1.0 / (c * k + 1)
+    if alpha >= 1.0:
+        return float("inf")
+    return (1.0 - alpha ** (k + 1)) / ((1.0 - alpha) * (c * k + 1.0))
+
+
+def _leviathan_alpha_break_even(k: int, c: float = 0.221) -> float:
+    lo, hi = 1e-4, 0.9999
+    if _leviathan_S(hi, k, c) < 1.0:
+        return float("nan")
+    a, b = lo, hi
+    for _ in range(60):
+        mid = 0.5 * (a + b)
+        if _leviathan_S(mid, k, c) >= 1.0:
+            b = mid
+        else:
+            a = mid
+    return b
 
 
 # Phi-4 text backbone geometry (for KV footprint estimates only).
@@ -582,6 +625,7 @@ def _run_phi4_profile_isolated(
     generate_func: str = "generate",
     inter_profile_sleep: float = 5.0,
     subprocess_extra_env: dict[str, str] | None = None,
+    eagle_draft_k: int = 4,
 ) -> tuple[float, None, dict]:
     """Run a single profile in an isolated subprocess.
 
@@ -645,7 +689,7 @@ def _run_phi4_profile_isolated(
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=3600,
         env=run_env,
     )
 
@@ -687,6 +731,8 @@ def run_phi4_benchmark(
     validate_outputs: bool = False,
     force_eagle3: bool = False,
     quick: bool = False,
+    inter_profile_sleep_default: float | None = None,
+    eagle_draft_k: int = 4,
 ) -> None:
     if quick:
         max_new_tokens = min(max_new_tokens, 8)
@@ -859,10 +905,13 @@ def run_phi4_benchmark(
     # Profile D: AR + LUT Q4 GEMV (vpshufb, Phase 1) - isolated subprocess
     tps_d = 0.0
     peak_d = None
+    _default_sleep = 5.0 if inter_profile_sleep_default is None else float(
+        inter_profile_sleep_default
+    )
     _inter_sleep = (
         0.5
         if quick
-        else float(os.environ.get("ASDSL_PROFILE_SLEEP", "5"))
+        else float(os.environ.get("ASDSL_PROFILE_SLEEP", str(_default_sleep)))
     )
     tps_d, peak_d, _ex_d = _run_phi4_profile_isolated(
         "D", root, prompt, max_new_tokens, primary_bits,
@@ -943,6 +992,7 @@ def run_phi4_benchmark(
             generate_func="generate_eagle3",
             inter_profile_sleep=_inter_sleep,
             subprocess_extra_env=g_env if g_env else None,
+            eagle_draft_k=int(eagle_draft_k),
         )
         m_g = {"tokens_per_second": tps_g}
         if tps_g is not None:
@@ -952,10 +1002,15 @@ def run_phi4_benchmark(
                 mpc = ex_g.get("mean_tokens_accepted_per_cycle")
                 if mpc is not None:
                     print(f"[Profile G] Mean tokens accepted/cycle: {float(mpc):.2f}")
-                levi_ok = float(ar_g) >= 0.636
+                dk_g = int(eagle_draft_k)
+                a_be = _leviathan_alpha_break_even(dk_g)
+                levi_ok = (
+                    float(ar_g) >= a_be if not math.isnan(a_be) else False
+                )
+                pct = a_be * 100.0 if not math.isnan(a_be) else float("nan")
                 print(
                     f"[Profile G] Leviathan gate: {'PASS' if levi_ok else 'FAIL'} "
-                    f"(break-even alpha ~0.636)",
+                    f"(break-even alpha ~{pct:.1f}% for draft_k={dk_g})",
                     flush=True,
                 )
             else:
@@ -1214,22 +1269,52 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(root))
 
+    bc_path = root / "benchmark_config.json"
+    cfg = load_benchmark_config(bc_path)
+    if cfg:
+        d_prompt = str(cfg.get("prompt", "The fundamental theorem of calculus states that"))
+        d_max = int(cfg.get("max_new_tokens", 64))
+        d_threads = int(cfg.get("threads", 8))
+        d_gamma = int(cfg.get("draft_k", 7))
+        d_sleep = float(cfg.get("inter_profile_sleep_seconds", 3))
+    else:
+        d_prompt = "The fundamental theorem of calculus states that"
+        d_max = 32
+        d_threads = 0
+        d_gamma = 7
+        d_sleep = 5.0
+
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--phi4", action="store_true", help="Use local Phi-4 weights (slow, large RAM)")
     p.add_argument(
+        "--override-config",
+        action="store_true",
+        help="Suppress per-flag warnings when CLI differs from benchmark_config.json",
+    )
+    p.add_argument(
         "--prompt",
         type=str,
-        default="The fundamental theorem of calculus states that",
-        help="Decode prompt (longer default avoids immediate EOS so EAGLE-3 acceptance is measurable).",
+        default=argparse.SUPPRESS,
+        help="Decode prompt (default from benchmark_config.json when present).",
     )
-    p.add_argument("--max-new-tokens", type=int, default=32)
-    p.add_argument("--gamma", type=int, default=7, help="QCSD draft width (sim and phi4 --draft-k)")
+    p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Max decode tokens (default from benchmark_config.json when present).",
+    )
+    p.add_argument(
+        "--gamma",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="QCSD draft width / sim gamma (default: draft_k from benchmark_config.json when present).",
+    )
     p.add_argument("--vocab-size", type=int, default=200064)
     p.add_argument(
         "--threads",
         type=int,
-        default=0,
-        help="BLAS/OpenMP/native GEMV threads (0=auto: half of logical CPUs, min 1)",
+        default=argparse.SUPPRESS,
+        help="BLAS/OpenMP/native GEMV threads (default from benchmark_config.json when present; 0=auto)",
     )
     p.add_argument("--primary-bits", type=int, default=4, choices=[2, 3, 4, 8])
     p.add_argument("--draft-bits", type=int, default=2, choices=[2, 3, 4, 8])
@@ -1339,6 +1424,69 @@ def main() -> None:
     if not 0.0 <= args.phi4_acceptance_estimate <= 1.0:
         p.error("--phi4-acceptance-estimate must be between 0 and 1")
 
+    ns = vars(args)
+    if "prompt" not in ns:
+        ns["prompt"] = d_prompt
+    elif cfg and not args.override_config and ns["prompt"] != d_prompt:
+        print(
+            f"[CONFIG] WARNING: --prompt overrides canonical config value {d_prompt!r}",
+            flush=True,
+        )
+    if "max_new_tokens" not in ns:
+        ns["max_new_tokens"] = d_max
+    elif cfg and not args.override_config and ns["max_new_tokens"] != d_max:
+        print(
+            f"[CONFIG] WARNING: --max-new-tokens {ns['max_new_tokens']} "
+            f"overrides canonical config value {d_max}",
+            flush=True,
+        )
+    if "gamma" not in ns:
+        ns["gamma"] = d_gamma
+    elif cfg and not args.override_config and ns["gamma"] != d_gamma:
+        print(
+            f"[CONFIG] WARNING: --gamma {ns['gamma']} overrides canonical config "
+            f"draft_k value {d_gamma}",
+            flush=True,
+        )
+    if "threads" not in ns:
+        ns["threads"] = d_threads
+    elif cfg and not args.override_config and ns["threads"] != d_threads:
+        print(
+            f"[CONFIG] WARNING: --threads {ns['threads']} overrides canonical "
+            f"config value {d_threads}",
+            flush=True,
+        )
+    if args.override_config and cfg:
+        print(
+            "[CONFIG] --override-config: CLI replaces canonical benchmark_config.json values",
+            flush=True,
+        )
+
+    eagle_draft_k = int(ns["gamma"])
+    if bc_path.is_file():
+        try:
+            eagle_draft_k = int(
+                json.loads(bc_path.read_text(encoding="utf-8")).get(
+                    "draft_k", eagle_draft_k
+                )
+            )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    if args.phi4 and cfg:
+        if getattr(args, "slim_meta", None) is None and cfg.get("slim_meta"):
+            sm = Path(cfg["slim_meta"])
+            args.slim_meta = (
+                str((root / sm).resolve()) if not sm.is_absolute() else str(sm)
+            )
+        if getattr(args, "fatrelu_thresholds", None) is None and cfg.get(
+            "fatrelu_thresholds"
+        ):
+            fr = Path(cfg["fatrelu_thresholds"])
+            args.fatrelu_thresholds = (
+                str((root / fr).resolve()) if not fr.is_absolute() else str(fr)
+            )
+
     if args.phi4:
         _require_phi4_index_or_exit(root)
         run_phi4_benchmark(
@@ -1358,6 +1506,8 @@ def main() -> None:
             validate_outputs=args.validate_outputs,
             force_eagle3=args.force_eagle3,
             quick=args.quick,
+            inter_profile_sleep_default=d_sleep,
+            eagle_draft_k=eagle_draft_k,
         )
         return
 

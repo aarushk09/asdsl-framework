@@ -339,6 +339,52 @@
     "best_tok_per_sec": 2.74,
     "total_speedup_vs_1_20": 2.283333333333333,
     "remaining_gap_tok_per_sec": 4.26
+  },
+  "phase_11_results": {
+    "benchmark_config_locked": true,
+    "canonical_prompt": "The fundamental theorem of calculus states that",
+    "canonical_max_new_tokens": 64,
+    "canonical_draft_k": 1,
+    "profile_f_run1_tok_per_sec": 3.12,
+    "profile_f_run2_tok_per_sec": 3.09,
+    "profile_f_canonical_avg": 3.105,
+    "profile_f_two_run_variance_pct": 0.97,
+    "mtp_head_training": {
+      "train_top1": 72.7,
+      "val_top1": 31.5,
+      "test_top1": 32.8,
+      "training_samples": 1920,
+      "training_epochs_completed": 11,
+      "early_stopped": true
+    },
+    "leviathan_break_even_table": {
+      "k1": 22.1,
+      "k2": 33.2,
+      "k3": 41.7,
+      "k7": 61.5
+    },
+    "eagle3_acceptance_rate": 13.5,
+    "eagle3_mean_tokens_per_cycle": 0.54,
+    "profile_g_tok_per_sec": 1.32,
+    "profile_g_vs_profile_f": 0.423,
+    "eagle3_net_positive": false,
+    "final_benchmark_table": {
+      "A": 2.4,
+      "C": 2.56,
+      "D": 1.82,
+      "E": 1.74,
+      "F": 3.12,
+      "G": 1.32,
+      "B": 0.99
+    },
+    "llama_cpp_beaten": false,
+    "best_profile": "F",
+    "best_tok_per_sec": 3.12,
+    "total_speedup_vs_1_20": 2.6,
+    "remaining_gap_tok_per_sec": 3.68,
+    "note_on_profile_d": "LUT vpshufb is consistently slower than native FMA GEMV on Raptor Lake due to gather latency exceeding shuffle benefit; architectural mismatch for this hardware generation; not a regression",
+    "final_benchmark_source": "phase11_baseline_run.txt (run 1); run 2 F=3.09 tok/s G acceptance 10.2% for variance check",
+    "leviathan_gate_profile_g": "FAIL"
   }
 }
 
