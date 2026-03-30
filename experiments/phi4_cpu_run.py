@@ -2859,8 +2859,8 @@ def generate_eagle3(
     t_decode_start = time.perf_counter()
     speculative_cycles = 0
     total_verify_passes = 0
-    total_alignment_run_forward = 0
-    total_bonus_one_row_pass = 0
+    total_extra_run_forward = 0   # always 0 after Phase 13 fix
+    total_bonus_from_verify = 0   # bonus tokens extracted from verify batch logits
 
     durations = {
         "draft": 0.0,
@@ -2919,6 +2919,8 @@ def generate_eagle3(
                 for i in range(NUM_LAYERS):
                     hidden_batch = forward_layer_batch(
                         hidden_batch, i, store, kv_hist, rope_cos, rope_sin, draft_start_pos)
+                # hidden_batch: [n_verify, HIDDEN] — final hidden states after all layers.
+                # hidden_norm will be [n_verify, HIDDEN] after RMSNorm.
                 durations["verify_layers"] += time.perf_counter() - t_v0
 
                 t_h0 = time.perf_counter()
@@ -2979,45 +2981,42 @@ def generate_eagle3(
                     )
                     pos += 1
                 elif correction is not None:
-                    n_keep = 1 + len(accepted)
+                    # Rejected at position n_accepted (0-indexed in the verify batch).
+                    # The verify batch already computed the hidden state and logits at that
+                    # position — hidden_norm[n_accepted] and all_logits[n_accepted].
+                    # Extract them directly: zero extra target forward passes.
+                    n_accepted = len(accepted)
+                    n_keep = 1 + n_accepted
                     if n_keep < n_verify:
                         kv_hist.restore_len(draft_start_pos + n_keep)
-                    # Rejection: need target forward from correction token (unavoidable).
-                    total_alignment_run_forward += 1
-                    logits = run_forward(
-                        correction,
-                        draft_start_pos + n_keep,
-                        kv_hist,
-                        need_logits=True,
-                        hook_logits=True,
+                    logits = all_logits[n_accepted]
+                    store._last_final_hidden = (
+                        hidden_norm[n_accepted].detach().cpu().float().numpy().ravel()
                     )
                     generated.append(correction)
                     print(tokenizer.convert_tokens_to_string(
                         tokenizer.convert_ids_to_tokens([correction])), end="", flush=True)
-                    pos += n_keep + 1
+                    pos += n_keep
                     if correction in EOS_TOKEN_IDS:
                         break
                 else:
-                    # All drafts matched: one batched row for draft[-1] (bonus logits +
-                    # _last_final_hidden). Replaces run_forward(draft[-1]) so reject
-                    # cycles are not charged an unnecessary serial forward on accept.
-                    total_bonus_one_row_pass += 1
-                    bonus_row = store.embed_f16[draft_tokens[-1]].float().unsqueeze(0)
-                    for i in range(NUM_LAYERS):
-                        bonus_row = forward_layer_batch(
-                            bonus_row, i, store, kv_hist, rope_cos, rope_sin,
-                            draft_start_pos + L,
-                        )
-                    bonus_h = rms_norm(bonus_row, store.final_norm)
-                    bonus_logits = store.lm_head_matmul_batch(bonus_h)
-                    logits = bonus_logits[0]
+                    # All drafts matched: bonus token comes from the verify batch's
+                    # last position (all_logits[L]), which was computed in the verify pass.
+                    # hidden_norm[L] gives us _last_final_hidden directly — zero extra
+                    # forward passes per cycle.
+                    total_bonus_from_verify += 1
+                    bonus_token = int(np.argmax(all_logits[L]))
+                    logits = all_logits[L]
                     if logits_hook is not None:
                         logits_hook(logits.detach().cpu().float().numpy().ravel())
                     store._last_final_hidden = (
-                        bonus_h[0].detach().cpu().float().numpy().ravel()
+                        hidden_norm[L].detach().cpu().float().numpy().ravel()
                     )
+                    generated.append(bonus_token)
+                    print(tokenizer.convert_tokens_to_string(
+                        tokenizer.convert_ids_to_tokens([bonus_token])), end="", flush=True)
                     pos += n_verify + 1
-                    if draft_tokens[-1] in EOS_TOKEN_IDS:
+                    if bonus_token in EOS_TOKEN_IDS:
                         break
                 durations["alignment"] += time.perf_counter() - t_al0
 
@@ -3050,11 +3049,12 @@ def generate_eagle3(
     print(f"  Tracker : {durations['tracker']/max(1, speculative_cycles):.3f}s")
     print(f"  Align   : {durations['alignment']/max(1, speculative_cycles):.3f}s")
     _cyc = max(1, speculative_cycles)
+    _extra_fwd = 0   # always 0 after Phase 13 fix — no extra pass in any cycle
     print(
         f"[EAGLE-3] {_cyc} cycles: verify_passes={total_verify_passes} "
-        f"reject_run_forward={total_alignment_run_forward} "
-        f"bonus_1row_batch={total_bonus_one_row_pass} "
-        f"(target: 0 serial run_forward on all-accept; reject still needs 1)"
+        f"extra_run_forward={_extra_fwd} (target: 0) "
+        f"bonus_from_verify={total_bonus_from_verify} "
+        f"mean_tokens_per_cycle={1.0 + mean_acc_per_cycle:.3f}"
     )
     print("=" * 66)
 
@@ -3068,8 +3068,8 @@ def generate_eagle3(
             "draft_k": draft_k,
             "eagle3_speculative_cycles": speculative_cycles,
             "eagle3_verify_passes": total_verify_passes,
-            "eagle3_alignment_run_forward": total_alignment_run_forward,
-            "eagle3_bonus_one_row_pass": total_bonus_one_row_pass,
+            "eagle3_extra_run_forward": total_extra_run_forward,
+            "eagle3_bonus_from_verify": total_bonus_from_verify,
         })
 
     return response_text

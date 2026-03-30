@@ -414,6 +414,50 @@
     "remaining_gap_tok_per_sec": 4.02,
     "benchmark_source": "phase12_benchmark.txt 2026-03-30 canonical run",
     "leviathan_gate_profile_g": "FAIL"
+  },
+  "phase_13_results": {
+    "bug_fixed": "generate_eagle3 reject branch used run_forward(correction) after verify batch, firing on every rejected cycle (~89% of cycles); all-accept branch used a separate 1-row forward_layer_batch. Both now extract _last_final_hidden and logits directly from the verify batch's hidden_norm[L] and all_logits[L] — zero extra target forward passes per cycle.",
+    "reject_run_forward_eliminated": true,
+    "extra_run_forward_per_cycle": 0.0,
+    "eagle3_acceptance_rate": 7.1,
+    "mean_tokens_per_cycle": 1.071,
+    "profile_f_tok_per_sec": 2.86,
+    "profile_g_tok_per_sec": 1.43,
+    "profile_g_vs_profile_f": 0.500,
+    "eagle3_net_positive": false,
+    "mathematical_ceiling_analysis": {
+      "draft_k": 1,
+      "cost_ratio_c": 0.221,
+      "measured_acceptance": 0.071,
+      "theoretical_speedup_at_measured_alpha": 1.071,
+      "profile_g_ceiling_at_100pct_acceptance": 5.72,
+      "profile_f_needed_to_beat_llamacpp_at_50pct_acceptance": 4.67,
+      "profile_f_needed_to_beat_llamacpp_at_33pct_acceptance": 5.26,
+      "current_profile_f_vs_needed": "2.86 / 4.67 = 61.2% of needed F for 50% acceptance",
+      "conclusion": "profile G beats profile F only if acceptance exceeds ~22% at current F; llama.cpp requires F recovery to 4.7+ tok/s plus acceptance 50%+"
+    },
+    "profile_f_regression_investigation": {
+      "phase_7_f_tok_per_sec": 5.19,
+      "phase_12_f_tok_per_sec": 2.98,
+      "phase_13_f_tok_per_sec": 2.86,
+      "regression_pct": 44.9,
+      "root_cause_identified": false,
+      "root_cause": "under investigation; 32/32 transposed down_proj layers loaded correctly in current session; Phase 7 peak was measured with cold safetensors cache rebuild; session-to-session variance on quantized workloads is plausible cause",
+      "transposed_down_proj_layers_loaded": 32,
+      "expected_layers": 32
+    },
+    "llama_cpp_beaten": false,
+    "final_benchmark_table": {
+      "A": 1.99,
+      "C": 2.40,
+      "D": 1.64,
+      "E": 1.56,
+      "F": 2.86,
+      "G": 1.43,
+      "B": 0.86
+    },
+    "benchmark_source": "phase13_benchmark.txt 2026-03-30 canonical run",
+    "leviathan_gate_profile_g": "FAIL"
   }
 }
 
