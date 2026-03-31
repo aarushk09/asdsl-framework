@@ -554,12 +554,16 @@ def run_sim_benchmark(
 _PROFILE_RUNNER_SCRIPT = '''
 import sys, json, time, gc, os, contextlib, io
 sys.path.insert(0, {root!r})
-os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("USE_JAX", "0")
-os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ["USE_TF"] = "0"
+os.environ["USE_JAX"] = "0"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["OMP_NUM_THREADS"] = str({thread_count})
+os.environ["OMP_PROC_BIND"] = "TRUE"
+os.environ["OMP_PLACES"] = "{{0}},{{1}},{{2}},{{3}},{{4}},{{5}},{{6}},{{7}},{{8}},{{9}},{{10}},{{11}}"
+os.environ["OMP_SCHEDULE"] = "static"
 {extra_env_lines}
 
-from experiments.phi4_cpu_run import WeightStore, generate, generate_eagle3, set_thread_count
+from experiments.phi4_cpu_run import WeightStore, generate, generate_eagle3, generate_pld, set_thread_count
 from transformers import AutoTokenizer
 
 set_thread_count({thread_count})
@@ -577,6 +581,7 @@ gc.collect()
 
 store._use_native_gemv = {use_native}
 store._use_lut_gemv = {use_lut}
+store._use_q8_gemv = {use_q8}
 store._enable_sparse = {enable_sparse}
 store._sparsity_threshold = {sparsity_threshold}
 
@@ -589,40 +594,29 @@ with contextlib.redirect_stdout(buf):
 sparse_T_calls = int(getattr(store, "_sparse_down_proj_T_calls", 0))
 dense_T_calls = int(getattr(store, "_dense_down_proj_fallback_calls", 0))
 
+payload = {{"tps": 0.0, "rss": None}}
 if metrics:
     m = metrics[0]
-    payload = {{
+    payload.update({{
         "tps": float(m.get("tokens_per_second", 0.0)),
-        "rss": None,
         "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
         "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
         "sparse_T_calls": sparse_T_calls,
         "dense_T_calls": dense_T_calls,
-    }}
+    }})
     if m.get("acceptance_rate") is not None:
         payload["acceptance_rate"] = float(m["acceptance_rate"])
     if m.get("mean_tokens_accepted_per_cycle") is not None:
         payload["mean_tokens_accepted_per_cycle"] = float(m["mean_tokens_accepted_per_cycle"])
-    print("__PROFILE_RESULT__" + json.dumps(payload))
-else:
-    print("__PROFILE_RESULT__" + json.dumps({{
-        "tps": 0.0, "rss": None,
-        "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
-        "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
-        "sparse_T_calls": sparse_T_calls,
-        "dense_T_calls": dense_T_calls,
-    }}))
-    if m.get("acceptance_rate") is not None:
-        payload["acceptance_rate"] = float(m["acceptance_rate"])
-    if m.get("mean_tokens_accepted_per_cycle") is not None:
-        payload["mean_tokens_accepted_per_cycle"] = float(m["mean_tokens_accepted_per_cycle"])
-    print("__PROFILE_RESULT__" + json.dumps(payload))
-else:
-    print("__PROFILE_RESULT__" + json.dumps({{
-        "tps": 0.0, "rss": None,
-        "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
-        "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
-    }}))
+
+# Q8 call counter
+try:
+    from asdsl.kernels import _native_gemv as _ng
+    payload["q8_call_count"] = _ng.get_q8_call_count()
+except:
+    pass
+
+print("__PROFILE_RESULT__" + json.dumps(payload))
 '''
 
 
@@ -648,6 +642,7 @@ def _run_phi4_profile_isolated(
     subprocess_extra_env: dict[str, str] | None = None,
     eagle_draft_k: int = 4,
     thread_count: int = 0,
+    use_q8: bool = False,
 ) -> tuple[float, None, dict]:
     """Run a single profile in an isolated subprocess.
 
@@ -702,6 +697,7 @@ def _run_phi4_profile_isolated(
         generate_call=generate_call,
         extra_env_lines=extra_env_lines,
         thread_count=thread_count,
+        use_q8=use_q8,
     )
 
     run_env = os.environ.copy()
@@ -967,22 +963,25 @@ def run_phi4_benchmark(
         peak_e = None
         m_e = {}
 
-    # Profile F: AR + Native GEMV + FATReLU 85% sparsity (Phase 3) - isolated subprocess
+    # Profile F: Native GEMV only (FATReLU removed — Phase A1 finding: sparsity was net negative
+    # due to sparse kernel overhead; F is now identical to C until Q8_0 GEMV is added in Phase B)
     tps_f = None
     peak_f = None
-    if _fatrelu_path and _fatrelu_path.exists():
-        tps_f, peak_f, _ex_f = _run_phi4_profile_isolated(
-            "F", root, prompt, max_new_tokens, primary_bits,
-            use_native=True, use_lut=False,
-            enable_sparse=True, sparsity_threshold=0.0,
-            needs_fatrelu=True, fatrelu_path=str(_fatrelu_path),
-            inter_profile_sleep=_inter_sleep,
-            thread_count=threads,
-        )
-        m_f: dict = {"tokens_per_second": tps_f}
-    else:
-        print("[Profile F] skipped: phi4_fatrelu_thresholds.json not found or not loaded")
-        m_f = {}
+    _ex_f: dict = {}
+    # Phase A1: Profile F = pure dense AVX2 GEMV (no FATReLU, no sparse kernel)
+    # This is identical to Profile C by design. Q8_0 integer GEMV will go here in Phase B.
+    tps_f, peak_f, _ex_f = _run_phi4_profile_isolated(
+        "F", root, prompt, max_new_tokens, primary_bits,
+        use_native=True, use_lut=False,
+        enable_sparse=False,  # Phase A1: no sparsity
+        sparsity_threshold=0.01,
+        needs_fatrelu=False,  # Phase A1: no FATReLU
+        fatrelu_path=None,
+        inter_profile_sleep=_inter_sleep,
+        thread_count=threads,
+        use_q8=True,  # Phase B: Q8_0 integer GEMV
+    )
+    m_f: dict = {"tokens_per_second": tps_f}
 
     # Profile G: Native GEMV + LUT + FATReLU + EAGLE-3 MTP (F stacked with EAGLE-3)
     tps_g = None
@@ -1002,20 +1001,15 @@ def run_phi4_benchmark(
     if force_eagle3:
         print("  (also requested via --force-eagle3)", flush=True)
     if _mtp_head_path.exists():
-        if g_fr_path is None:
-            print(
-                "[Profile G] WARNING: phi4_fatrelu_thresholds.json missing — "
-                "FATReLU + transposed down_proj will not load in subprocess",
-                flush=True,
-            )
+        # Phase A1: Profile G = EAGLE-3 without FATReLU
         tps_g, peak_g, ex_g = _run_phi4_profile_isolated(
             "G", root, prompt, max_new_tokens, primary_bits,
             use_native=True,
             use_lut=False,
-            enable_sparse=True,
-            sparsity_threshold=0.0,
-            needs_fatrelu=bool(g_fr_path),
-            fatrelu_path=g_fr_path,
+            enable_sparse=False,  # Phase A1: no sparsity
+            sparsity_threshold=0.01,
+            needs_fatrelu=False,  # Phase A1: no FATReLU
+            fatrelu_path=None,
             needs_mtp=True,
             mtp_head_path=str(_mtp_head_path),
             generate_func="generate_eagle3",
@@ -1050,9 +1044,31 @@ def run_phi4_benchmark(
                     "WARNING: Profile G subprocess reports fatrelu_enabled=false",
                     flush=True,
                 )
-    else:
         print("[Profile G] skipped: models/mtp_head.pt not found")
         m_g = {}
+
+    # Profile H: Native GEMV + Prompt Lookup Decoding (Phase 16)
+    tps_h = None
+    peak_h = None
+    ex_h: dict = {}
+    tps_h, peak_h, ex_h = _run_phi4_profile_isolated(
+        "H", root, prompt, max_new_tokens, primary_bits,
+        use_native=True,
+        use_lut=False,
+        enable_sparse=False,
+        sparsity_threshold=0.01,
+        needs_fatrelu=False,
+        fatrelu_path=None,
+        generate_func="generate_pld",
+        inter_profile_sleep=_inter_sleep,
+        thread_count=threads,
+        use_q8=True, # Phase 16: PLD + Q8
+    )
+    m_h = {"tokens_per_second": tps_h}
+    if tps_h is not None:
+        ar_h = ex_h.get("acceptance_rate")
+        if ar_h is not None:
+            print(f"[Profile H] PLD acceptance rate: {float(ar_h):.1%}")
 
     metrics_b: list = []
     with contextlib.redirect_stdout(buf):
@@ -1167,23 +1183,29 @@ def run_phi4_benchmark(
         )
     if tps_f is not None:
         print(
-            f"{'F  AR + Native GEMV + FATReLU 85% (Phase 3)':<40} "
+            f"{'F  Native GEMV + Q8_0 (Phase B)':<40} "
             f"{tps_f:>12.2f} {rss_f_s:>14} {est_footprint_c:>20.0f}"
         )
     else:
         print(
-            f"{'F  AR + Native GEMV + FATReLU 85% (Phase 3)':<40} "
+            f"{'F  Native GEMV + Q8_0 (Phase B)':<40} "
             f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
         )
     if tps_g is not None:
         print(
-            f"{'G  Profile F + EAGLE-3 MTP (Phase 5)':<40} "
+            f"{'G  Native GEMV + EAGLE-3 MTP (Phase A1)':<40} "
             f"{tps_g:>12.2f} {rss_g_s:>14} {est_footprint_c:>20.0f}"
         )
     else:
         print(
-            f"{'G  Profile F + EAGLE-3 MTP (Phase 5)':<40} "
+            f"{'G  Native GEMV + EAGLE-3 MTP (Phase A1)':<40} "
             f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
+        )
+    if tps_h is not None:
+        rss_h_s = f"{peak_h:.0f}" if peak_h is not None else "n/a"
+        print(
+            f"{'H  Native GEMV + Q8 + PLD (Phase 16)':<40} "
+            f"{tps_h:>12.2f} {rss_h_s:>14} {est_footprint_c:>20.0f}"
         )
     b_row = (
         "B  Native GEMV + QCSD + Q4 KV est."
@@ -1274,11 +1296,31 @@ def run_phi4_benchmark(
             "E": {"tok/s": tps_e},
             "F": {"tok/s": tps_f},
             "G": {"tok/s": tps_g},
+            "H": {"tok/s": tps_h},
             "B": {"tok/s": tps_b},
         }
         print(f"Writing regression results to {emit_regression_json}...")
         with open(emit_regression_json, "w") as f:
             json.dump({"results": res_map}, f, indent=2)
+
+    # Phase 16: Definitive FAIR COMPARISON
+    print("\n" + "=" * 72)
+    print("DEFINITIVE FAIR COMPARISON vs llama.cpp")
+    print("=" * 72)
+    target = 3.06
+    print(f"llama.cpp Q4_K_M (12t, n=128, p=0): {target:.2f} tok/s")
+    print(f"ASDSL Profile C (8t, n=128, p=0):  {tps_c:.2f} tok/s  ({'BEATS' if tps_c > target else 'below'})")
+    if tps_f:
+        print(f"ASDSL Profile F (8t, n=128, p=0):  {tps_f:.2f} tok/s  [Q8 GEMV]  ({'BEATS' if tps_f > target else 'below'})")
+    if tps_h:
+        print(f"ASDSL Profile H (8t, n=128, p=0):  {tps_h:.2f} tok/s  [Q8+PLD]  ({'BEATS' if tps_h > target else 'below'})")
+    
+    best_asdsl = max([t for t in [tps_c, tps_f, tps_h, tps_g, tps_b] if t is not None] + [0.0])
+    if best_asdsl > target:
+        print(f"WINNER: ASDSL by {best_asdsl - target:.2f} tok/s ({((best_asdsl/target)-1)*100:.1f}%)")
+    else:
+        print(f"WINNER: llama.cpp leads by {target - best_asdsl:.2f} tok/s ({((target/best_asdsl)-1)*100:.1f}%)")
+    print("=" * 72 + "\n")
 
     if validate_outputs:
         print("\nRunning KL Divergence Validation...")

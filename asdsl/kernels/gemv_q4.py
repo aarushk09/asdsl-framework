@@ -210,6 +210,7 @@ def gemv_q4_packed(
     K: int,
     group_size: int,
     use_lut: bool = False,
+    use_q8: bool = False,
 ) -> np.ndarray:
     """Fused 4-bit packed GEMV: y = dequant(W_q4) @ x.
 
@@ -225,6 +226,7 @@ def gemv_q4_packed(
         group_size: Elements per quantization group.
         use_lut:    If True, use the vpshufb LUT kernel (Phase 1) instead of FMA.
                     Falls back to FMA path if _native_lut is not available.
+        use_q8:     If True, use dynamic Q8 activation quantization + madd_epi16 (Phase B).
 
     Returns:
         Output float32, shape (M,) if x is 1-D, else (B, M).
@@ -242,6 +244,15 @@ def gemv_q4_packed(
             raise ValueError(f"x.shape[1]={x.shape[1]} does not match K={K}")
     else:
         raise ValueError("x must be 1-D (K,) or 2-D (batch, K)")
+
+    # Q8 path (Phase B): dynamic Q8 activation quantization + integer GEMV
+    # Use Q8 for ALL matrices — the activation quantization is done ONCE per
+    # matrix call (shared across all output rows), so the overhead is amortized.
+    if use_q8 and x.ndim == 1:
+        if _native_available and hasattr(_native, "gemv_q4_q8_avx2"):
+            y = np.zeros(M, dtype=np.float32)
+            _native.gemv_q4_q8_avx2(w_packed, scales, x, y, M, K, group_size)
+            return y
 
     # LUT path (Phase 1): vpshufb-based kernel
     if use_lut and x.ndim == 1:

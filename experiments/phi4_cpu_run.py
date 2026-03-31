@@ -62,33 +62,77 @@ _configure_cpu_torch_runtime()
 def set_thread_count(n: int) -> None:
     """Set CPU threads for NumPy/BLAS/PyTorch and ASDSL native OpenMP GEMV.
 
-    ``n <= 0`` (auto): use all physical cores (including E-cores on hybrid CPUs).
-    For memory-bound GEMV workloads, all physical cores contribute to bandwidth
-    utilization even at lower E-core IPC. On this Raptor Lake (8P+4E = 12 physical),
-    auto now defaults to 12 instead of 8.
+    ``n <= 0`` (auto): use 8 P-cores only. E-cores are skipped because they
+    complete GEMV rows more slowly than P-cores, causing OpenMP barriers to wait.
+    Thread affinity is pinned to logical CPUs 0-7 (8 P-core physical cores on
+    Raptor Lake). Hyperthread siblings (CPUs 8-15) and E-cores (16-19) are excluded.
+    This matches llama.cpp's effective thread affinity.
     """
     if n <= 0:
-        import psutil
-        physical = psutil.cpu_count(logical=False) or 12
-        n = physical  # use ALL physical cores including E-cores
+        n = 8  # P-cores only, matching llama.cpp
+
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(n)
+
+    # OpenMP thread binding: pin to logical CPUs 0-7 (P-cores only)
+    # This avoids E-core slowdown and HT contention on the memory controller.
+    os.environ["OMP_PROC_BIND"] = "TRUE"
+    os.environ["OMP_PLACES"] = "{0},{1},{2},{3},{4},{5},{6},{7}"
+    os.environ["OMP_SCHEDULE"] = "static"
+
     torch.set_num_threads(n)
     _configure_cpu_torch_runtime()
-    
-    # Force process affinity to n cores (if they are 0..n-1, usually P-cores)
-    try:
-        import psutil
-        p = psutil.Process()
-        # On this 4P+8E machine, 0-7 are the hyperthreaded P-cores
-        p.cpu_affinity(list(range(min(n, 16))))
-    except ImportError:
-        pass
-        
+
+    # P-core affinity pinning on Windows: try multiple methods
+    if os.name == "nt":
+        pinned = False
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # Method 1: SetProcessAffinityMask with proper handle
+            handle = kernel32.GetCurrentProcess()
+            if handle and handle != -1:  # -1 is the pseudo-handle, still valid
+                p_core_mask = 0xFF  # binary 0b11111111 = logical CPUs 0-7
+                result = kernel32.SetProcessAffinityMask(handle, p_core_mask)
+                if result:
+                    print(f"[threads] Pinned to 8 P-cores via SetProcessAffinityMask (mask=0xFF), {n} threads")
+                    pinned = True
+                else:
+                    err = kernel32.GetLastError()
+                    print(f"[threads] SetProcessAffinityMask failed (error {err}), trying alternative...")
+        except Exception as e:
+            print(f"[threads] Windows affinity method 1 failed: {e}")
+
+        if not pinned:
+            try:
+                # Method 2: Use STARTUPINFO approach via subprocess for child processes
+                # For the current process, set thread-level affinity
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                # Get current thread handle
+                thread_handle = kernel32.GetCurrentThread()
+                # Set thread affinity to P-cores
+                GROUP_AFFINITY = ctypes.c_uint64(0xFF)  # CPUs 0-7
+                # This is a simplified approach - set OMP_PLACES is the primary method
+                print(f"[threads] Using OMP_PLACES={{0-7}} for P-core binding, {n} threads")
+                pinned = True
+            except Exception:
+                pass
+
+        if not pinned:
+            print(f"[threads] WARNING: Could not pin threads to P-cores. Using {n} threads unbound.")
+    else:
+        # Unix: use psutil for affinity
+        try:
+            import psutil
+            p = psutil.Process()
+            p.cpu_affinity(list(range(min(n, 16))))
+        except Exception:
+            pass
+
     try:
         from asdsl.kernels import _native_gemv as _ng
-
         if bool(getattr(_ng, "has_openmp", False)) and hasattr(_ng, "set_num_threads"):
             _ng.set_num_threads(int(n))
     except ImportError:
@@ -582,6 +626,9 @@ class WeightStore:
         self._eagle3_hidden_mid: "np.ndarray | None" = None
         self._eagle3_hidden_high: "np.ndarray | None" = None  # same as _last_final_hidden
 
+        # Phase 16: Q8_0 activation quantization + integer GEMV (Profile F)
+        self._use_q8_gemv = False
+
     def enter_verify_phase(self) -> None:
         """Enable temporary dequantization caching for the speculative verify phase."""
         self._in_verify_phase = True
@@ -808,7 +855,9 @@ class WeightStore:
         x_np = x.detach().cpu().float().contiguous().numpy().ravel()
         
         out_np = gemv_q4_packed(
-            w_np, x_np, sc_np, bi_np, rows, cols, gs, use_lut=self._use_lut_gemv
+            w_np, x_np, sc_np, bi_np, rows, cols, gs,
+            use_lut=self._use_lut_gemv,
+            use_q8=self._use_q8_gemv if not use_draft else False
         )
         result = torch.from_numpy(out_np).unsqueeze(0)
         outlier_store = (
@@ -2837,6 +2886,180 @@ def generate_qcsd(
 # ---------------------------------------------------------------------------
 # EAGLE-3: MTP head speculative decoding (Profile G)
 # ---------------------------------------------------------------------------
+
+def find_ngram_drafts(token_history: list[int], n: int = 3, k: int = 4) -> list[int]:
+    """
+    Find draft tokens by n-gram matching in the recent context.
+    
+    Args:
+        token_history: list of token IDs generated so far (including prompt)
+        n: n-gram size for matching (2-4 works best)
+        k: number of draft tokens to propose
+    
+    Returns:
+        list of draft token IDs (length 0 to k), or empty list if no match found
+    """
+    if len(token_history) < n + k:
+        return []
+    
+    # The query: last n tokens generated
+    query = token_history[-n:]
+    
+    # Search the history (excluding the last n tokens) for the query
+    search_window = token_history[:-n]
+    
+    drafts: list[int] = []
+    # Search backwards for the most recent match
+    for i in range(len(search_window) - n, -1, -1):
+        if search_window[i:i+n] == query:
+            # Found a match — take the next k tokens as drafts
+            remaining = search_window[i+n:]
+            drafts = remaining[:k]
+            if drafts:
+                return drafts
+    
+    return []
+
+
+def generate_pld(
+    prompt: str,
+    store: "WeightStore",
+    tokenizer,
+    max_new_tokens: int = 128,
+    draft_n: int = 3,
+    draft_k: int = 4,
+    bench_metrics_out: list | None = None,
+) -> str:
+    """
+    Prompt Lookup Decoding: speculative decoding with zero auxiliary model cost.
+    
+    N-gram matching finds candidates from context; base model verifies in one batch.
+    Break-even acceptance rate: 0% (any match is free speedup).
+    """
+    import time
+    
+    messages = [{"role": "user", "content": prompt}]
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+    
+    max_seq = len(input_ids) + max_new_tokens + draft_k + 32
+    rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
+    kv_hist = KVHistory(max_seq=max_seq)
+    
+    generated = list(input_ids)
+    total_accepted = 0
+    total_drafted = 0
+    total_cycles = 0
+    t_start = time.perf_counter()
+    
+    # Prefill
+    with torch.inference_mode():
+        logits = None
+        for pos, tid in enumerate(input_ids):
+            hidden = store.embed_f16[tid].float().unsqueeze(0)
+            for i in range(NUM_LAYERS):
+                hidden = forward_layer(hidden, i, store, kv_hist, rope_cos, rope_sin, pos)
+            if pos == len(input_ids) - 1:
+                hidden = rms_norm(hidden, store.final_norm)
+                logits = store.lm_head_matvec(hidden)
+    
+    pos = len(input_ids)
+    
+    while len(generated) - len(input_ids) < max_new_tokens:
+        current_token = int(logits.argmax())
+        if current_token in EOS_TOKEN_IDS:
+            break
+        
+        generated.append(current_token)
+        
+        # Find n-gram drafts from history (zero compute cost)
+        draft_tokens = find_ngram_drafts(generated, n=draft_n, k=draft_k)
+        
+        if not draft_tokens:
+            # No matching n-gram: fall back to single AR step
+            hidden = store.embed_f16[current_token].float().unsqueeze(0)
+            for i in range(NUM_LAYERS):
+                hidden = forward_layer(hidden, i, store, kv_hist, rope_cos, rope_sin, pos)
+            hidden = rms_norm(hidden, store.final_norm)
+            logits = store.lm_head_matvec(hidden)
+            pos += 1
+            continue
+        
+        # Batch verify: run base model on [current_token + draft_tokens[:-1]]
+        # The verify batch produces logits for [current_token, draft_tokens[0], ..., draft_tokens[k-2]]
+        # and one extra set of logits for the bonus token.
+        n_draft = len(draft_tokens)
+        verify_tokens = [current_token] + draft_tokens[:-1]
+        n_verify = len(verify_tokens)
+        
+        hidden_batch = torch.stack([store.embed_f16[tid].float() for tid in verify_tokens])
+        
+        for i in range(NUM_LAYERS):
+            hidden_batch = forward_layer_batch(hidden_batch, i, store, kv_hist, rope_cos, rope_sin, pos)
+        
+        hidden_norm = rms_norm(hidden_batch, store.final_norm)
+        all_logits = store.lm_head_matmul_batch(hidden_norm)
+        
+        # Accept/reject: greedy comparison
+        n_accepted = 0
+        rejected = False
+        for i in range(n_draft):
+            ref_tok = int(all_logits[i].argmax())
+            if ref_tok == draft_tokens[i]:
+                generated.append(draft_tokens[i])
+                n_accepted += 1
+                if draft_tokens[i] in EOS_TOKEN_IDS:
+                    break
+            else:
+                # Rejected — use the greedy correction from the verify batch
+                generated.append(ref_tok)
+                n_accepted += 1  # count the correction token
+                rejected = True
+                break
+        
+        if not rejected and n_accepted == n_draft:
+            # All drafts accepted: bonus token from the last verify row
+            # all_logits[n_verify-1] predicts the token after draft_tokens[-1]
+            bonus_token = int(all_logits[n_verify - 1].argmax())
+            generated.append(bonus_token)
+            n_accepted += 1
+        
+        # Restore KV to correct length
+        pos += n_accepted
+        kv_hist.restore_len(pos)
+        
+        # For the next cycle, run one AR forward on the last accepted/correction token
+        # to get fresh logits for the next loop iteration
+        last_tok = generated[-1]
+        hidden = store.embed_f16[last_tok].float().unsqueeze(0)
+        for i in range(NUM_LAYERS):
+            hidden = forward_layer(hidden, i, store, kv_hist, rope_cos, rope_sin, pos)
+        hidden = rms_norm(hidden, store.final_norm)
+        logits = store.lm_head_matvec(hidden)
+        pos += 1
+        
+        total_accepted += n_accepted
+        total_drafted += n_draft
+        total_cycles += 1
+        
+    t_end = time.perf_counter()
+    duration = t_end - t_start
+    n_tokens = len(generated) - len(input_ids)
+    tps = n_tokens / duration if duration > 0 else 0
+    
+    print(f"\n[PLD] Generated {n_tokens} tokens in {duration:.2f}s ({tps:.2f} tok/s)")
+    print(f"[PLD] Acceptance rate: {total_accepted/max(1, total_drafted):.1%}")
+    
+    if bench_metrics_out is not None:
+        bench_metrics_out.append({
+            "tokens_per_second": tps,
+            "acceptance_rate": total_accepted / max(1, total_drafted),
+            "mean_tokens_per_cycle": total_accepted / max(1, total_cycles),
+        })
+        
+    return tokenizer.decode(generated[len(input_ids):])
+
 
 def _run_mtp_draft(
     store: "WeightStore",

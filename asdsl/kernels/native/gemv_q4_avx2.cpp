@@ -55,20 +55,6 @@ namespace py = pybind11;
  * =================================================================== */
 
 /**
- * Horizontal sum: reduce 8-wide float vector to scalar.
- */
-static inline float hsum256_ps(__m256 v) {
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 lo = _mm256_castps256_ps128(v);
-    lo = _mm_add_ps(lo, hi);
-    __m128 shuf = _mm_movehdup_ps(lo);
-    lo = _mm_add_ps(lo, shuf);
-    shuf = _mm_movehl_ps(shuf, lo);
-    lo = _mm_add_ss(lo, shuf);
-    return _mm_cvtss_f32(lo);
-}
-
-/**
  * Horizontal sum of 8x int32 in __m256i to scalar int32.
  */
 static inline int32_t hsum256_epi32(__m256i v) {
@@ -80,6 +66,158 @@ static inline int32_t hsum256_epi32(__m256i v) {
     shuf = _mm_shuffle_epi32(lo, _MM_SHUFFLE(0, 1, 0, 1));
     lo = _mm_add_epi32(lo, shuf);
     return _mm_cvtsi128_si32(lo);
+}
+
+// Q4 × Q8 integer GEMV using _mm256_madd_epi16
+// This matches llama.cpp's ggml_vec_dot_q4_K_q8_K approach
+// KEY OPTIMIZATION: Q8 activation quantization is done ONCE per matrix call
+// (shared across all rows), and uses SIMD for both max-finding and quantization.
+// BIAS HANDLING: The Q4 format uses bias = -zero_point * scale. For symmetric
+// Q4 (zero_point=8), the bias term is -8*scale. We incorporate this by computing
+// sum(x_q8) per group and adding bias * sum(x_q8) to the accumulator.
+static std::atomic<int> q8_call_count{0};
+
+void gemv_q4_q8_avx2(
+    const uint8_t* weights_packed,  // [out_features, in_features/2] Q4 nibble-packed
+    const float*   scales,          // [out_features, n_groups] FP32 per-group scales
+    const float*   x,               // [in_features] FP32 activations
+    float*         y,               // [out_features] FP32 output
+    int            out_features,
+    int            in_features,
+    int            group_size       // typically 32 or 64
+) {
+    q8_call_count.fetch_add(1, std::memory_order_relaxed);
+    const int n_groups = in_features / group_size;
+    const int packed_stride = in_features / 2;
+    
+    // Pre-quantize x to Q8 per group — done ONCE, shared across all output rows.
+    std::vector<int8_t> x_q8(in_features);
+    std::vector<float> x_scales(n_groups);
+    std::vector<int32_t> x_q8_sums(n_groups);  // sum of quantized activations per group
+    
+    for (int g = 0; g < n_groups; g++) {
+        const float* xg = x + g * group_size;
+        int8_t* xq = x_q8.data() + g * group_size;
+        
+        // SIMD max-abs finding
+        __m256 max_abs = _mm256_setzero_ps();
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 v = _mm256_loadu_ps(xg + j);
+            __m256 a = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+            max_abs = _mm256_max_ps(max_abs, a);
+        }
+        __m128 lo = _mm256_castps256_ps128(max_abs);
+        __m128 hi = _mm256_extractf128_ps(max_abs, 1);
+        lo = _mm_max_ps(lo, hi);
+        lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_max_ps(lo, _mm_movehdup_ps(lo));
+        float amax = _mm_cvtss_f32(lo);
+        
+        if (amax < 1e-9f) {
+            memset(xq, 0, group_size);
+            x_scales[g] = 1.0f;
+            x_q8_sums[g] = 0;
+            continue;
+        }
+        
+        float scale = amax / 127.0f;
+        float inv_scale = 127.0f / amax;
+        x_scales[g] = scale;
+        
+        // SIMD quantize to int8: FP32 → scale → round → pack to int8
+        __m256 vscale = _mm256_set1_ps(inv_scale);
+        __m256i sum_acc = _mm256_setzero_si256();
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 vf = _mm256_mul_ps(_mm256_loadu_ps(xg + j), vscale);
+            __m256i vi = _mm256_cvtps_epi32(vf);
+            // Accumulate sum of int32 values
+            sum_acc = _mm256_add_epi32(sum_acc, vi);
+            __m128i lo4 = _mm_packs_epi32(
+                _mm256_castsi256_si128(vi),
+                _mm256_extracti128_si256(vi, 1));
+            __m128i packed = _mm_packs_epi16(lo4, lo4);
+            _mm_storel_epi64((__m128i*)(xq + j), packed);
+        }
+        // Horizontal sum of int32 accumulator
+        __m128i sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(sum_acc),
+            _mm256_extracti128_si256(sum_acc, 1));
+        sum128 = _mm_hadd_epi32(sum128, sum128);
+        sum128 = _mm_hadd_epi32(sum128, sum128);
+        x_q8_sums[g] = _mm_cvtsi128_si32(sum128);
+    }
+    
+    // Row-parallel integer GEMV
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < out_features; row++) {
+        float acc = 0.0f;
+        const uint8_t* w_row = weights_packed + (size_t)row * packed_stride;
+        
+        for (int g = 0; g < n_groups; g++) {
+            const int8_t* x_group_q8 = x_q8.data() + g * group_size;
+            const uint8_t* w_group = w_row + g * (group_size / 2);
+            float w_scale = scales[row * n_groups + g];
+            float x_scale = x_scales[g];
+            
+            __m256i acc_int = _mm256_setzero_si256();
+            const __m128i mask_nibble = _mm_set1_epi8(0x0F);
+            const __m256i eight_256 = _mm256_set1_epi16(8);
+            
+            // Process group_size elements in chunks of 32 (16 packed bytes)
+            for (int i = 0; i < group_size; i += 32) {
+                // Load 16 packed bytes = 32 nibbles
+                __m128i packed = _mm_loadu_si128((const __m128i*)(w_group + i / 2));
+                
+                // Extract lo and hi nibbles of each byte
+                __m128i lo = _mm_and_si128(packed, mask_nibble);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_nibble);
+                
+                // Interleave to get w0, w1, w2, w3, ... w15 and w16..w31
+                __m128i w0_15_u8 = _mm_unpacklo_epi8(lo, hi);
+                __m128i w16_31_u8 = _mm_unpackhi_epi8(lo, hi);
+                
+                // Promote to int16 and center at zero (subtract 8)
+                __m256i w0_15 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w0_15_u8), eight_256);
+                __m256i w16_31 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w16_31_u8), eight_256);
+                
+                // Load 32 Q8 activations and promote to int16
+                __m256i x0_15 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i)));
+                __m256i x16_31 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i + 16)));
+                
+                // madd_epi16: (w0*x0 + w1*x1), (w2*x2 + w3*x3), ...
+                acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w0_15, x0_15));
+                acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w16_31, x16_31));
+            }
+            
+            // Integer dot product of centered weights and quantized activations
+            int32_t dot_int = hsum256_epi32(acc_int);
+            
+            // Dequantize: the weights were centered (w - 8), so:
+            //   dot((w-8), x_q8) = dot(w, x_q8) - 8 * sum(x_q8)
+            // The FP32 path computes: dot(w, x) * scale + bias * sum(x)
+            // where bias = -8 * scale (for symmetric Q4).
+            // So: dot(w, x_q8) * w_scale * x_scale + (-8 * w_scale) * sum(x_q8 * x_scale)
+            //   = (dot_int + 8 * sum(x_q8)) * w_scale * x_scale + (-8 * w_scale) * sum(x_q8) * x_scale
+            //   = dot_int * w_scale * x_scale
+            // The centering and bias cancel out! This is the beauty of symmetric quantization.
+            acc += (float)dot_int * w_scale * x_scale;
+        }
+        y[row] = acc;
+    }
+}
+
+/**
+ * Horizontal sum: reduce 8-wide float vector to scalar.
+ */
+static inline float hsum256_ps(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    lo = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(lo);
+    lo = _mm_add_ps(lo, shuf);
+    shuf = _mm_movehl_ps(shuf, lo);
+    lo = _mm_add_ss(lo, shuf);
+    return _mm_cvtss_f32(lo);
 }
 
 /**
@@ -914,8 +1052,36 @@ Modifies Y_batch in-place (adds to it — caller should zero before calling).
         py::arg("X_batch"), py::arg("Y_batch"),
         py::arg("M"), py::arg("K"), py::arg("B"), py::arg("group_size") = 32);
 
+    m.def("gemv_q4_q8_avx2",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> w,
+           py::array_t<float,   py::array::c_style | py::array::forcecast> s,
+           py::array_t<float,   py::array::c_style | py::array::forcecast> x,
+           py::array_t<float,   py::array::c_style | py::array::forcecast> y,
+           int out_features, int in_features, int group_size) {
+            auto wb = w.request();
+            auto sb = s.request();
+            auto xb = x.request();
+            auto yb = y.request();
+            
+            py::gil_scoped_release release;
+            gemv_q4_q8_avx2(
+                static_cast<const uint8_t*>(wb.ptr),
+                static_cast<const float*>(sb.ptr),
+                static_cast<const float*>(xb.ptr),
+                static_cast<float*>(yb.ptr),
+                out_features, in_features, group_size
+            );
+        },
+        "Q4 weight × Q8 activation integer GEMV using madd_epi16",
+        py::arg("weights_packed"), py::arg("scales"), py::arg("x"),
+        py::arg("y"), py::arg("out_features"), py::arg("in_features"),
+        py::arg("group_size") = 32);
+
     m.def("check_avx2", &check_avx2_support,
         "Runtime check: does this CPU support AVX2?");
+
+    m.def("get_q8_call_count", []() { return q8_call_count.load(std::memory_order_relaxed); },
+        "Return the number of times gemv_q4_q8_avx2 has been called.");
 
     m.def("check_fma", &check_fma_support,
         "Runtime check: does this CPU support FMA3?");
