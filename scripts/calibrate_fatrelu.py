@@ -37,6 +37,21 @@ import psutil
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+CANONICAL_CALIBRATION_PROMPTS = [
+    "The fundamental theorem of calculus states that",
+    "In mathematics, the derivative of a function measures",
+    "The Pythagorean theorem states that in a right triangle",
+    "To solve a differential equation, we must find",
+    "The chain rule in calculus allows us to differentiate",
+    "Integration by parts is a technique for computing",
+    "The eigenvalues of a matrix are the values for which",
+    "In linear algebra, a vector space is defined as a set",
+    "The Taylor series expansion of a function around a point",
+    "Fourier transforms decompose a function into sinusoidal",
+    "The gradient descent algorithm minimizes a function by",
+    "In probability theory, the expected value of a random",
+]
+
 CALIBRATION_PROMPTS = [
     "The capital of France is",
     "In mathematics, the derivative of x squared is",
@@ -215,17 +230,30 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--sparsity", type=float, default=TARGET_SPARSITY,
                         help=f"Target sparsity (default: {TARGET_SPARSITY})")
+    parser.add_argument("--prompts", choices=["canonical", "diverse", "quick"],
+                        default="diverse",
+                        help="'canonical' = 12 mathematical/calculus prompts; "
+                             "'diverse' = 32 mixed prompts (default); "
+                             "'quick' = 4 prompts")
     parser.add_argument("--output", type=str,
                         default=str(ROOT / "phi4_fatrelu_thresholds.json"))
     args = parser.parse_args()
 
+    prompt_mode = args.prompts
     quick = args.quick
     n_layers = 4 if quick else 32
-    prompts = CALIBRATION_PROMPTS[:4] if quick else CALIBRATION_PROMPTS
+    if prompt_mode == "quick":
+        prompts = CALIBRATION_PROMPTS[:4]
+    elif prompt_mode == "canonical":
+        prompts = CANONICAL_CALIBRATION_PROMPTS
+    else:  # diverse
+        prompts = CALIBRATION_PROMPTS
     output_path = Path(args.output)
 
     print("=" * 60)
-    print(f"ASDSL Phase 3 — FATReLU Calibration {'(QUICK)' if quick else ''}")
+    print(f"ASDSL Phase 3 — FATReLU Calibration "
+          f"{'(QUICK)' if quick else ''} "
+          f"[prompt_mode={prompt_mode}, {len(prompts)} prompts, {n_layers} layers]")
     print("=" * 60)
 
     check_memory(required_gb=3.0 if quick else 4.0)
@@ -276,6 +304,7 @@ def main() -> None:
         "model": "phi4-14b",
         "target_sparsity": args.sparsity,
         "quick_mode": quick,
+        "prompt_mode": prompt_mode,
         "n_layers_calibrated": n_layers,
         "calibration_prompts_used": len(prompts),
         "ffn_intermediate_dim": 8192,

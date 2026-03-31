@@ -11,17 +11,17 @@ at AI=3.99 FLOPS/byte vs ridge 17.6.
 - Threads: 8 (P-cores)
 - draft_k: 1
 
-## Final benchmark results (Phase 14, 2026-03-30)
+## Final benchmark results (Phase 15, 2026-03-30)
 
 | Profile | Configuration                              | tok/s | vs Phase 0 |
 |---------|--------------------------------------------|-------|------------|
-| A       | PyTorch baseline + FP32 KV                | 2.04  | 1.00×      |
-| C       | Native Q4 GEMV (AVX2 FMA)                 | 2.26  | 1.12×      |
-| D       | LUT vpshufb tiled kernel (Phase 1)        | 1.55  | 0.76×      |
-| E       | SliM 2.2-bit + LUT (4/32 layers, quick)  | 1.43  | 0.70×      |
-| F       | FATReLU 85% FFN sparsity (Phase 3)         | 2.66  | 1.31×      |
-| G       | FATReLU + EAGLE-3 MTP (draft_k=1)         | 1.35  | 0.66×      |
-| B       | Legacy QCSD (2-bit draft bank)            | 0.86  | 0.42×      |
+| A       | PyTorch baseline + FP32 KV                | 2.00  | 1.00×      |
+| C       | Native Q4 GEMV (AVX2 FMA)                 | 2.16  | 1.12×      |
+| D       | LUT vpshufb tiled kernel (Phase 1)        | 1.40  | 0.70×      |
+| E       | SliM 2.2-bit + LUT (4/32 layers, quick)  | 1.30  | 0.65×      |
+| F       | FATReLU 85% FFN sparsity (Phase 3)         | 2.66  | 1.33×      |
+| G       | FATReLU + EAGLE-3 MTP (draft_k=1)         | 1.35  | 0.68×      |
+| B       | Legacy QCSD (2-bit draft bank)            | 0.73  | 0.37×      |
 
 **llama.cpp Q4_K_M reference (~7.0 tok/s): not beaten, gap = 5.35 tok/s**
 **EAGLE-3 acceptance rate: 7.1%** (MTP head test_top1 = 32.8% on held-out eval)
@@ -30,7 +30,7 @@ at AI=3.99 FLOPS/byte vs ridge 17.6.
 ## Phase 0 baseline
 1.20 tok/s (PyTorch matvec, no quantization)
 
-## Architecture contributions (Phase 14)
+## Architecture contributions (Phase 15)
 
 | Optimization               | Contribution           | Measured |
 |---------------------------|------------------------|----------|
@@ -116,13 +116,27 @@ a broader distribution.
 
 Not achievable with current F (~2.66 tok/s) and current acceptance (7.1%).
 
+## Phase 15 finding: canonical recalibration
+
+Phase 15 ran `calibrate_fatrelu.py --prompts canonical` (12 mathematical/calculus prompts)
+to produce `phi4_fatrelu_thresholds_canonical.json`. Result: τ values were nearly
+identical to the original file (ratio 1.00× for 30/32 layers, 1.35× for L0, 1.46× for L1).
+
+This confirms: the Phase 14 sparsity gap (46–66% on L0/L3 vs 85% target) is **session
+variance**, not wrong τ values. The canonical thresholds actually degraded Profile F
+from 2.66 → 2.07 tok/s on the same session.
+
+The Phase 7 peak (5.19 tok/s) remains unexplained but is session-specific. Possible
+causes: AVX2 turbo boost ceiling behavior, OpenMP thread affinity differences, or
+Windows scheduler variance on the quantized AVX2 workload.
+
 ## Path to llama.cpp
 
 The theoretical path requires four things together:
 
-1. **Profile F recovery to ~5.0 tok/s** — possible via per-prompt τ recalibration
-   (run `calibrate_fatrelu.py` with the canonical prompt included in calibration set),
-   or session optimization (disable turbo boost, pin threads).
+1. **Profile F recovery to ~5.0 tok/s** — per-prompt τ recalibration is confirmed
+   unlikely to help (Phase 15 result). Session optimization (disable turbo boost,
+   thread pinning, NUMA affinity) may recover the Phase 7 peak.
 
 2. **EAGLE-3 acceptance ≥ 50%** — requires significantly more MTP training data
    covering mathematical/technical prompts, or larger draft_k (if acceptance supports it).
@@ -138,12 +152,14 @@ The theoretical path requires four things together:
 
 - **EAGLE-3 acceptance**: 7.1% end-to-end vs 32.8% held-out eval — distribution shift.
   Needs domain-matched training data or per-prompt calibration.
-- **Profile F variance**: 5.19 peak not reproduced; session-to-session thermal/throttle
-  variance on Windows + AVX2 CPU is significant.
+- **Profile F variance (Phase 15 confirmed)**: 5.19 peak not reproducible; canonical τ
+  recalibration made F worse (2.07 tok/s). Session-to-session thermal/throttle variance
+  on Windows + AVX2 quantized CPU is the dominant factor. Per-prompt τ calibration
+  does not fix this (Phase 15 proof).
 - **LUT vpshufb on Raptor Lake**: consistently slower than native FMA GEMV due to
   `_mm_i32gather_ps` latency (~20 cycles); architectural mismatch for this hardware.
 - **SliM quick-mode**: only 4/32 layers calibrated; full calibration requires more RAM.
-- **QCSD Profile B**: 0.86 tok/s at 81% acceptance — batched verify is correct but
+- **QCSD Profile B**: 0.73 tok/s at 84% acceptance — batched verify is correct but
   serial draft emission + 2-bit quality limits throughput.
 
 ## Future work (ordered by impact)

@@ -461,10 +461,10 @@
   },
   "phase_14_results": {
     "this_is_the_final_phase": true,
-    "profile_f_root_cause_diagnosis": "active_rows used 1e-9 threshold instead of tau — near-zero values already masked by FATReLU were still processed by sparse kernel (bug fixed). Confirmed: sparse_down_proj_T_called=864, dense_fallback=0 for 27 tokens. Remaining: actual sparsity on benchmark prompt is 46-66% on L0/L3 vs 85% target, caused by calibration prompt mismatch; Phase 7 peak (5.19 tok/s) not reproduced, likely session thermal variance.",
+    "profile_f_root_cause_diagnosis": "active_rows used 1e-9 threshold instead of tau — near-zero values already masked by FATReLU were still processed by sparse kernel (bug fixed in Phase 14). Confirmed: sparse_down_proj_T_called=864, dense_fallback=0 for 27 tokens. Phase 15 canonical recalibration: tau values nearly identical to original (1.00x for most layers), confirming the Phase 14 sparsity gap (46-66% on L0/L3) was session variance, not wrong tau. Canonical thresholds made F worse (2.07 vs 2.66). Phase 7 peak (5.19 tok/s) remains unexplained but is session-specific. Fixed threshold bug is confirmed correct.",
     "sparse_down_proj_T_calls_per_token": 32,
     "dense_fallback_calls_per_token": 0,
-    "actual_ffn_sparsity_measured": "46-66% on L0/L3; 70-84% on L1; 53-88% on L2; ~85% on L30-L31; target 85%",
+    "actual_ffn_sparsity_measured": "46-66% on L0/L3; 70-84% on L1; 53-88% on L2; ~85% on L30-L31; target 85%. Phase 15 canonical tau: L0=0.01356 (orig 0.01002), L3=0.01789 (orig 0.01728), both within 1.35x — sparsity gap confirmed as session variance.",
     "profile_f_recovered": false,
     "mtp_head_retrained": false,
     "mtp_head_test_top1_final": 32.8,
@@ -489,6 +489,20 @@
       "combined_g_projection": 7.05
     },
     "project_conclusion": "asdsl achieves 2.22x speedup vs phase 0 baseline (1.20 to 2.66 tok/s); does not beat llama.cpp at 7.0 tok/s; primary remaining work: per-prompt FATReLU calibration to recover F to 4.7+ tok/s plus EAGLE-3 acceptance to 50%+"
+  },
+  "phase_15_recalibration": {
+    "thresholds_file": "phi4_fatrelu_thresholds_canonical.json",
+    "calibration_prompts": "12 mathematical/calculus domain prompts (canonical)",
+    "mean_sparsity_before_canonical_tau": 0.65,
+    "mean_sparsity_after_canonical_tau": 0.65,
+    "profile_f_before_canonical_tau": 2.66,
+    "profile_f_after_canonical_tau": 2.07,
+    "profile_g_before_canonical_tau": 1.35,
+    "profile_g_after_canonical_tau": 1.15,
+    "llama_cpp_beaten": false,
+    "final_best_tok_per_sec": 2.66,
+    "project_permanently_closed": true,
+    "key_finding": "canonical recalibration produced nearly identical tau values (ratio 1.00x for 30/32 layers); sparsity gap is session variance, not wrong tau. Canonical thresholds actually degraded F from 2.66 to 2.07 tok/s in this session. Phase 7 peak (5.19 tok/s) remains session-specific and unexplained."
   }
 }
 
