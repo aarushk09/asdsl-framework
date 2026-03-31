@@ -62,14 +62,15 @@ _configure_cpu_torch_runtime()
 def set_thread_count(n: int) -> None:
     """Set CPU threads for NumPy/BLAS/PyTorch and ASDSL native OpenMP GEMV.
 
-    ``n <= 0`` (auto): use half of ``os.cpu_count()`` (minimum 1). That tends to map
-    closer to physical cores on typical SMT CPUs and reduces hyperthreading
-    contention on bandwidth-bound native GEMV while still letting explicit
-    ``--threads`` override for tuning.
+    ``n <= 0`` (auto): use all physical cores (including E-cores on hybrid CPUs).
+    For memory-bound GEMV workloads, all physical cores contribute to bandwidth
+    utilization even at lower E-core IPC. On this Raptor Lake (8P+4E = 12 physical),
+    auto now defaults to 12 instead of 8.
     """
     if n <= 0:
-        logical = os.cpu_count() or 4
-        n = max(1, logical // 2)
+        import psutil
+        physical = psutil.cpu_count(logical=False) or 12
+        n = physical  # use ALL physical cores including E-cores
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(n)
@@ -528,7 +529,11 @@ class WeightStore:
         self._repacked_layers: dict = {}  # lazy per-layer repacked buffers
         # Phase 3: FATReLU sparsity (Profile F)
         self._use_fatrelu = False
-        self._fatrelu_thresholds: dict[int, float] = {}  # per-layer tau
+        self._fatrelu_thresholds: dict[int, float] = {}  # per-layer tau (fixed fallback)
+        self._adaptive_tau: dict[int, float] = {}         # per-layer measured tau (adaptive)
+        self._adaptive_tau_warmup_tokens = 0               # tokens seen for warmup
+        self._adaptive_tau_warmup_target = 5                # measure tau from first 5 tokens
+        self._use_adaptive_fatrelu = False                  # enabled via load_fatrelu(path, adaptive=True)
         self._sparse_down_proj_T_calls = 0
         self._dense_down_proj_fallback_calls = 0
         self._sparsity_debug_count = 0
@@ -571,6 +576,11 @@ class WeightStore:
         self._use_eagle3: bool = False
         self._mtp_head: dict | None = None
         self._last_final_hidden: "np.ndarray | None" = None
+        # EAGLE-3 multi-layer feature fusion: capture hidden states from 3 layers
+        # Layer 0 (low), Layer 15 (mid), Layer 31 (high = final hidden)
+        self._eagle3_hidden_low: "np.ndarray | None" = None
+        self._eagle3_hidden_mid: "np.ndarray | None" = None
+        self._eagle3_hidden_high: "np.ndarray | None" = None  # same as _last_final_hidden
 
     def enter_verify_phase(self) -> None:
         """Enable temporary dequantization caching for the speculative verify phase."""
@@ -1154,11 +1164,18 @@ class WeightStore:
         size_gb = meta.get("statistics", {}).get("estimated_model_size_gb", "?")
         print(f"[SliM] Loaded: {avg_bits} avg bits, ~{size_gb} GB estimated size")
 
-    def load_fatrelu(self, thresholds_path) -> None:
+    def load_fatrelu(self, thresholds_path, adaptive: bool = False) -> None:
         """Load FATReLU thresholds from phi4_fatrelu_thresholds.json.
 
         Sets self._use_fatrelu = True and populates self._fatrelu_thresholds.
         Also triggers transposed down_proj loading (Prerequisite B).
+
+        If ``adaptive=True``, enables runtime adaptive tau measurement: the first
+        ``_adaptive_tau_warmup_target`` tokens are used to measure the actual 85th
+        percentile activation magnitude per layer, after which the measured tau values
+        are used for all subsequent tokens (with exponential moving average smoothing).
+        This compensates for prompt-specific activation magnitude variance that causes
+        fixed offline tau values to produce 46-54% actual sparsity instead of 85%.
         """
         import json as _json
         thresholds_path = Path(thresholds_path)
@@ -1170,12 +1187,17 @@ class WeightStore:
         raw = data.get("thresholds", {})
         self._fatrelu_thresholds = {int(k): float(v) for k, v in raw.items()}
         self._use_fatrelu = True
+        self._use_adaptive_fatrelu = adaptive
 
         n = len(self._fatrelu_thresholds)
         mean_tau = sum(self._fatrelu_thresholds.values()) / max(n, 1)
         sparsity = data.get("target_sparsity", 0.85)
+        mode_str = "adaptive" if adaptive else "fixed"
         print(f"[FATReLU] Loaded: {n} layers, mean tau={mean_tau:.4f}, "
-              f"target sparsity={sparsity:.0%}")
+              f"target sparsity={sparsity:.0%}, mode={mode_str}")
+        if adaptive:
+            print(f"[FATReLU] Adaptive: warmup={self._adaptive_tau_warmup_target} tokens, "
+                  f"EMA smoothing=0.7/0.3")
 
         # Phase 4 Prerequisite B: build transposed down_proj weights
         self.load_transposed_down_proj()
@@ -1538,7 +1560,13 @@ class WeightStore:
         return self.embed_f16[token_id].float().cpu().numpy().ravel()
 
     def load_mtp_head(self, path: str) -> None:
-        """Load trained MTP head for EAGLE-3 speculative decoding (Profile G)."""
+        """Load trained MTP head for EAGLE-3 speculative decoding (Profile G).
+
+        Supports both old single-layer format (fc1/norm/proj) and new multi-layer
+        EAGLE-3 format (proj_low/mid/high + attn/norm/ffn/proj_out). The format is
+        detected from the checkpoint's ``architecture`` key or by checking for
+        multi-layer keys.
+        """
         import torch
         import os
         from pathlib import Path
@@ -1551,19 +1579,53 @@ class WeightStore:
         try:
             ckpt = torch.load(str(path_p), map_location="cpu", weights_only=False)
             val_acc = ckpt.get("val_top1_accuracy", 0.0)
-            
-            # Map checkpoint keys to names used in _run_mtp_draft
-            self._mtp_head = {
-                "fc1_W": ckpt["fc1_weight"].float().numpy(),
-                "fc1_b": ckpt["fc1_bias"].float().numpy(),
-                "norm_W": ckpt["norm_weight"].float().numpy(),
-                "norm_b": ckpt["norm_bias"].float().numpy(),
-                "proj_W": ckpt["proj_weight"].float().numpy(),
-                "proj_b": ckpt["proj_bias"].float().numpy(),
-                "val_acc": val_acc
-            }
+            architecture = ckpt.get("architecture", "single_layer")
+
+            # Detect format: multi-layer EAGLE-3 has proj_low_W, etc.
+            is_multilayer = (
+                architecture == "eagle3_multilayer"
+                or "proj_low_W" in ckpt
+                or "proj_low_weight" in ckpt
+            )
+
+            if is_multilayer:
+                # New multi-layer EAGLE-3 format
+                self._mtp_head = {
+                    "architecture": "eagle3_multilayer",
+                    "proj_low_W": ckpt.get("proj_low_W", ckpt.get("proj_low_weight")).float().numpy(),
+                    "proj_low_b": ckpt.get("proj_low_b", ckpt.get("proj_low_bias")).float().numpy(),
+                    "proj_mid_W": ckpt.get("proj_mid_W", ckpt.get("proj_mid_weight")).float().numpy(),
+                    "proj_mid_b": ckpt.get("proj_mid_b", ckpt.get("proj_mid_bias")).float().numpy(),
+                    "proj_high_W": ckpt.get("proj_high_W", ckpt.get("proj_high_weight")).float().numpy(),
+                    "proj_high_b": ckpt.get("proj_high_b", ckpt.get("proj_high_bias")).float().numpy(),
+                    "attn_W": ckpt.get("attn_W", ckpt.get("attn_weight")).float().numpy(),
+                    "attn_b": ckpt.get("attn_b", ckpt.get("attn_bias")).float().numpy(),
+                    "norm_W": ckpt.get("norm_W", ckpt.get("norm_weight")).float().numpy(),
+                    "norm_b": ckpt.get("norm_b", ckpt.get("norm_bias")).float().numpy(),
+                    "ffn_W": ckpt.get("ffn_W", ckpt.get("ffn_weight")).float().numpy(),
+                    "ffn_b": ckpt.get("ffn_b", ckpt.get("ffn_bias")).float().numpy(),
+                    "proj_out_W": ckpt.get("proj_out_W", ckpt.get("proj_out_weight")).float().numpy(),
+                    "proj_out_b": ckpt.get("proj_out_b", ckpt.get("proj_out_bias")).float().numpy(),
+                    "val_acc": val_acc,
+                    "test_acc": ckpt.get("test_top1_accuracy", 0.0),
+                }
+                print(f"[EAGLE-3] Loaded multi-layer MTP head from {path} "
+                      f"(val_acc={val_acc:.1f}%, architecture=eagle3_multilayer)")
+            else:
+                # Old single-layer format (backward compatible)
+                self._mtp_head = {
+                    "architecture": "single_layer",
+                    "fc1_W": ckpt["fc1_weight"].float().numpy(),
+                    "fc1_b": ckpt["fc1_bias"].float().numpy(),
+                    "norm_W": ckpt["norm_weight"].float().numpy(),
+                    "norm_b": ckpt["norm_bias"].float().numpy(),
+                    "proj_W": ckpt["proj_weight"].float().numpy(),
+                    "proj_b": ckpt["proj_bias"].float().numpy(),
+                    "val_acc": val_acc
+                }
+                print(f"[EAGLE-3] Loaded single-layer MTP head from {path} "
+                      f"(val_acc={val_acc:.1f}%, fallback)")
             self._use_eagle3 = True
-            print(f"[EAGLE-3] Loaded MTP head from {path} (val_acc={val_acc:.1f}%)")
         except Exception as e:
             print(f"[EAGLE-3] Error loading MTP head from {path}: {e}")
             self._use_eagle3 = False
@@ -2032,7 +2094,26 @@ def forward_layer(
     # Phase 3: FATReLU threshold mask — zero out elements below tau
     # This creates 85% sparsity in the FFN intermediate, enabling sparse down_proj.
     if store._use_fatrelu and layer_idx in store._fatrelu_thresholds:
-        tau = store._fatrelu_thresholds[layer_idx]
+        # Adaptive tau: measure from first N tokens, then use measured values
+        if store._use_adaptive_fatrelu:
+            if store._adaptive_tau_warmup_tokens < store._adaptive_tau_warmup_target:
+                # Measure actual 85th percentile from this token's activations
+                act_np = act.detach().cpu().float().numpy().ravel()
+                measured_tau = float(np.percentile(np.abs(act_np), 85))
+                if layer_idx in store._adaptive_tau:
+                    # Exponential moving average for stability
+                    store._adaptive_tau[layer_idx] = (
+                        0.7 * store._adaptive_tau[layer_idx] + 0.3 * measured_tau
+                    )
+                else:
+                    store._adaptive_tau[layer_idx] = measured_tau
+                tau = store._adaptive_tau[layer_idx]
+            else:
+                # After warmup, use the measured adaptive tau (falls back to fixed if not measured)
+                tau = store._adaptive_tau.get(
+                    layer_idx, store._fatrelu_thresholds.get(layer_idx, 0))
+        else:
+            tau = store._fatrelu_thresholds[layer_idx]
         act = act * (act.abs() >= tau).float()
         if store._sparsity_debug_count < 3 and layer_idx < 4:
             tau_v = tau
@@ -2041,8 +2122,15 @@ def forward_layer(
             n_active = int((np.abs(act_np) >= tau_v).sum())
             print(f"[sparsity token={store._sparsity_debug_count} L{layer_idx}] "
                   f"tau={tau_v:.5f} sparsity={actual_sparsity:.1%} active={n_active}/8192")
-        if layer_idx == 31 and store._sparsity_debug_count < 3:
-            store._sparsity_debug_count += 1
+        if layer_idx == 31:
+            if store._use_adaptive_fatrelu:
+                store._adaptive_tau_warmup_tokens += 1
+                if store._adaptive_tau_warmup_tokens == store._adaptive_tau_warmup_target:
+                    mean_at = sum(store._adaptive_tau.values()) / max(len(store._adaptive_tau), 1)
+                    print(f"[FATReLU] Adaptive warmup complete at token {store._adaptive_tau_warmup_tokens}; "
+                          f"measured mean tau={mean_at:.5f} across {len(store._adaptive_tau)} layers")
+            if store._sparsity_debug_count < 3:
+                store._sparsity_debug_count += 1
 
     # Phase 4 Prerequisite B: use transposed down_proj for column-sparse access
     # When FATReLU is active and transposed weights are available, use
@@ -2095,6 +2183,18 @@ def forward_layer(
     else:
         store._dense_down_proj_fallback_calls += 1
         hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
+
+    # EAGLE-3 multi-layer feature fusion: capture hidden states from 3 layers
+    # Captured for training data collection and for EAGLE-3 draft generation.
+    # Layer 0 (low-level features), Layer 15 (mid-level), Layer 31 (high-level).
+    if store._use_eagle3:
+        h_np = hidden.detach().cpu().float().numpy().ravel()
+        if layer_idx == 0:
+            store._eagle3_hidden_low = h_np.copy()
+        elif layer_idx == 15:
+            store._eagle3_hidden_mid = h_np.copy()
+        elif layer_idx == 31:
+            store._eagle3_hidden_high = h_np.copy()
 
     return hidden
 
@@ -2752,7 +2852,11 @@ def _run_mtp_draft(
     to predict the greedy next token). This is **not** the greedy ``current_token``
     about to be emitted.
 
-    Uses ``torch.nn.functional.layer_norm`` + ``gelu`` to match ``train_mtp_head``.
+    Supports both single-layer format (old mtp_head.pt) and multi-layer
+    EAGLE-3 format (new mtp_head.pt with eagle3_multilayer architecture).
+    Multi-layer: fuses low (L0), mid (L15), high (L31) hidden states via
+    learned projections, then residual-adds token embedding, runs transformer
+    decoder layer (self-attention + FFN), projects back to hidden dim.
 
     Returns: list of up to k draft token ids.
     """
@@ -2763,35 +2867,106 @@ def _run_mtp_draft(
         return []
 
     head = store._mtp_head
-    fc1_W = torch.from_numpy(head["fc1_W"]).float()
-    fc1_b = torch.from_numpy(head["fc1_b"]).float()
-    norm_W = torch.from_numpy(head["norm_W"]).float()
-    norm_b = torch.from_numpy(head["norm_b"]).float()
-    proj_W = torch.from_numpy(head["proj_W"]).float()
-    proj_b = torch.from_numpy(head["proj_b"]).float()
+    architecture = head.get("architecture", "single_layer")
 
     prev_hidden = torch.from_numpy(store._last_final_hidden.copy()).float()
     cur_embed_src = embed_source_token_id
     drafts: list[int] = []
 
-    for _ in range(k):
-        tok_emb = torch.from_numpy(store._get_token_embedding(cur_embed_src)).float()
-        x = torch.cat([prev_hidden, tok_emb], dim=0)
-        h = F.linear(x.unsqueeze(0), fc1_W, fc1_b).squeeze(0)
-        h = F.layer_norm(
-            h.unsqueeze(0),
-            (h.shape[-1],),
-            norm_W,
-            norm_b,
-            eps=1e-5,
-        ).squeeze(0)
-        h = F.gelu(h)
-        h_proj = F.linear(h.unsqueeze(0), proj_W, proj_b).squeeze(0)
-        logits_t = store.lm_head_matvec(h_proj.unsqueeze(0))
-        next_tok = int(logits_t.argmax())
-        drafts.append(next_tok)
-        prev_hidden = h_proj
-        cur_embed_src = next_tok
+    if architecture == "eagle3_multilayer":
+        # Multi-layer EAGLE-3: fuse low/mid/high layer hidden states
+        proj_low_W = torch.from_numpy(head["proj_low_W"]).float()
+        proj_low_b = torch.from_numpy(head["proj_low_b"]).float()
+        proj_mid_W = torch.from_numpy(head["proj_mid_W"]).float()
+        proj_mid_b = torch.from_numpy(head["proj_mid_b"]).float()
+        proj_high_W = torch.from_numpy(head["proj_high_W"]).float()
+        proj_high_b = torch.from_numpy(head["proj_high_b"]).float()
+        attn_W = torch.from_numpy(head["attn_W"]).float()
+        attn_b = torch.from_numpy(head["attn_b"]).float()
+        norm_W = torch.from_numpy(head["norm_W"]).float()
+        norm_b = torch.from_numpy(head["norm_b"]).float()
+        ffn_W = torch.from_numpy(head["ffn_W"]).float()
+        ffn_b = torch.from_numpy(head["ffn_b"]).float()
+        proj_out_W = torch.from_numpy(head["proj_out_W"]).float()
+        proj_out_b = torch.from_numpy(head["proj_out_b"]).float()
+
+        # h_low/h_mid/h_high are captured during forward_layer passes
+        # Fall back to h_high for any that are None (backward compat)
+        h_low = torch.from_numpy(
+            store._eagle3_hidden_low.copy()
+            if store._eagle3_hidden_low is not None
+            else store._last_final_hidden.copy()
+        ).float()
+        h_mid = torch.from_numpy(
+            store._eagle3_hidden_mid.copy()
+            if store._eagle3_hidden_mid is not None
+            else store._last_final_hidden.copy()
+        ).float()
+        h_high = prev_hidden
+
+        for _ in range(k):
+            tok_emb = torch.from_numpy(store._get_token_embedding(cur_embed_src)).float()
+
+            # Project each layer's hidden state to MTP_HIDDEN dim via GELU
+            f_low  = F.gelu(F.linear(h_low,  proj_low_W,  proj_low_b))
+            f_mid  = F.gelu(F.linear(h_mid,  proj_mid_W,  proj_mid_b))
+            f_high = F.gelu(F.linear(h_high, proj_high_W, proj_high_b))
+
+            # Fuse: concatenate all three projected features
+            fused = torch.cat([f_low, f_mid, f_high], dim=-1)  # [3072]
+            x = fused + tok_emb  # residual addition with token embedding
+
+            # Transformer decoder self-attention (single attention layer)
+            # Approximate as: x + SelfAttn(x)
+            x_attn = F.linear(x.unsqueeze(0), attn_W, attn_b).squeeze(0)
+            x = x + x_attn
+
+            # Self-attention normalization
+            x = F.layer_norm(x.unsqueeze(0), (x.shape[-1],), norm_W, norm_b, eps=1e-5).squeeze(0)
+
+            # Feed-forward after attention
+            x = x + F.gelu(F.linear(x, ffn_W, ffn_b))
+
+            # Final normalization
+            x = F.layer_norm(x.unsqueeze(0), (x.shape[-1],), norm_W, norm_b, eps=1e-5).squeeze(0)
+
+            # Project back to Phi-4 hidden dim for lm_head
+            h_proj = F.linear(x, proj_out_W, proj_out_b)
+            logits_t = store.lm_head_matvec(h_proj.unsqueeze(0))
+            next_tok = int(logits_t.argmax())
+            drafts.append(next_tok)
+
+            # Advance: use projected hidden state as next step's high hidden
+            h_high = h_proj.detach()
+            cur_embed_src = next_tok
+
+    else:
+        # Old single-layer format (backward compatible)
+        fc1_W = torch.from_numpy(head["fc1_W"]).float()
+        fc1_b = torch.from_numpy(head["fc1_b"]).float()
+        norm_W = torch.from_numpy(head["norm_W"]).float()
+        norm_b = torch.from_numpy(head["norm_b"]).float()
+        proj_W = torch.from_numpy(head["proj_W"]).float()
+        proj_b = torch.from_numpy(head["proj_b"]).float()
+
+        for _ in range(k):
+            tok_emb = torch.from_numpy(store._get_token_embedding(cur_embed_src)).float()
+            x = torch.cat([prev_hidden, tok_emb], dim=0)
+            h = F.linear(x.unsqueeze(0), fc1_W, fc1_b).squeeze(0)
+            h = F.layer_norm(
+                h.unsqueeze(0),
+                (h.shape[-1],),
+                norm_W,
+                norm_b,
+                eps=1e-5,
+            ).squeeze(0)
+            h = F.gelu(h)
+            h_proj = F.linear(h.unsqueeze(0), proj_W, proj_b).squeeze(0)
+            logits_t = store.lm_head_matvec(h_proj.unsqueeze(0))
+            next_tok = int(logits_t.argmax())
+            drafts.append(next_tok)
+            prev_hidden = h_proj
+            cur_embed_src = next_tok
 
     return drafts
 

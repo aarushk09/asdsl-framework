@@ -170,3 +170,57 @@ The theoretical path requires four things together:
 3. Full SliM 32/32-layer calibration — expected ~45% footprint reduction → proportional F speedup.
 4. Profile combining SliM + FATReLU — multiplicative bandwidth savings.
 5. QCSD draft quality improvement (beyond 2-bit) — higher acceptance → better QCSD speedup.
+
+## Phase 16 findings (2026-03-30): thread count, adaptive sparsity, EAGLE-3 architecture
+
+### What was changed
+
+1. **Thread count**: Auto default changed from 8 to 12 (all physical cores on Raptor Lake 8P+4E).
+2. **Adaptive FATReLU**: Implemented runtime 85th-percentile measurement from first 5 tokens
+   per layer, with EMA smoothing (0.7/0.3). Loads fixed thresholds as fallbacks.
+3. **EAGLE-3 multi-layer architecture**: `_run_mtp_draft` and `load_mtp_head` updated to support
+   both old single-layer format (fc1/norm/proj) and new multi-layer format (proj_low/mid/high +
+   attn/norm/ffn/proj_out). Hidden states captured from layers 0, 15, 31 during forward passes.
+4. **Benchmark config**: Updated to 12 threads, 128 tokens, empty prompt, draft_k=3 for fair
+   llama.cpp comparison.
+5. **Profile isolation**: All isolated subprocess runs now call `set_thread_count` with the
+   configured thread count (fixing a bug where isolated profiles used 1 thread).
+
+### Results (12 threads, 128 tokens, empty prompt)
+
+| Profile | tok/s | vs Phase 15 |
+|---------|-------|-------------|
+| C | 1.68 | -0.48 (different config: n=128,k=3 vs n=64,k=1) |
+| F | 1.28 | -0.79 (sparse kernel overhead worse at 12 threads) |
+| G | 0.58 | -0.57 (MTP head trained on 32 samples = near-random) |
+
+**llama.cpp Q4_K_M (12t, 128, empty): 3.06 tok/s — not beaten, gap = 1.38 tok/s**
+
+### Key diagnostic finding: sparse kernel overhead
+
+The adaptive FATReLU implementation is working correctly:
+- `sparse_T=896, dense_fallback=0` — sparse kernel is being called for every layer
+- Yet Profile F (1.28 tok/s) is 24% slower than Profile C (1.68 tok/s) at 12 threads
+
+At 8 threads (Phase 15), the ratio was F/C = 0.958 (2.07/2.16). At 12 threads it
+worsened to 0.762 (1.28/1.68). The sparse kernel's per-row index selection, boundary
+checks, and non-contiguous memory access become relatively more expensive as thread count
+increases, because the dense GEMV benefits from more threads while the sparse kernel does not.
+
+This is a fundamental software engineering constraint: the ASDSL sparse kernel implementation
+in Python/C++ has overhead that offsets the 85% memory bandwidth savings from sparsity.
+
+### MTP head quality
+
+Quick training on 32 samples (4 prompts × 8 steps) produces a near-random head:
+- train_top1: 19.2%, val_top1: 0.0%, test_top1: 3.1%
+- Architecture correctly supports multi-layer format, but training data is insufficient
+- Full training on 10,000 prompts was intended but HuggingFace was unreachable during Phase 16;
+  fallback corpus generated at `models/sharegpt_prompts.json`
+
+### Honest assessment
+
+ASDSL does not beat llama.cpp on this benchmark. The remaining path requires:
+1. Native sparse kernel optimization (C-level sparse GEMV without Python call overhead)
+2. Full MTP training on large corpus (10K+ prompts) for meaningful EAGLE-3 acceptance
+3. Session optimization to recover the Phase 7 peak (5.19 tok/s — still unexplained)

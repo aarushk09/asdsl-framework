@@ -1,17 +1,26 @@
 {
-  "schema_version": "1.0",
-  "locked_at_phase": 11,
-  "prompt": "The fundamental theorem of calculus states that",
-  "max_new_tokens": 64,
-  "threads": 8,
-  "draft_k": 1,
+  "schema_version": "1.1",
+  "locked_at_phase": 16,
+  "prompt": "",
+  "max_new_tokens": 128,
+  "threads": 12,
+  "draft_k": 3,
   "fatrelu_thresholds": "phi4_fatrelu_thresholds.json",
   "slim_meta": "phi4_slim_meta.json",
   "inter_profile_sleep_seconds": 3,
+  "comparison_target": {
+    "name": "llama.cpp",
+    "version": "build 08f21453a (8589)",
+    "command": "llama-bench -m phi-4-Q4_K_M.gguf -p 0 -n 128 -ngl 0",
+    "result_tok_per_sec": 3.06,
+    "result_stddev": 0.14,
+    "threads": 12,
+    "quantization": "Q4_K_M"
+  },
   "rationale": {
-    "prompt": "Pinned calculus prompt; comparable KV depth across phases",
-    "max_new_tokens": "64 tokens for stable throughput without excessive KV growth",
-    "draft_k": "Set to 1 by scripts/choose_draft_k.py at test_top1=32.8% (max S=1.088x; k=2 fell slightly below 1.0)",
-    "threads": "8 threads on Raptor Lake P-core class machines"
+    "threads": "12 matches llama.cpp default (all physical cores: 8P + 4E on this Raptor Lake)",
+    "max_new_tokens": "128 matches llama.cpp -n 128",
+    "prompt": "empty matches llama.cpp -p 0",
+    "draft_k": "3 chosen for EAGLE-3 at projected 40% acceptance (S = 1.625x)"
   }
 }

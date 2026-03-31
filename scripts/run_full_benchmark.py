@@ -559,8 +559,10 @@ os.environ.setdefault("USE_JAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 {extra_env_lines}
 
-from experiments.phi4_cpu_run import WeightStore, generate, generate_eagle3
+from experiments.phi4_cpu_run import WeightStore, generate, generate_eagle3, set_thread_count
 from transformers import AutoTokenizer
+
+set_thread_count({thread_count})
 
 tokenizer = AutoTokenizer.from_pretrained(
     "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True)
@@ -583,6 +585,10 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     {generate_call}
 
+# Capture sparsity debug info after generation
+sparse_T_calls = int(getattr(store, "_sparse_down_proj_T_calls", 0))
+dense_T_calls = int(getattr(store, "_dense_down_proj_fallback_calls", 0))
+
 if metrics:
     m = metrics[0]
     payload = {{
@@ -590,7 +596,22 @@ if metrics:
         "rss": None,
         "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
         "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
+        "sparse_T_calls": sparse_T_calls,
+        "dense_T_calls": dense_T_calls,
     }}
+    if m.get("acceptance_rate") is not None:
+        payload["acceptance_rate"] = float(m["acceptance_rate"])
+    if m.get("mean_tokens_accepted_per_cycle") is not None:
+        payload["mean_tokens_accepted_per_cycle"] = float(m["mean_tokens_accepted_per_cycle"])
+    print("__PROFILE_RESULT__" + json.dumps(payload))
+else:
+    print("__PROFILE_RESULT__" + json.dumps({{
+        "tps": 0.0, "rss": None,
+        "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
+        "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
+        "sparse_T_calls": sparse_T_calls,
+        "dense_T_calls": dense_T_calls,
+    }}))
     if m.get("acceptance_rate") is not None:
         payload["acceptance_rate"] = float(m["acceptance_rate"])
     if m.get("mean_tokens_accepted_per_cycle") is not None:
@@ -626,6 +647,7 @@ def _run_phi4_profile_isolated(
     inter_profile_sleep: float = 5.0,
     subprocess_extra_env: dict[str, str] | None = None,
     eagle_draft_k: int = 4,
+    thread_count: int = 0,
 ) -> tuple[float, None, dict]:
     """Run a single profile in an isolated subprocess.
 
@@ -644,7 +666,7 @@ def _run_phi4_profile_isolated(
     if needs_slim and slim_meta_path:
         pre_lines.append(f"store.load_slim({slim_meta_path!r})")
     if needs_fatrelu and fatrelu_path:
-        post_lines.append(f"store.load_fatrelu({fatrelu_path!r})")
+        post_lines.append(f"store.load_fatrelu({fatrelu_path!r}, adaptive=True)")
     if needs_mtp and mtp_head_path:
         post_lines.append(f"store.load_mtp_head({mtp_head_path!r})")
     pre_warm_setup = "\n".join(pre_lines)
@@ -679,6 +701,7 @@ def _run_phi4_profile_isolated(
         max_new_tokens=max_new_tokens,
         generate_call=generate_call,
         extra_env_lines=extra_env_lines,
+        thread_count=thread_count,
     )
 
     run_env = os.environ.copy()
@@ -710,7 +733,10 @@ def _run_phi4_profile_isolated(
               file=sys.stderr)
         print(result.stderr[-2000:] if result.stderr else "(no stderr)", file=sys.stderr)
 
-    print(f"[Profile {profile_name}] isolated result: {tps:.3f} tok/s", flush=True)
+    sparse_T = extras.get("sparse_T_calls", 0)
+    dense_T = extras.get("dense_T_calls", 0)
+    sparse_info = f" sparse_T={sparse_T} dense_fallback={dense_T}" if sparse_T or dense_T else ""
+    print(f"[Profile {profile_name}] isolated result: {tps:.3f} tok/s{sparse_info}", flush=True)
     return tps, None, extras
 
 
@@ -917,6 +943,7 @@ def run_phi4_benchmark(
         "D", root, prompt, max_new_tokens, primary_bits,
         use_native=True, use_lut=True,
         enable_sparse=False, sparsity_threshold=0.01,
+        thread_count=threads,
         inter_profile_sleep=_inter_sleep,
     )
     m_d: dict = {"tokens_per_second": tps_d}
@@ -930,6 +957,7 @@ def run_phi4_benchmark(
             "E", root, prompt, max_new_tokens, primary_bits,
             use_native=True, use_lut=True,
             needs_slim=True, slim_meta_path=str(_slim_meta_path),
+            thread_count=threads,
             inter_profile_sleep=_inter_sleep,
         )
         m_e = {"tokens_per_second": tps_e}
@@ -949,6 +977,7 @@ def run_phi4_benchmark(
             enable_sparse=True, sparsity_threshold=0.0,
             needs_fatrelu=True, fatrelu_path=str(_fatrelu_path),
             inter_profile_sleep=_inter_sleep,
+            thread_count=threads,
         )
         m_f: dict = {"tokens_per_second": tps_f}
     else:
@@ -993,6 +1022,7 @@ def run_phi4_benchmark(
             inter_profile_sleep=_inter_sleep,
             subprocess_extra_env=g_env if g_env else None,
             eagle_draft_k=int(eagle_draft_k),
+            thread_count=threads,
         )
         m_g = {"tokens_per_second": tps_g}
         if tps_g is not None:
