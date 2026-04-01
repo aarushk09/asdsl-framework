@@ -559,11 +559,11 @@ os.environ["USE_JAX"] = "0"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["OMP_NUM_THREADS"] = str({thread_count})
 os.environ["OMP_PROC_BIND"] = "TRUE"
-os.environ["OMP_PLACES"] = "{{0}},{{1}},{{2}},{{3}},{{4}},{{5}},{{6}},{{7}},{{8}},{{9}},{{10}},{{11}}"
+os.environ["OMP_PLACES"] = "{{0-7}}"
 os.environ["OMP_SCHEDULE"] = "static"
 {extra_env_lines}
 
-from experiments.phi4_cpu_run import WeightStore, generate, generate_eagle3, generate_pld, set_thread_count
+from experiments.phi4_cpu_run import WeightStore, generate, generate_eagle3, generate_pld, generate_native, set_thread_count
 from transformers import AutoTokenizer
 
 set_thread_count({thread_count})
@@ -615,6 +615,10 @@ try:
     payload["q8_call_count"] = _ng.get_q8_call_count()
 except:
     pass
+
+# Print Q8 call count for debugging
+if payload.get("q8_call_count"):
+    print(f"  [debug] Q8 call count: {payload['q8_call_count']}")
 
 print("__PROFILE_RESULT__" + json.dumps(payload))
 '''
@@ -1070,6 +1074,30 @@ def run_phi4_benchmark(
         if ar_h is not None:
             print(f"[Profile H] PLD acceptance rate: {float(ar_h):.1%}")
 
+    # Profile I: Pure C++ Inference Engine (Phase 19) — DISABLED: zero-copy pointers unstable
+    # tps_i = None
+    # peak_i = None
+    # ex_i: dict = {}
+    # tps_i, peak_i, ex_i = _run_phi4_profile_isolated(
+    #     "I", root, prompt, max_new_tokens, primary_bits,
+    #     use_native=True,
+    #     use_lut=False,
+    #     enable_sparse=False,
+    #     sparsity_threshold=0.01,
+    #     needs_fatrelu=False,
+    #     fatrelu_path=None,
+    #     generate_func="generate_native",  # New function using C++ engine
+    #     inter_profile_sleep=_inter_sleep,
+    #     thread_count=threads,
+    #     use_q8=True,
+    # )
+    # m_i = {"tokens_per_second": tps_i}
+    tps_i = None
+    peak_i = None
+    ex_i: dict = {}
+    m_i = {}
+    print("[Profile I] DISABLED: zero-copy weight pointers unstable", flush=True)
+
     metrics_b: list = []
     with contextlib.redirect_stdout(buf):
         with phi4.torch.inference_mode():
@@ -1207,6 +1235,13 @@ def run_phi4_benchmark(
             f"{'H  Native GEMV + Q8 + PLD (Phase 16)':<40} "
             f"{tps_h:>12.2f} {rss_h_s:>14} {est_footprint_c:>20.0f}"
         )
+    # Profile I: Pure C++ Inference Engine
+    if tps_i is not None:
+        rss_i_s = f"{peak_i:.0f}" if peak_i is not None else "n/a"
+        print(
+            f"{'I  Pure C++ Engine + Q4xQ8 (Phase 19)':<40} "
+            f"{tps_i:>12.2f} {rss_i_s:>14} {est_footprint_c:>20.0f}"
+        )
     b_row = (
         "B  Native GEMV + QCSD + Q4 KV est."
         if qcsd_on
@@ -1314,8 +1349,10 @@ def run_phi4_benchmark(
         print(f"ASDSL Profile F (8t, n=128, p=0):  {tps_f:.2f} tok/s  [Q8 GEMV]  ({'BEATS' if tps_f > target else 'below'})")
     if tps_h:
         print(f"ASDSL Profile H (8t, n=128, p=0):  {tps_h:.2f} tok/s  [Q8+PLD]  ({'BEATS' if tps_h > target else 'below'})")
+    if tps_i:
+        print(f"ASDSL Profile I (8t, n=128, p=0):  {tps_i:.2f} tok/s  [Pure C++ Engine]  ({'BEATS' if tps_i > target else 'below'})")
     
-    best_asdsl = max([t for t in [tps_c, tps_f, tps_h, tps_g, tps_b] if t is not None] + [0.0])
+    best_asdsl = max([t for t in [tps_c, tps_f, tps_h, tps_g, tps_b, tps_i] if t is not None] + [0.0])
     if best_asdsl > target:
         print(f"WINNER: ASDSL by {best_asdsl - target:.2f} tok/s ({((best_asdsl/target)-1)*100:.1f}%)")
     else:

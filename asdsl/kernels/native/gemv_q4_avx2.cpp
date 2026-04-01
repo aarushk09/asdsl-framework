@@ -40,8 +40,10 @@
 
 #if defined(_MSC_VER)
 #include <intrin.h>
+#include <malloc.h>
 #elif defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
+#include <alloca.h>
 #endif
 
 #ifdef _OPENMP
@@ -90,14 +92,17 @@ void gemv_q4_q8_avx2(
     const int n_groups = in_features / group_size;
     const int packed_stride = in_features / 2;
     
-    // Pre-quantize x to Q8 per group — done ONCE, shared across all output rows.
-    std::vector<int8_t> x_q8(in_features);
-    std::vector<float> x_scales(n_groups);
-    std::vector<int32_t> x_q8_sums(n_groups);  // sum of quantized activations per group
+    // Heap-allocated buffers — avoids stack overflow risk with _malloca on large inputs.
+    // Max in_features for Phi-4 is 12288 (FFN up_proj), so 12288 bytes for x_q8.
+    std::vector<int8_t> x_q8_buf(in_features);
+    std::vector<float> x_scales_buf(n_groups);
+    int8_t* x_q8 = x_q8_buf.data();
+    float* x_scales = x_scales_buf.data();
     
+    // Pre-quantize x to Q8 per group — done ONCE, shared across all output rows.
     for (int g = 0; g < n_groups; g++) {
         const float* xg = x + g * group_size;
-        int8_t* xq = x_q8.data() + g * group_size;
+        int8_t* xq = x_q8 + g * group_size;
         
         // SIMD max-abs finding
         __m256 max_abs = _mm256_setzero_ps();
@@ -116,7 +121,6 @@ void gemv_q4_q8_avx2(
         if (amax < 1e-9f) {
             memset(xq, 0, group_size);
             x_scales[g] = 1.0f;
-            x_q8_sums[g] = 0;
             continue;
         }
         
@@ -126,25 +130,15 @@ void gemv_q4_q8_avx2(
         
         // SIMD quantize to int8: FP32 → scale → round → pack to int8
         __m256 vscale = _mm256_set1_ps(inv_scale);
-        __m256i sum_acc = _mm256_setzero_si256();
         for (int j = 0; j < group_size; j += 8) {
             __m256 vf = _mm256_mul_ps(_mm256_loadu_ps(xg + j), vscale);
             __m256i vi = _mm256_cvtps_epi32(vf);
-            // Accumulate sum of int32 values
-            sum_acc = _mm256_add_epi32(sum_acc, vi);
             __m128i lo4 = _mm_packs_epi32(
                 _mm256_castsi256_si128(vi),
                 _mm256_extracti128_si256(vi, 1));
             __m128i packed = _mm_packs_epi16(lo4, lo4);
             _mm_storel_epi64((__m128i*)(xq + j), packed);
         }
-        // Horizontal sum of int32 accumulator
-        __m128i sum128 = _mm_add_epi32(
-            _mm256_castsi256_si128(sum_acc),
-            _mm256_extracti128_si256(sum_acc, 1));
-        sum128 = _mm_hadd_epi32(sum128, sum128);
-        sum128 = _mm_hadd_epi32(sum128, sum128);
-        x_q8_sums[g] = _mm_cvtsi128_si32(sum128);
     }
     
     // Row-parallel integer GEMV
@@ -154,7 +148,7 @@ void gemv_q4_q8_avx2(
         const uint8_t* w_row = weights_packed + (size_t)row * packed_stride;
         
         for (int g = 0; g < n_groups; g++) {
-            const int8_t* x_group_q8 = x_q8.data() + g * group_size;
+            const int8_t* x_group_q8 = x_q8 + g * group_size;
             const uint8_t* w_group = w_row + g * (group_size / 2);
             float w_scale = scales[row * n_groups + g];
             float x_scale = x_scales[g];
@@ -204,6 +198,8 @@ void gemv_q4_q8_avx2(
         }
         y[row] = acc;
     }
+    
+    // std::vector automatically frees memory when it goes out of scope
 }
 
 /**

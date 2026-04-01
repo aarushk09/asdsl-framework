@@ -86,7 +86,7 @@ def set_thread_count(n: int) -> None:
     # OpenMP thread binding: pin to logical CPUs 0-7 (P-cores only)
     # This avoids E-core slowdown and HT contention on the memory controller.
     os.environ["OMP_PROC_BIND"] = "TRUE"
-    os.environ["OMP_PLACES"] = "{0},{1},{2},{3},{4},{5},{6},{7}"
+    os.environ["OMP_PLACES"] = "{0-7}"
     os.environ["OMP_SCHEDULE"] = "static"
 
     torch.set_num_threads(n)
@@ -3164,6 +3164,67 @@ def generate_pld(
             "mean_tokens_per_cycle": total_accepted / max(1, total_cycles),
         })
         
+    return tokenizer.decode(generated[len(input_ids):])
+
+
+def generate_native(
+    prompt: str,
+    store: "WeightStore",
+    tokenizer,
+    max_new_tokens: int = 128,
+    bench_metrics_out: list | None = None,
+) -> str:
+    """
+    Hybrid C++/Python generation (Phase 19/20).
+    
+    C++ handles transformer layers via zero-copy Q4×Q8 GEMV.
+    Python handles LM head via optimized PyTorch FP16 matmul.
+    """
+    import time
+    import torch
+    from asdsl.kernels.native_engine import NativeEngineWrapper, HAS_NATIVE_ENGINE
+    
+    if not HAS_NATIVE_ENGINE:
+        raise RuntimeError("Native engine not available")
+    
+    messages = [{"role": "user", "content": prompt}]
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+    
+    # Create C++ engine
+    engine = NativeEngineWrapper(store, max_seq_len=len(input_ids) + max_new_tokens + 32)
+    
+    EOS_TOKEN_1 = 200020  # <|end|>
+    EOS_TOKEN_2 = 199999  # </s>
+    
+    generated = list(input_ids)
+    t_start = time.perf_counter()
+    
+    # Autoregressive generation: C++ transformer + Python LM head
+    for pos in range(len(input_ids), len(input_ids) + max_new_tokens):
+        token_id = generated[-1]
+        hidden_np = engine.forward_hidden(token_id, pos)
+        logits = engine.compute_logits(hidden_np)
+        next_token = int(np.argmax(logits))
+        
+        if next_token == EOS_TOKEN_1 or next_token == EOS_TOKEN_2:
+            break
+        generated.append(next_token)
+    
+    t_end = time.perf_counter()
+    
+    n_tokens = len(generated) - len(input_ids)
+    duration = t_end - t_start
+    tps = n_tokens / duration if duration > 0 else 0
+    
+    print(f"\n[Native Engine] Generated {n_tokens} tokens in {duration:.2f}s ({tps:.2f} tok/s)")
+    
+    if bench_metrics_out is not None:
+        bench_metrics_out.append({
+            "tokens_per_second": tps,
+        })
+    
     return tokenizer.decode(generated[len(input_ids):])
 
 
