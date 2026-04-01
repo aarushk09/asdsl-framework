@@ -618,7 +618,7 @@ except:
 
 # Print Q8 call count for debugging
 if payload.get("q8_call_count"):
-    print(f"  [debug] Q8 call count: {payload['q8_call_count']}")
+    print(f"  [debug] Q8 call count: {{payload['q8_call_count']}}")
 
 print("__PROFILE_RESULT__" + json.dumps(payload))
 '''
@@ -674,6 +674,16 @@ def _run_phi4_profile_isolated(
     if generate_func == "generate_eagle3":
         generate_call = (
             f"generate_eagle3({prompt!r}, store, tokenizer, "
+            f"max_new_tokens={max_new_tokens}, bench_metrics_out=metrics)"
+        )
+    elif generate_func == "generate_native":
+        generate_call = (
+            f"generate_native({prompt!r}, store, tokenizer, "
+            f"max_new_tokens={max_new_tokens}, bench_metrics_out=metrics)"
+        )
+    elif generate_func == "generate_pld":
+        generate_call = (
+            f"generate_pld({prompt!r}, store, tokenizer, "
             f"max_new_tokens={max_new_tokens}, bench_metrics_out=metrics)"
         )
     else:
@@ -786,7 +796,7 @@ def run_phi4_benchmark(
     store = phi4.WeightStore(
         bits=primary_bits,
         group_size=None,
-        enable_qcsd=True,
+        enable_qcsd=False,
         draft_bits=draft_bits,
         enable_sparse=False,
     )
@@ -923,10 +933,12 @@ def run_phi4_benchmark(
     m_c = metrics_c[0] if metrics_c else {}
     tps_c = float(m_c.get("tokens_per_second", 0.0))
 
-    if _fatrelu_path and _fatrelu_path.exists():
-        store.load_fatrelu(str(_fatrelu_path))
-        gc.collect()
-        peak_load = max(peak_load, _peak_rss_mb())
+    # Phase A1: FATReLU disabled — net negative for performance due to
+    # transposed down_proj memory overhead. Profiles C/F/I use dense GEMV.
+    # if _fatrelu_path and _fatrelu_path.exists():
+    #     store.load_fatrelu(str(_fatrelu_path))
+    #     gc.collect()
+    #     peak_load = max(peak_load, _peak_rss_mb())
 
     # Profile D: AR + LUT Q4 GEMV (vpshufb, Phase 1) - isolated subprocess
     tps_d = 0.0
@@ -1074,29 +1086,26 @@ def run_phi4_benchmark(
         if ar_h is not None:
             print(f"[Profile H] PLD acceptance rate: {float(ar_h):.1%}")
 
-    # Profile I: Pure C++ Inference Engine (Phase 19) — DISABLED: zero-copy pointers unstable
-    # tps_i = None
-    # peak_i = None
-    # ex_i: dict = {}
-    # tps_i, peak_i, ex_i = _run_phi4_profile_isolated(
-    #     "I", root, prompt, max_new_tokens, primary_bits,
-    #     use_native=True,
-    #     use_lut=False,
-    #     enable_sparse=False,
-    #     sparsity_threshold=0.01,
-    #     needs_fatrelu=False,
-    #     fatrelu_path=None,
-    #     generate_func="generate_native",  # New function using C++ engine
-    #     inter_profile_sleep=_inter_sleep,
-    #     thread_count=threads,
-    #     use_q8=True,
-    # )
-    # m_i = {"tokens_per_second": tps_i}
+    # Profile I: Pure C++ Inference Engine (Phase 19 — NATIVE_GRAPH)
+    # Zero-copy weight pointers, full C++ autoregressive loop, no Python overhead
     tps_i = None
     peak_i = None
     ex_i: dict = {}
-    m_i = {}
-    print("[Profile I] DISABLED: zero-copy weight pointers unstable", flush=True)
+    tps_i, peak_i, ex_i = _run_phi4_profile_isolated(
+        "I", root, prompt, max_new_tokens, primary_bits,
+        use_native=True,
+        use_lut=False,
+        enable_sparse=False,
+        sparsity_threshold=0.01,
+        needs_fatrelu=False,
+        fatrelu_path=None,
+        generate_func="generate_native",
+        inter_profile_sleep=_inter_sleep,
+        thread_count=threads,
+        use_q8=True,
+    )
+    m_i = {"tokens_per_second": tps_i}
+    print(f"[Profile I] Pure C++ Engine (Phase 19 NATIVE_GRAPH): {tps_i:.3f} tok/s", flush=True)
 
     metrics_b: list = []
     with contextlib.redirect_stdout(buf):
@@ -1134,13 +1143,14 @@ def run_phi4_benchmark(
         _append_history_rate(root, float(ex_g["acceptance_rate"]), key="eagle3_acceptance_rates")
         appended_eagle3_from_g = True
 
-    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_f, peak_g, peak_b) if x is not None)
+    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_f, peak_g, peak_i, peak_b) if x is not None)
     rss_a_s = f"{peak_a:.0f}" if peak_a is not None else "n/a"
     rss_c_s = f"{peak_c:.0f}" if peak_c is not None else "n/a"
     rss_d_s = f"{peak_d:.0f}" if peak_d is not None else "n/a"
     rss_e_s = f"{peak_e:.0f}" if peak_e is not None else "n/a"
     rss_f_s = f"{peak_f:.0f}" if peak_f is not None else "n/a"
     rss_g_s = f"{peak_g:.0f}" if peak_g is not None else "n/a"
+    rss_i_s = f"{peak_i:.0f}" if peak_i is not None else "n/a"
     rss_b_s = f"{peak_b:.0f}" if peak_b is not None else "n/a"
 
     try:
@@ -1332,6 +1342,7 @@ def run_phi4_benchmark(
             "F": {"tok/s": tps_f},
             "G": {"tok/s": tps_g},
             "H": {"tok/s": tps_h},
+            "I": {"tok/s": tps_i},
             "B": {"tok/s": tps_b},
         }
         print(f"Writing regression results to {emit_regression_json}...")

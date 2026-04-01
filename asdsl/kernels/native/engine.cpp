@@ -708,5 +708,7 @@ PYBIND11_MODULE(_native_engine, m) {
              py::arg("norm_ptr"))
         .def("generate", &InferenceEngine::generate,
              py::arg("prompt_tokens"), py::arg("max_new_tokens"))
+        .def("forward_hidden", &InferenceEngine::forward_hidden,
+             py::arg("token_id"), py::arg("pos"))
         .def("get_seq_len", &InferenceEngine::get_seq_len);
 }
