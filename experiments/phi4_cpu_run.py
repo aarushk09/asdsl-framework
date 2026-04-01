@@ -46,6 +46,14 @@ from transformers import AutoTokenizer
 
 from asdsl.engine import run_dual_model_speculative_benchmark
 
+# Phase 17: Native C++ ops for non-GEMV operations
+try:
+    from asdsl.kernels import _native_ops
+    HAS_NATIVE_OPS = True
+except ImportError:
+    HAS_NATIVE_OPS = False
+    _native_ops = None
+
 
 def _configure_cpu_torch_runtime() -> None:
     """Flush FP32 subnormals to zero on CPU (avoids 100× slowdowns in matmul/mv)."""
@@ -628,6 +636,12 @@ class WeightStore:
 
         # Phase 16: Q8_0 activation quantization + integer GEMV (Profile F)
         self._use_q8_gemv = False
+
+        # Phase 17: Native C++ ops for non-GEMV operations
+        self._use_native_ops = HAS_NATIVE_OPS
+        # Pre-computed RoPE cos/sin tables as flat float32 numpy arrays
+        self._cos_table: "np.ndarray | None" = None
+        self._sin_table: "np.ndarray | None" = None
 
     def enter_verify_phase(self) -> None:
         """Enable temporary dequantization caching for the speculative verify phase."""
@@ -1967,6 +1981,23 @@ class WeightStore:
             else:
                 print(f"  Inference: chunked uint8 dequant+matvec (in-place, no AVX GEMV)")
 
+        # Phase 17: Pre-compute RoPE cos/sin tables as flat float32 numpy arrays
+        # for native C++ RoPE dispatch. Tables are [max_seq_len, head_dim/2].
+        if HAS_NATIVE_OPS:
+            max_seq = 2048  # default max sequence length
+            half_head = HEAD_DIM // 2  # 64
+            cos_table = np.zeros((max_seq, half_head), dtype=np.float32)
+            sin_table = np.zeros((max_seq, half_head), dtype=np.float32)
+            for pos in range(max_seq):
+                for i in range(half_head):
+                    freq = 1.0 / (ROPE_THETA ** (2.0 * i / HEAD_DIM))
+                    angle = pos * freq
+                    cos_table[pos, i] = math.cos(angle)
+                    sin_table[pos, i] = math.sin(angle)
+            self._cos_table = np.ascontiguousarray(cos_table)
+            self._sin_table = np.ascontiguousarray(sin_table)
+            print(f"  Pre-computed RoPE tables: {max_seq} x {half_head} (native ops enabled)")
+
         # (Initialization moved up above the early return to fix benchmarking)
 
     def get_norm(self, layer_idx: int, name: str) -> torch.Tensor:
@@ -2085,72 +2116,130 @@ def forward_layer(
 ) -> torch.Tensor:
     """Single Phi-4 transformer layer. Updates kv_hist with the new K/V.
 
-    Uses chunked matvec (streaming dequant for quantized, chunked f16 read
-    for float16) to minimise DRAM bandwidth.  KV history is pre-allocated
-    torch tensors - no per-token np.stack / allocations.
+    Phase 17: Uses native C++ ops for non-GEMV operations (RMSNorm, RoPE,
+    attention, SwiGLU, residual add) to eliminate Python dispatch overhead.
+    GEMV operations still use the Q8 integer kernel via store.matvec().
 
     Args:
         use_draft: If True, use the draft (2-bit) weight bank for QCSD.
     """
+    use_native = store._use_native_ops and HAS_NATIVE_OPS
 
     # - Self-attention -
-    residual = hidden
-    h = rms_norm(hidden, store.get_norm(layer_idx, "input_layernorm"))
+    residual = hidden.detach().cpu().float().numpy().ravel()
 
-    qkv = store.matvec(layer_idx, "qkv_proj", h, use_draft=use_draft)
+    # RMSNorm (pre-attention)
+    rms_att_w = store.get_norm(layer_idx, "input_layernorm").detach().cpu().float().numpy()
+    if use_native:
+        h = np.empty(HIDDEN, dtype=np.float32)
+        _native_ops.rmsnorm_f32(residual, h, rms_att_w, HIDDEN, RMS_EPS)
+    else:
+        rms = np.sqrt(np.mean(residual**2) + RMS_EPS)
+        h = (residual / rms) * rms_att_w
 
-    q = qkv[:, :Q_DIM].view(1, NUM_HEADS, HEAD_DIM)
-    k = qkv[:, Q_DIM:Q_DIM + KV_DIM].view(1, NUM_KV_HEADS, HEAD_DIM)
-    v = qkv[:, Q_DIM + KV_DIM:].view(1, NUM_KV_HEADS, HEAD_DIM)
+    # QKV projection
+    h_t = torch.from_numpy(h).unsqueeze(0)
+    qkv = store.matvec(layer_idx, "qkv_proj", h_t, use_draft=use_draft)
+    qkv_np = qkv.detach().cpu().float().numpy().ravel()
 
-    cos_pos = rope_cos[pos:pos + 1]
-    sin_pos = rope_sin[pos:pos + 1]
-    q = apply_rope(q, cos_pos, sin_pos)
-    k = apply_rope(k, cos_pos, sin_pos)
+    q = qkv_np[:Q_DIM].reshape(NUM_HEADS, HEAD_DIM).copy()
+    k = qkv_np[Q_DIM:Q_DIM + KV_DIM].reshape(NUM_KV_HEADS, HEAD_DIM).copy()
+    v = qkv_np[Q_DIM + KV_DIM:].reshape(NUM_KV_HEADS, HEAD_DIM).copy()
 
-    kv_hist.append(layer_idx, k.squeeze(0), v.squeeze(0))
+    # RoPE
+    if use_native and store._cos_table is not None:
+        _native_ops.rope_apply_inplace(
+            q.ravel(), k.ravel(),
+            store._cos_table, store._sin_table,
+            NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, pos, 2048)
+    else:
+        cos_pos = rope_cos[pos:pos + 1]
+        sin_pos = rope_sin[pos:pos + 1]
+        q_t = apply_rope(torch.from_numpy(q).unsqueeze(0), cos_pos, sin_pos)
+        k_t = apply_rope(torch.from_numpy(k).unsqueeze(0), cos_pos, sin_pos)
+        q = q_t.squeeze(0).numpy()
+        k = k_t.squeeze(0).numpy()
+
+    # Append to KV cache
+    kv_hist.append(layer_idx,
+                   torch.from_numpy(k.squeeze()),
+                   torch.from_numpy(v.squeeze()))
 
     k_hist, v_hist = kv_hist.get(layer_idx)
     seq_len = k_hist.shape[0]
 
-    expand = NUM_HEADS // NUM_KV_HEADS
-    k_full = (k_hist.unsqueeze(2)
-                    .expand(-1, -1, expand, -1)
-                    .reshape(seq_len, NUM_HEADS, HEAD_DIM)
-                    .permute(1, 0, 2)
-                    .unsqueeze(0))
-    v_full = (v_hist.unsqueeze(2)
-                    .expand(-1, -1, expand, -1)
-                    .reshape(seq_len, NUM_HEADS, HEAD_DIM)
-                    .permute(1, 0, 2)
-                    .unsqueeze(0))
+    # GQA attention
+    if use_native:
+        # Flatten KV cache for native attention kernel
+        # k_hist: [seq_len, n_kv_heads, head_dim] → [seq_len * n_kv_heads * head_dim]
+        k_cache_flat = k_hist.detach().cpu().float().numpy().ravel()
+        v_cache_flat = v_hist.detach().cpu().float().numpy().ravel()
+        attn_out = np.empty(NUM_HEADS * HEAD_DIM, dtype=np.float32)
+        _native_ops.gqa_decode_attention(
+            q.ravel(), k_cache_flat, v_cache_flat, attn_out,
+            NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, seq_len,
+            1.0 / math.sqrt(HEAD_DIM))
+        attn_out_t = torch.from_numpy(attn_out).reshape(1, Q_DIM)
+    else:
+        expand = NUM_HEADS // NUM_KV_HEADS
+        k_full = (k_hist.unsqueeze(2)
+                        .expand(-1, -1, expand, -1)
+                        .reshape(seq_len, NUM_HEADS, HEAD_DIM)
+                        .permute(1, 0, 2)
+                        .unsqueeze(0))
+        v_full = (v_hist.unsqueeze(2)
+                        .expand(-1, -1, expand, -1)
+                        .reshape(seq_len, NUM_HEADS, HEAD_DIM)
+                        .permute(1, 0, 2)
+                        .unsqueeze(0))
+        q_attn = torch.from_numpy(q).unsqueeze(0).unsqueeze(2)
+        attn_out_t = torch.nn.functional.scaled_dot_product_attention(
+            q_attn, k_full, v_full,
+        )
+        attn_out_t = attn_out_t.permute(0, 2, 1, 3).reshape(1, Q_DIM)
 
-    q_attn = q.unsqueeze(2)
-    attn_out = torch.nn.functional.scaled_dot_product_attention(
-        q_attn, k_full, v_full,
-    )
-    attn_out = attn_out.permute(0, 2, 1, 3).reshape(1, Q_DIM)
-
-    hidden = residual + store.matvec(layer_idx, "o_proj", attn_out, use_draft=use_draft)
+    # Output projection + residual
+    o_proj = store.matvec(layer_idx, "o_proj", attn_out_t, use_draft=use_draft)
+    o_proj_np = o_proj.detach().cpu().float().numpy().ravel()
+    if use_native:
+        _native_ops.vec_add_inplace(residual, o_proj_np, HIDDEN)
+    else:
+        residual = residual + o_proj_np
+    hidden = torch.from_numpy(residual).unsqueeze(0)
 
     # - Feed-forward (MLP) -
-    residual = hidden
-    h = rms_norm(hidden, store.get_norm(layer_idx, "post_attention_layernorm"))
+    residual = hidden.detach().cpu().float().numpy().ravel()
 
-    gu = store.matvec(layer_idx, "gate_up_proj", h, use_draft=use_draft)
-    act = silu(gu[:, :INTER]) * gu[:, INTER:]
+    # RMSNorm (pre-FFN)
+    rms_ffn_w = store.get_norm(layer_idx, "post_attention_layernorm").detach().cpu().float().numpy()
+    if use_native:
+        h = np.empty(HIDDEN, dtype=np.float32)
+        _native_ops.rmsnorm_f32(residual, h, rms_ffn_w, HIDDEN, RMS_EPS)
+    else:
+        rms = np.sqrt(np.mean(residual**2) + RMS_EPS)
+        h = (residual / rms) * rms_ffn_w
 
-    # Phase 3: FATReLU threshold mask — zero out elements below tau
-    # This creates 85% sparsity in the FFN intermediate, enabling sparse down_proj.
+    # Gate + Up projection
+    h_t = torch.from_numpy(h).unsqueeze(0)
+    gu = store.matvec(layer_idx, "gate_up_proj", h_t, use_draft=use_draft)
+    gu_np = gu.detach().cpu().float().numpy().ravel()
+    gate = gu_np[:INTER].copy()
+    up = gu_np[INTER:]
+
+    # SwiGLU
+    if use_native:
+        _native_ops.swiglu_inplace(gate, up, INTER)
+        act = gate
+    else:
+        act = silu(torch.from_numpy(gate)).numpy() * up
+
+    # FATReLU threshold mask (if active)
+    tau = None
     if store._use_fatrelu and layer_idx in store._fatrelu_thresholds:
-        # Adaptive tau: measure from first N tokens, then use measured values
         if store._use_adaptive_fatrelu:
             if store._adaptive_tau_warmup_tokens < store._adaptive_tau_warmup_target:
-                # Measure actual 85th percentile from this token's activations
-                act_np = act.detach().cpu().float().numpy().ravel()
-                measured_tau = float(np.percentile(np.abs(act_np), 85))
+                measured_tau = float(np.percentile(np.abs(act), 85))
                 if layer_idx in store._adaptive_tau:
-                    # Exponential moving average for stability
                     store._adaptive_tau[layer_idx] = (
                         0.7 * store._adaptive_tau[layer_idx] + 0.3 * measured_tau
                     )
@@ -2158,19 +2247,16 @@ def forward_layer(
                     store._adaptive_tau[layer_idx] = measured_tau
                 tau = store._adaptive_tau[layer_idx]
             else:
-                # After warmup, use the measured adaptive tau (falls back to fixed if not measured)
                 tau = store._adaptive_tau.get(
                     layer_idx, store._fatrelu_thresholds.get(layer_idx, 0))
         else:
             tau = store._fatrelu_thresholds[layer_idx]
-        act = act * (act.abs() >= tau).float()
+        act = act * (np.abs(act) >= tau).astype(np.float32)
         if store._sparsity_debug_count < 3 and layer_idx < 4:
-            tau_v = tau
-            act_np = act.detach().cpu().float().numpy()
-            actual_sparsity = float((np.abs(act_np) < tau_v).mean())
-            n_active = int((np.abs(act_np) >= tau_v).sum())
+            actual_sparsity = float((np.abs(act) < tau).mean())
+            n_active = int((np.abs(act) >= tau).sum())
             print(f"[sparsity token={store._sparsity_debug_count} L{layer_idx}] "
-                  f"tau={tau_v:.5f} sparsity={actual_sparsity:.1%} active={n_active}/8192")
+                  f"tau={tau:.5f} sparsity={actual_sparsity:.1%} active={n_active}/8192")
         if layer_idx == 31:
             if store._use_adaptive_fatrelu:
                 store._adaptive_tau_warmup_tokens += 1
@@ -2181,19 +2267,13 @@ def forward_layer(
             if store._sparsity_debug_count < 3:
                 store._sparsity_debug_count += 1
 
-    # Phase 4 Prerequisite B: use transposed down_proj for column-sparse access
-    # When FATReLU is active and transposed weights are available, use
-    # sparse_down_proj_T for 6.7x memory traffic reduction.
+    # Down projection
     use_T_sparse = (store._use_fatrelu and layer_idx in store._down_proj_T
                     and not use_draft)
     if use_T_sparse:
-        act_np = act.detach().cpu().float().contiguous().numpy().ravel()
-        # Use tau threshold: only rows where |act| >= tau are kept by FATReLU.
-        # Using 1e-9 here would include near-zero values the mask already zeroed,
-        # causing the sparse kernel to waste work on rows that contribute nothing.
-        active_rows = np.where(np.abs(act_np) >= tau)[0].astype(np.int32)
+        active_rows = np.where(np.abs(act) >= tau)[0].astype(np.int32)
         if store._sparsity_debug_count < 3 and layer_idx < 4:
-            actual_sparsity = 1.0 - len(active_rows) / len(act_np)
+            actual_sparsity = 1.0 - len(active_rows) / len(act)
             print(f"[sparse_rows token={store._sparsity_debug_count} L{layer_idx}] "
                   f"active_rows={len(active_rows)}/8192 ({100*len(active_rows)/8192:.1f}% dense, "
                   f"sparsity={actual_sparsity:.1%})")
@@ -2203,39 +2283,65 @@ def forward_layer(
                 dT = store._down_proj_T[layer_idx]
                 y_down_np = _sparse_T(
                     dT['packed'].ravel(), dT['scales'], dT['biases'],
-                    act_np, active_rows,
+                    act, active_rows,
                     dT['in_dim'], dT['out_dim'], store.group_size
                 )
                 store._sparse_down_proj_T_calls += 1
-                hidden = residual + torch.from_numpy(y_down_np).unsqueeze(0)
+                if use_native:
+                    _native_ops.vec_add_inplace(residual, y_down_np, HIDDEN)
+                else:
+                    residual = residual + y_down_np
+                hidden = torch.from_numpy(residual).unsqueeze(0)
             except Exception:
                 store._dense_down_proj_fallback_calls += 1
-                hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
+                down_t = store.matvec(layer_idx, "down_proj",
+                                      torch.from_numpy(act).unsqueeze(0), use_draft=use_draft)
+                if use_native:
+                    _native_ops.vec_add_inplace(residual,
+                                                down_t.detach().cpu().float().numpy().ravel(), HIDDEN)
+                else:
+                    hidden = hidden + down_t
         else:
-            # All zeros: output is zero
             store._sparse_down_proj_T_calls += 1
-            hidden = residual + torch.zeros(1, HIDDEN, dtype=torch.float32)
+            if use_native:
+                pass  # residual unchanged (down_proj output is zero)
+            hidden = torch.from_numpy(residual).unsqueeze(0)
     elif store._enable_sparse and not use_draft and store._use_native_gemv:
         from asdsl.kernels import compute_activation_bitmask
-        act_np = act.detach().cpu().float().contiguous().numpy().ravel()
         bitmask, active_indices = compute_activation_bitmask(
-            act_np, threshold=store._sparsity_threshold
+            act, threshold=store._sparsity_threshold
         )
-        sparsity = 1.0 - len(active_indices) / len(act_np)
+        sparsity = 1.0 - len(active_indices) / len(act)
         if sparsity > 0.80:
-            hidden = residual + store.matvec_sparse(
-                layer_idx, "down_proj", act, bitmask, active_indices
+            down_t = store.matvec_sparse(
+                layer_idx, "down_proj",
+                torch.from_numpy(act).unsqueeze(0), bitmask, active_indices
             )
+            if use_native:
+                _native_ops.vec_add_inplace(residual,
+                                            down_t.detach().cpu().float().numpy().ravel(), HIDDEN)
+            else:
+                hidden = hidden + down_t
         else:
             store._dense_down_proj_fallback_calls += 1
-            hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
+            down_t = store.matvec(layer_idx, "down_proj",
+                                  torch.from_numpy(act).unsqueeze(0), use_draft=use_draft)
+            if use_native:
+                _native_ops.vec_add_inplace(residual,
+                                            down_t.detach().cpu().float().numpy().ravel(), HIDDEN)
+            else:
+                hidden = hidden + down_t
     else:
         store._dense_down_proj_fallback_calls += 1
-        hidden = residual + store.matvec(layer_idx, "down_proj", act, use_draft=use_draft)
+        down_t = store.matvec(layer_idx, "down_proj",
+                              torch.from_numpy(act).unsqueeze(0), use_draft=use_draft)
+        if use_native:
+            _native_ops.vec_add_inplace(residual,
+                                        down_t.detach().cpu().float().numpy().ravel(), HIDDEN)
+        else:
+            hidden = hidden + down_t
 
-    # EAGLE-3 multi-layer feature fusion: capture hidden states from 3 layers
-    # Captured for training data collection and for EAGLE-3 draft generation.
-    # Layer 0 (low-level features), Layer 15 (mid-level), Layer 31 (high-level).
+    # EAGLE-3 multi-layer feature fusion
     if store._use_eagle3:
         h_np = hidden.detach().cpu().float().numpy().ravel()
         if layer_idx == 0:
