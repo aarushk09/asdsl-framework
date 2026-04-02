@@ -1,0 +1,17 @@
+[CONFIG] Loaded canonical benchmark config from C:\Users\aarus\projects\asdsl-framework\benchmark_config.json
+[CONFIG] prompt='' max_new_tokens=128 threads=8 draft_k=3
+[threads] Using OMP_PLACES={0-7} for P-core binding, 8 threads
+  Loading & quantizing 128 projection weights to 4-bit ...
+  (embedding + norms loaded as bfloat16)
+    16/128 (12%)      32/128 (25%)      48/128 (38%)      64/128 (50%)      80/128 (62%)      96/128 (75%)      112/128 (88%)      128/128 (100%)      128/128 (100%)  done.               
+  Caching embed float16 ... done
+[SliM] WARNING: phi4_slim_meta.json was generated in quick mode (only 4 layers calibrated) — using for Profile E anyway
+[SliM] Loaded: 3.09 avg bits, ~2.76 GB estimated size
+  [SliM] Pre-repacking arrays for calibrated layers...
+  [SliM] Repacking done in 2.69s
+  Caching packed Q4 weights (128 tensors, rows×cols/2) ... done (128/128) | 2416 MB
+  Inference: native AVX2 GEMV Q4 packed (gemv_q4_packed)
+  Pre-computed RoPE tables: 2048 x 64 (native ops enabled)
+[Profile D] Starting isolated subprocess (sleep 3s first)...
+[Profile D] isolated result: 0.000 tok/s
+[Profile E] Starting isolated subprocess (sleep 3s first)...
