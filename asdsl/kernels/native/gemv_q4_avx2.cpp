@@ -34,6 +34,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cmath>
+#include <atomic>
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
@@ -68,6 +70,52 @@ static inline int32_t hsum256_epi32(__m256i v) {
     shuf = _mm_shuffle_epi32(lo, _MM_SHUFFLE(0, 1, 0, 1));
     lo = _mm_add_epi32(lo, shuf);
     return _mm_cvtsi128_si32(lo);
+}
+
+static constexpr int Q4K_N_PER_BLOCK = 256;
+static constexpr int Q4K_BLOCK_SIZE = 144;
+
+static inline float fp16_to_float32(uint16_t h) {
+    uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
+    uint32_t exp = (static_cast<uint32_t>(h) >> 10) & 0x1Fu;
+    uint32_t mant = static_cast<uint32_t>(h) & 0x03FFu;
+
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            int e = -1;
+            do {
+                ++e;
+                mant <<= 1;
+            } while ((mant & 0x0400u) == 0);
+            mant &= 0x03FFu;
+            uint32_t exp32 = static_cast<uint32_t>(127 - 15 - e);
+            bits = sign | (exp32 << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        uint32_t exp32 = exp + (127 - 15);
+        bits = sign | (exp32 << 23) | (mant << 13);
+    }
+
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static inline uint8_t get_6bit_packed(const uint8_t* bytes, int idx) {
+    const int bit_pos = idx * 6;
+    const int byte_idx = bit_pos / 8;
+    const int bit_off = bit_pos % 8;
+    if (bit_off <= 2) {
+        return static_cast<uint8_t>((bytes[byte_idx] >> bit_off) & 0x3F);
+    }
+    const int lo = bytes[byte_idx] >> bit_off;
+    const int hi = bytes[byte_idx + 1] << (8 - bit_off);
+    return static_cast<uint8_t>((lo | hi) & 0x3F);
 }
 
 // Q4 × Q8 integer GEMV using _mm256_madd_epi16
@@ -200,6 +248,106 @@ void gemv_q4_q8_avx2(
     }
     
     // std::vector automatically frees memory when it goes out of scope
+}
+
+void gemv_q4km_q8_avx2(
+    const uint8_t* weights_q4km,
+    const float* x,
+    float* y,
+    int out_features,
+    int in_features
+) {
+    if (in_features <= 0 || out_features <= 0) {
+        return;
+    }
+    if ((in_features % 32) != 0 || (in_features % Q4K_N_PER_BLOCK) != 0) {
+        throw std::invalid_argument("in_features must be divisible by 256 for Q4_K_M");
+    }
+
+    const int n_blocks_per_row = in_features / Q4K_N_PER_BLOCK;
+    const int n_groups = in_features / 32;
+
+    std::vector<int8_t> x_q8_buf(in_features);
+    std::vector<float> x_scales(n_groups);
+
+    for (int g = 0; g < n_groups; ++g) {
+        const int base = g * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            float a = std::fabs(x[base + i]);
+            if (a > amax) {
+                amax = a;
+            }
+        }
+        if (amax < 1e-12f) {
+            x_scales[g] = 0.0f;
+            std::memset(x_q8_buf.data() + base, 0, 32);
+            continue;
+        }
+
+        const float inv_scale = 127.0f / amax;
+        x_scales[g] = amax / 127.0f;
+        for (int i = 0; i < 32; ++i) {
+            const float q = std::round(x[base + i] * inv_scale);
+            int qi = static_cast<int>(q);
+            qi = std::max(-127, std::min(127, qi));
+            x_q8_buf[base + i] = static_cast<int8_t>(qi);
+        }
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < out_features; ++row) {
+        const uint8_t* row_ptr = weights_q4km +
+            static_cast<size_t>(row) * n_blocks_per_row * Q4K_BLOCK_SIZE;
+        float acc = 0.0f;
+
+        for (int b = 0; b < n_blocks_per_row; ++b) {
+            const uint8_t* blk = row_ptr + static_cast<size_t>(b) * Q4K_BLOCK_SIZE;
+
+            uint16_t d_h;
+            uint16_t dmin_h;
+            std::memcpy(&d_h, blk + 0, sizeof(uint16_t));
+            std::memcpy(&dmin_h, blk + 2, sizeof(uint16_t));
+            const float d = fp16_to_float32(d_h);
+            const float dmin = fp16_to_float32(dmin_h);
+            const uint8_t* packed_scales = blk + 4;
+            const uint8_t* qs_base = blk + 16;
+
+            for (int sb = 0; sb < 8; ++sb) {
+                const float sub_scale = d * static_cast<float>(get_6bit_packed(packed_scales, sb));
+                const float sub_min = dmin * static_cast<float>(get_6bit_packed(packed_scales, sb + 8));
+
+                const uint8_t* qs = qs_base + sb * 16;
+                const int base_elem = b * Q4K_N_PER_BLOCK + sb * 32;
+                const int8_t* xq = x_q8_buf.data() + base_elem;
+                const float x_scale = x_scales[base_elem / 32];
+
+                __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
+                __m128i mask = _mm_set1_epi8(0x0F);
+                __m128i lo = _mm_and_si128(packed, mask);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
+                __m128i w0_u8 = _mm_unpacklo_epi8(lo, hi);
+                __m128i w1_u8 = _mm_unpackhi_epi8(lo, hi);
+
+                __m256i w0 = _mm256_cvtepu8_epi16(w0_u8);
+                __m256i w1 = _mm256_cvtepu8_epi16(w1_u8);
+                __m256i x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(xq)));
+                __m256i x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(xq + 16)));
+
+                __m256i acc_int = _mm256_add_epi32(_mm256_madd_epi16(w0, x0), _mm256_madd_epi16(w1, x1));
+                const int32_t dot_int = hsum256_epi32(acc_int);
+
+                int32_t xsum_int = 0;
+                for (int i = 0; i < 32; ++i) {
+                    xsum_int += static_cast<int32_t>(xq[i]);
+                }
+
+                acc += (sub_scale * static_cast<float>(dot_int) - sub_min * static_cast<float>(xsum_int)) * x_scale;
+            }
+        }
+
+        y[row] = acc;
+    }
 }
 
 /**
@@ -1072,6 +1220,40 @@ Modifies Y_batch in-place (adds to it — caller should zero before calling).
         py::arg("weights_packed"), py::arg("scales"), py::arg("x"),
         py::arg("y"), py::arg("out_features"), py::arg("in_features"),
         py::arg("group_size") = 32);
+
+    m.def("gemv_q4km_q8_avx2",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> w,
+           py::array_t<float,   py::array::c_style | py::array::forcecast> x,
+           py::array_t<float,   py::array::c_style | py::array::forcecast> y,
+           int out_features, int in_features) {
+            auto wb = w.request();
+            auto xb = x.request();
+            auto yb = y.request();
+            if (wb.ndim != 1 || xb.ndim != 1 || yb.ndim != 1) {
+                throw std::invalid_argument("weights, x, y must be 1-D contiguous arrays");
+            }
+            const int blocks_per_row = in_features / Q4K_N_PER_BLOCK;
+            const int64_t expected_w = static_cast<int64_t>(out_features) * blocks_per_row * Q4K_BLOCK_SIZE;
+            if (wb.size != expected_w) {
+                throw std::invalid_argument("Q4_K_M weight size mismatch");
+            }
+            if (xb.size != in_features || yb.size != out_features) {
+                throw std::invalid_argument("x/y size mismatch for out_features/in_features");
+            }
+            py::gil_scoped_release release;
+            gemv_q4km_q8_avx2(
+                static_cast<const uint8_t*>(wb.ptr),
+                static_cast<const float*>(xb.ptr),
+                static_cast<float*>(yb.ptr),
+                out_features,
+                in_features
+            );
+        },
+        "Q4_K_M superblock GEMV with Q8 activations",
+        py::arg("weights_q4km"), py::arg("x"), py::arg("y"),
+        py::arg("out_features"), py::arg("in_features"));
+
+    m.attr("has_q4km_gemv") = true;
 
     m.def("check_avx2", &check_avx2_support,
         "Runtime check: does this CPU support AVX2?");

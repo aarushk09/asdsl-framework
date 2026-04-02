@@ -583,6 +583,50 @@
       "changes_committed": false,
       "phase_16_results_block_completed": false
     }
+  },
+  "phase_22_results": {
+    "timestamp": "2026-04-02T00:00:00Z",
+    "status": "blocked_by_model_format_mismatch",
+    "gguf_path": "C:/Users/aarus/llama.cpp/phi-4-Q4_K_M.gguf",
+    "gguf_tensor_count": 363,
+    "gguf_shape_sample": {
+      "token_embd.weight": [100352, 5120],
+      "blk.0.attn_q.weight": [5120, 5120],
+      "blk.0.ffn_down.weight": [5120, 17920]
+    },
+    "asdsl_expected_shape_sample": {
+      "embed_tokens": [200064, 3072],
+      "layers.0.qkv_proj": [5120, 3072],
+      "layers.0.down_proj": [3072, 8192]
+    },
+    "gguf_qtype_issue": "phi-4-Q4_K_M.gguf includes GGML type 14 (Q6_K) tensors for attn_v/down_proj; Phase 22 loader currently supports Q4_K projection tensors only",
+    "profile_f2_result": {
+      "tok_per_sec": 0.0,
+      "error": "ValueError: Expected q4_k tensor, got unknown_14"
+    },
+    "final_benchmark_table": {
+      "A": 2.22,
+      "C": 2.16,
+      "D": 1.25,
+      "E": 1.26,
+      "F": 1.88,
+      "F2": 0.0,
+      "G": 0.63,
+      "H": 0.98,
+      "I": 0.0,
+      "B": 2.26
+    },
+    "llama_cpp_reference_tok_per_sec": 3.06,
+    "llama_cpp_beaten": false,
+    "tests_result": "160 passed, 1 skipped",
+    "code_changes": [
+      "asdsl/io/gguf_loader.py added",
+      "_native_gemv: gemv_q4km_q8_avx2 added",
+      "WeightStore.load_from_gguf and Q4_K_M dispatch added",
+      "run_full_benchmark: Profile F2 and --gguf-path added",
+      "tests/test_q4km_gemv.py added"
+    ],
+    "next_required_step": "Use a GGUF that matches the active Phi-4 multimodal-instruct geometry (32 layers, hidden 3072) or add Q6_K + 40x5120 runtime support"
   }
 }
 

@@ -578,12 +578,14 @@ store = WeightStore(bits={bits}, group_size=None, enable_qcsd=False,
 store.load()
 {pre_warm_setup}
 store.warm_cache()
+{gguf_load_line}
 gc.collect()
 {post_warm_setup}
 
 store._use_native_gemv = {use_native}
 store._use_lut_gemv = {use_lut}
 store._use_q8_gemv = {use_q8}
+store._use_q4km = {use_q4km}
 store._enable_sparse = {enable_sparse}
 store._sparsity_threshold = {sparsity_threshold}
 
@@ -602,6 +604,7 @@ if metrics:
     payload.update({{
         "tps": float(m.get("tokens_per_second", 0.0)),
         "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
+        "q4km_enabled": bool(getattr(store, "_use_q4km", False)),
         "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
         "sparse_T_calls": sparse_T_calls,
         "dense_T_calls": dense_T_calls,
@@ -649,6 +652,8 @@ def _run_phi4_profile_isolated(
     eagle_draft_k: int = 4,
     thread_count: int = 0,
     use_q8: bool = False,
+    use_q4km: bool = False,
+    gguf_path: str | None = None,
 ) -> tuple[float, None, dict]:
     """Run a single profile in an isolated subprocess.
 
@@ -670,6 +675,9 @@ def _run_phi4_profile_isolated(
         post_lines.append(f"store.load_fatrelu({fatrelu_path!r}, adaptive=True)")
     if needs_mtp and mtp_head_path:
         post_lines.append(f"store.load_mtp_head({mtp_head_path!r})")
+    gguf_load_line = ""
+    if use_q4km and gguf_path:
+        gguf_load_line = f"store.load_from_gguf({gguf_path!r})"
     pre_warm_setup = "\n".join(pre_lines)
     post_warm_setup = "\n".join(post_lines)
 
@@ -714,6 +722,8 @@ def _run_phi4_profile_isolated(
         extra_env_lines=extra_env_lines,
         thread_count=thread_count,
         use_q8=use_q8,
+        use_q4km=use_q4km,
+        gguf_load_line=gguf_load_line,
     )
 
     run_env = os.environ.copy()
@@ -771,6 +781,7 @@ def run_phi4_benchmark(
     quick: bool = False,
     inter_profile_sleep_default: float | None = None,
     eagle_draft_k: int = 4,
+    gguf_path: str | None = None,
 ) -> None:
     if quick:
         max_new_tokens = min(max_new_tokens, 8)
@@ -1001,6 +1012,28 @@ def run_phi4_benchmark(
     )
     m_f: dict = {"tokens_per_second": tps_f}
 
+    # Profile F2: Q4_K_M GGUF projections + Q8 GEMV (Phase 22)
+    tps_f2 = None
+    peak_f2 = None
+    ex_f2: dict = {}
+    if gguf_path:
+        tps_f2, peak_f2, ex_f2 = _run_phi4_profile_isolated(
+            "F2", root, prompt, max_new_tokens, primary_bits,
+            use_native=True,
+            use_lut=False,
+            enable_sparse=False,
+            sparsity_threshold=0.01,
+            needs_fatrelu=False,
+            fatrelu_path=None,
+            inter_profile_sleep=_inter_sleep,
+            thread_count=threads,
+            use_q8=True,
+            use_q4km=True,
+            gguf_path=gguf_path,
+        )
+    else:
+        print("[Profile F2] skipped: --gguf-path not provided")
+
     # Profile G: Native GEMV + LUT + FATReLU + EAGLE-3 MTP (F stacked with EAGLE-3)
     tps_g = None
     peak_g = None
@@ -1145,12 +1178,17 @@ def run_phi4_benchmark(
         _append_history_rate(root, float(ex_g["acceptance_rate"]), key="eagle3_acceptance_rates")
         appended_eagle3_from_g = True
 
-    peak_rss = max(x for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_f, peak_g, peak_i, peak_b) if x is not None)
+    peak_rss = max(
+        x
+        for x in (peak_load, peak_a, peak_c, peak_d, peak_e, peak_f, peak_f2, peak_g, peak_i, peak_b)
+        if x is not None
+    )
     rss_a_s = f"{peak_a:.0f}" if peak_a is not None else "n/a"
     rss_c_s = f"{peak_c:.0f}" if peak_c is not None else "n/a"
     rss_d_s = f"{peak_d:.0f}" if peak_d is not None else "n/a"
     rss_e_s = f"{peak_e:.0f}" if peak_e is not None else "n/a"
     rss_f_s = f"{peak_f:.0f}" if peak_f is not None else "n/a"
+    rss_f2_s = f"{peak_f2:.0f}" if peak_f2 is not None else "n/a"
     rss_g_s = f"{peak_g:.0f}" if peak_g is not None else "n/a"
     rss_i_s = f"{peak_i:.0f}" if peak_i is not None else "n/a"
     rss_b_s = f"{peak_b:.0f}" if peak_b is not None else "n/a"
@@ -1231,6 +1269,16 @@ def run_phi4_benchmark(
             f"{'F  Native GEMV + Q8_0 (Phase B)':<40} "
             f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
         )
+    if tps_f2 is not None:
+        print(
+            f"{'F2 Q4_K_M GGUF + Q8 GEMV (Phase 22)':<40} "
+            f"{tps_f2:>12.2f} {rss_f2_s:>14} {est_footprint_c:>20.0f}"
+        )
+    else:
+        print(
+            f"{'F2 Q4_K_M GGUF + Q8 GEMV (Phase 22)':<40} "
+            f"{'skipped':>12} {'n/a':>14} {'n/a':>20}"
+        )
     if tps_g is not None:
         print(
             f"{'G  Native GEMV + EAGLE-3 MTP (Phase A1)':<40} "
@@ -1283,7 +1331,7 @@ def run_phi4_benchmark(
             f"  Corrected footprint B (AR): primary ~{primary_mb:.0f} MB + Q4 KV est ~{kv_q4_mb:.0f} MB "
             f"= ~{est_footprint_b:.0f} MB"
         )
-    print(f"  Max sampled RSS (load / A / C / D / E / F / B): {peak_rss:.0f} MB")
+    print(f"  Max sampled RSS (load / A / C / D / E / F / F2 / B): {peak_rss:.0f} MB")
     if tps_c > 0:
         d_speedup = tps_d / tps_c if tps_c > 0 else 0.0
         print(f"  Profile D speedup vs C: {d_speedup:.2f}x (LUT vpshufb vs FMA)")
@@ -1342,6 +1390,7 @@ def run_phi4_benchmark(
             "D": {"tok/s": tps_d},
             "E": {"tok/s": tps_e},
             "F": {"tok/s": tps_f},
+            "F2": {"tok/s": tps_f2},
             "G": {"tok/s": tps_g},
             "H": {"tok/s": tps_h},
             "I": {"tok/s": tps_i},
@@ -1360,12 +1409,14 @@ def run_phi4_benchmark(
     print(f"ASDSL Profile C (8t, n=128, p=0):  {tps_c:.2f} tok/s  ({'BEATS' if tps_c > target else 'below'})")
     if tps_f:
         print(f"ASDSL Profile F (8t, n=128, p=0):  {tps_f:.2f} tok/s  [Q8 GEMV]  ({'BEATS' if tps_f > target else 'below'})")
+    if tps_f2:
+        print(f"ASDSL Profile F2 (8t, n=128, p=0): {tps_f2:.2f} tok/s  [Q4_K_M GGUF]  ({'BEATS' if tps_f2 > target else 'below'})")
     if tps_h:
         print(f"ASDSL Profile H (8t, n=128, p=0):  {tps_h:.2f} tok/s  [Q8+PLD]  ({'BEATS' if tps_h > target else 'below'})")
     if tps_i:
         print(f"ASDSL Profile I (8t, n=128, p=0):  {tps_i:.2f} tok/s  [Pure C++ Engine]  ({'BEATS' if tps_i > target else 'below'})")
     
-    best_asdsl = max([t for t in [tps_c, tps_f, tps_h, tps_g, tps_b, tps_i] if t is not None] + [0.0])
+    best_asdsl = max([t for t in [tps_c, tps_f, tps_f2, tps_h, tps_g, tps_b, tps_i] if t is not None] + [0.0])
     if best_asdsl > target:
         print(f"WINNER: ASDSL by {best_asdsl - target:.2f} tok/s ({((best_asdsl/target)-1)*100:.1f}%)")
     else:
@@ -1531,6 +1582,12 @@ def main() -> None:
              "Default: phi4_fatrelu_thresholds.json at repo root if it exists.",
     )
     p.add_argument(
+        "--gguf-path",
+        type=str,
+        default=None,
+        help="Path to Phi-4 GGUF file for Profile F2 (Q4_K_M direct load)",
+    )
+    p.add_argument(
         "--force-eagle3",
         action="store_true",
         help="Phi-4: set ASDSL_FORCE_EAGLE3 for Profile G subprocess (empirical run).",
@@ -1630,6 +1687,7 @@ def main() -> None:
             quick=args.quick,
             inter_profile_sleep_default=d_sleep,
             eagle_draft_k=eagle_draft_k,
+            gguf_path=getattr(args, "gguf_path", None),
         )
         return
 

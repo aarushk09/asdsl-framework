@@ -20,6 +20,7 @@ from asdsl.kernels.gemv_q4 import (
     gemv_q4,
     gemv_q4_packed,
     gemv_q4_unpacked,
+    gemv_q4km_q8,
     has_native_kernel,
 )
 from asdsl.kernels.gemv_q8 import (
@@ -47,6 +48,7 @@ __all__ = [
     "gemv_q4",
     "gemv_q4_packed",
     "gemv_q4_unpacked",
+    "gemv_q4km_q8",
     "has_native_kernel",
     "gemv_q8_unpacked",
     "has_native_q8_kernel",

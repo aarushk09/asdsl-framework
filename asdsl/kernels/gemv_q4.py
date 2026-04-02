@@ -320,6 +320,26 @@ def gemv_q4_unpacked(
     return _gemv_q4_numpy_unpacked(w, x, scales, biases, M, K, group_size)
 
 
+def gemv_q4km_q8(
+    weights_q4km: np.ndarray,
+    x: np.ndarray,
+    out_features: int,
+    in_features: int,
+) -> np.ndarray:
+    """Q4_K_M superblock GEMV using native Q8 activation quantization path."""
+    if not _native_available or not hasattr(_native, "gemv_q4km_q8_avx2"):
+        raise RuntimeError("Native Q4_K_M GEMV is unavailable in this build")
+
+    w = _ensure_u8_contiguous(weights_q4km).reshape(-1)
+    xv = _ensure_f32_contiguous(x).reshape(-1)
+    if xv.size != in_features:
+        raise ValueError(f"x length {xv.size} does not match in_features={in_features}")
+
+    y = np.zeros(out_features, dtype=np.float32)
+    _native.gemv_q4km_q8_avx2(w, xv, y, out_features, in_features)
+    return y
+
+
 def gemv_q4(qtensor: QuantizedTensor, x: np.ndarray) -> np.ndarray:
     """High-level fused 4-bit GEMV from a QuantizedTensor.
 

@@ -224,3 +224,46 @@ ASDSL does not beat llama.cpp on this benchmark. The remaining path requires:
 1. Native sparse kernel optimization (C-level sparse GEMV without Python call overhead)
 2. Full MTP training on large corpus (10K+ prompts) for meaningful EAGLE-3 acceptance
 3. Session optimization to recover the Phase 7 peak (5.19 tok/s — still unexplained)
+
+## Phase 22 (2026-04-02): GGUF Q4_K_M Integration + F2 Profile
+
+### Implemented
+
+1. Added a GGUF tensor loader in `asdsl/io/gguf_loader.py` with Q4_K parsing helpers.
+2. Added native `gemv_q4km_q8_avx2` to `asdsl/kernels/native/gemv_q4_avx2.cpp` and exported bindings.
+3. Added `WeightStore.load_from_gguf()` and Q4_K_M matvec dispatch in `experiments/phi4_cpu_run.py`.
+4. Added Profile `F2` and `--gguf-path` wiring in `scripts/run_full_benchmark.py`.
+5. Added correctness tests in `tests/test_q4km_gemv.py`.
+
+### Benchmark outcome
+
+| Profile | tok/s |
+|---------|-------|
+| A | 2.22 |
+| C | 2.16 |
+| D | 1.25 |
+| E | 1.26 |
+| F | 1.88 |
+| F2 (Q4_K_M GGUF) | 0.00 (failed to load) |
+| G | 0.63 |
+| H | 0.98 |
+| I | 0.00 |
+| B | 2.26 |
+
+llama.cpp Q4_K_M reference remains 3.06 tok/s.
+
+### Blocking incompatibility discovered
+
+The available GGUF file on disk (`C:/Users/aarus/llama.cpp/phi-4-Q4_K_M.gguf`) is not shape-compatible with the active ASDSL Phi-4 runtime path:
+
+- GGUF sample: 40 layers, hidden size 5120, vocab 100352.
+- ASDSL active path (`phi4_cpu_run.py`): 32 layers, hidden size 3072, vocab 200064.
+- GGUF also contains `GGML type 14` (Q6_K) tensors for `attn_v` and `ffn_down` in multiple layers.
+
+Current Phase 22 loader validates shape compatibility and Q4_K-only projection constraints, so Profile F2 fails fast with:
+
+`ValueError: Expected q4_k tensor, got unknown_14`
+
+### Validation
+
+Full test suite: `160 passed, 1 skipped`.

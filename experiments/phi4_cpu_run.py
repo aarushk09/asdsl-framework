@@ -30,6 +30,8 @@ import math
 import os
 import sys
 import time
+from dataclasses import dataclass
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional, Callable, Any
 
@@ -45,6 +47,16 @@ from safetensors import safe_open
 from transformers import AutoTokenizer
 
 from asdsl.engine import run_dual_model_speculative_benchmark
+
+
+@dataclass
+class StreamToken:
+    text: str = ""
+    token_id: int = 0
+    step: int = 0
+    is_eos: bool = False
+    elapsed_s: float = 0.0
+    tokens_per_second: float = 0.0
 
 # Phase 17: Native C++ ops for non-GEMV operations
 try:
@@ -455,6 +467,24 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return (x / rms) * weight
 
 
+def _normalize_input_ids(raw_ids) -> list[int]:
+    """Normalize tokenizer outputs to a flat ``list[int]``."""
+    ids = raw_ids
+    if isinstance(ids, Mapping):
+        if "input_ids" in ids:
+            ids = ids["input_ids"]
+        else:
+            vals = list(ids.values())
+            if not vals:
+                return []
+            ids = vals[0]
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if isinstance(ids, list) and ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return [int(x) for x in ids]
+
+
 def build_rope_cache(seq_len: int, head_dim: int, theta: float = ROPE_THETA,
                      dtype=torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-compute RoPE cos/sin tables up to seq_len."""
@@ -640,6 +670,11 @@ class WeightStore:
 
         # Phase 16: Q8_0 activation quantization + integer GEMV (Profile F)
         self._use_q8_gemv = False
+        # Phase 22: Q4_K_M superblock weights loaded from GGUF
+        self._use_q4km = False
+        self._q4km_weights: dict[tuple[int, str], np.ndarray] = {}
+        self._q4km_shapes: dict[tuple[int, str], tuple[int, int]] = {}
+        self._gguf_path: str | None = None
 
         # Phase 17: Native C++ ops for non-GEMV operations
         self._use_native_ops = HAS_NATIVE_OPS
@@ -801,6 +836,142 @@ class WeightStore:
         # Pre-allocate a flat float32 pool for chunked matvec.
         self._pool = torch.empty(_TARGET_CHUNK_BYTES // 4, dtype=torch.float32)
 
+    def _gguf_tensor_to_f32(self, info: dict) -> np.ndarray:
+        t = info.get("type")
+        data = info.get("data")
+        if data is None:
+            raise ValueError("GGUF tensor payload is missing")
+        arr = np.asarray(data)
+        if t == "f32":
+            return np.ascontiguousarray(arr, dtype=np.float32)
+        if t == "f16":
+            return np.ascontiguousarray(arr.astype(np.float16), dtype=np.float32)
+        if t == "bf16":
+            return np.ascontiguousarray(arr, dtype=np.float32)
+        raise ValueError(f"Unsupported GGUF tensor type for float conversion: {t}")
+
+    def _concat_q4k_rows(self, infos: list[dict]) -> tuple[np.ndarray, int, int]:
+        if not infos:
+            raise ValueError("No Q4_K tensors to concatenate")
+        cols = int(infos[0]["shape"][-1])
+        rows_total = 0
+        row_chunks: list[np.ndarray] = []
+        for info in infos:
+            if info.get("type") != "q4_k":
+                raise ValueError(f"Expected q4_k tensor, got {info.get('type')}")
+            shape = tuple(int(x) for x in info["shape"])
+            rows = int(shape[0])
+            if int(shape[-1]) != cols:
+                raise ValueError("Cannot concat Q4_K rows with different input dims")
+            row_bytes = int(info.get("row_bytes", (cols // 256) * 144))
+            raw = np.ascontiguousarray(info["data"], dtype=np.uint8).reshape(rows, row_bytes)
+            row_chunks.append(raw)
+            rows_total += rows
+        merged = np.ascontiguousarray(np.concatenate(row_chunks, axis=0), dtype=np.uint8)
+        return merged.reshape(-1), rows_total, cols
+
+    def load_from_gguf(self, gguf_path: str) -> None:
+        """Load projection weights from a Q4_K GGUF file into Q4_K_M fast path.
+
+        This method only wires projection matrices (qkv/o/gate_up/down). Existing
+        embedding and norm tensors are kept from the current store state.
+        """
+        from asdsl.io.gguf_loader import read_gguf_tensors
+
+        tensors = read_gguf_tensors(gguf_path)
+        if not tensors:
+            raise RuntimeError(f"No tensors found in GGUF: {gguf_path}")
+
+        if self.embed_f16 is None or self.final_norm is None:
+            raise RuntimeError(
+                "load_from_gguf requires existing embeddings/norms; call load() first"
+            )
+
+        loaded = 0
+        self._q4km_weights.clear()
+        self._q4km_shapes.clear()
+
+        for i in range(NUM_LAYERS):
+            qkv_info = tensors.get(f"blk.{i}.attn_qkv.weight")
+            if qkv_info is None:
+                q = tensors.get(f"blk.{i}.attn_q.weight")
+                k = tensors.get(f"blk.{i}.attn_k.weight")
+                v = tensors.get(f"blk.{i}.attn_v.weight")
+                if q is not None and k is not None and v is not None:
+                    qkv_raw, qkv_rows, qkv_cols = self._concat_q4k_rows([q, k, v])
+                else:
+                    raise RuntimeError(f"GGUF missing QKV tensors for layer {i}")
+            else:
+                if qkv_info.get("type") != "q4_k":
+                    raise RuntimeError(
+                        f"Layer {i} attn_qkv is {qkv_info.get('type')} (need q4_k)"
+                    )
+                qkv_rows, qkv_cols = [int(x) for x in qkv_info["shape"][:2]]
+                qkv_raw = np.ascontiguousarray(qkv_info["data"], dtype=np.uint8).reshape(-1)
+
+            o_info = tensors.get(f"blk.{i}.attn_output.weight")
+            if o_info is None or o_info.get("type") != "q4_k":
+                raise RuntimeError(f"Layer {i} attn_output.weight must be q4_k")
+            o_rows, o_cols = [int(x) for x in o_info["shape"][:2]]
+            o_raw = np.ascontiguousarray(o_info["data"], dtype=np.uint8).reshape(-1)
+
+            gu_info = tensors.get(f"blk.{i}.ffn_gate_up.weight")
+            if gu_info is None:
+                g = tensors.get(f"blk.{i}.ffn_gate.weight")
+                u = tensors.get(f"blk.{i}.ffn_up.weight")
+                if g is not None and u is not None:
+                    gu_raw, gu_rows, gu_cols = self._concat_q4k_rows([g, u])
+                else:
+                    raise RuntimeError(f"GGUF missing FFN gate/up tensors for layer {i}")
+            else:
+                if gu_info.get("type") != "q4_k":
+                    raise RuntimeError(
+                        f"Layer {i} ffn_gate_up is {gu_info.get('type')} (need q4_k)"
+                    )
+                gu_rows, gu_cols = [int(x) for x in gu_info["shape"][:2]]
+                gu_raw = np.ascontiguousarray(gu_info["data"], dtype=np.uint8).reshape(-1)
+
+            d_info = tensors.get(f"blk.{i}.ffn_down.weight")
+            if d_info is None or d_info.get("type") != "q4_k":
+                raise RuntimeError(
+                    f"Layer {i} ffn_down.weight is {None if d_info is None else d_info.get('type')} "
+                    "(need q4_k)"
+                )
+            d_rows, d_cols = [int(x) for x in d_info["shape"][:2]]
+            d_raw = np.ascontiguousarray(d_info["data"], dtype=np.uint8).reshape(-1)
+
+            expected = {
+                "qkv_proj": (QKV_DIM, HIDDEN),
+                "o_proj": (HIDDEN, HIDDEN),
+                "gate_up_proj": (2 * INTER, HIDDEN),
+                "down_proj": (HIDDEN, INTER),
+            }
+            found = {
+                "qkv_proj": (qkv_rows, qkv_cols),
+                "o_proj": (o_rows, o_cols),
+                "gate_up_proj": (gu_rows, gu_cols),
+                "down_proj": (d_rows, d_cols),
+            }
+            for nm, shp in found.items():
+                if shp != expected[nm]:
+                    raise RuntimeError(
+                        f"GGUF shape mismatch at layer {i} {nm}: got {shp}, expected {expected[nm]}"
+                    )
+
+            self._q4km_weights[(i, "qkv_proj")] = qkv_raw
+            self._q4km_shapes[(i, "qkv_proj")] = (qkv_rows, qkv_cols)
+            self._q4km_weights[(i, "o_proj")] = o_raw
+            self._q4km_shapes[(i, "o_proj")] = (o_rows, o_cols)
+            self._q4km_weights[(i, "gate_up_proj")] = gu_raw
+            self._q4km_shapes[(i, "gate_up_proj")] = (gu_rows, gu_cols)
+            self._q4km_weights[(i, "down_proj")] = d_raw
+            self._q4km_shapes[(i, "down_proj")] = (d_rows, d_cols)
+            loaded += 4
+
+        self._use_q4km = True
+        self._gguf_path = str(gguf_path)
+        print(f"  Loaded {loaded} Q4_K projection tensors from GGUF: {gguf_path}")
+
     # --- float16 path (bits=16) helpers --------------------------------
 
     def _matvec_f16(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
@@ -823,6 +994,8 @@ class WeightStore:
     def _matvec_quant(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
         """Chunked dequant+matvec for quantized weights (unpacked uint8 path)."""
         key = (layer_idx, name)
+        if self._use_q4km and key in self._q4km_weights:
+            return self._matvec_q4km(layer_idx, name, x)
         if self.bits == 4:
             return self._matvec_q4_packed(layer_idx, name, x, use_draft=False)
         u8 = self._quant_u8[key]
@@ -904,10 +1077,40 @@ class WeightStore:
             result = result + torch.from_numpy(out_corr).unsqueeze(0)
         return result
 
+    def _matvec_q4km(self, layer_idx: int, name: str, x: torch.Tensor) -> torch.Tensor:
+        """Fused GEMV for GGUF Q4_K_M projection weights."""
+        try:
+            from asdsl.kernels import _native_gemv as _ng  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("Q4_K_M GEMV requires native _native_gemv extension") from exc
+
+        if not hasattr(_ng, "gemv_q4km_q8_avx2"):
+            raise RuntimeError("Native extension does not export gemv_q4km_q8_avx2")
+
+        key = (layer_idx, name)
+        if key not in self._q4km_weights:
+            raise KeyError(f"Missing Q4_K_M weights for {key}")
+
+        rows, cols = self._q4km_shapes[key]
+        w_np = self._q4km_weights[key]
+
+        if self._x_buf is None or self._x_buf.size < cols:
+            self._x_buf = np.empty(cols, dtype=np.float32)
+        if self._out_buf is None or self._out_buf.size < rows:
+            self._out_buf = np.empty(rows, dtype=np.float32)
+
+        x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+        np.copyto(self._x_buf[:cols], x_np)
+        _ng.gemv_q4km_q8_avx2(w_np, self._x_buf[:cols], self._out_buf[:rows], rows, cols)
+        return torch.from_numpy(np.asarray(self._out_buf[:rows], dtype=np.float32).copy()).unsqueeze(0)
+
     def _matvec_native_gemv(self, layer_idx: int, name: str, x: torch.Tensor,
                             use_draft: bool = False) -> torch.Tensor:
         """AVX2 GEMV fast path for 4-bit packed, 8-bit, 3-bit, and 2-bit weights."""
         key = (layer_idx, name)
+
+        if not use_draft and self._use_q4km and key in self._q4km_weights:
+            return self._matvec_q4km(layer_idx, name, x)
 
         draft_q4 = use_draft and key in self._draft_quant_packed
         draft_q2p = use_draft and key in self._draft_quant_u8 and self._draft_bits == 2
@@ -1621,6 +1824,9 @@ class WeightStore:
     def matvec(self, layer_idx: int, name: str, x: torch.Tensor,
                use_draft: bool = False) -> torch.Tensor:
         """Bandwidth-efficient matrix-vector product: y = W @ x."""
+        key = (layer_idx, name)
+        if not use_draft and self._use_q4km and key in self._q4km_weights:
+            return self._matvec_q4km(layer_idx, name, x)
         if self.bits == 16:
             return self._matvec_f16(layer_idx, name, x)
         # Phase 2: SliM mixed-precision path
@@ -2483,7 +2689,7 @@ def forward_layer_batch(
 # Generation
 # ---------------------------------------------------------------------------
 
-def generate(
+def generate_stream(
     prompt: str,
     store: WeightStore,
     tokenizer,
@@ -2508,6 +2714,7 @@ def generate(
     input_ids = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True
     )
+    input_ids = _normalize_input_ids(input_ids)
 
     # Pre-compute RoPE tables (generous max length).
     # Pass ROTARY_DIM (96) - only the rotated portion of each head needs tables.
@@ -2574,6 +2781,59 @@ def generate(
             pos += 1
 
 
+def generate(
+    prompt: str,
+    store: WeightStore,
+    tokenizer,
+    max_new_tokens: int = 50,
+    system_prompt: str = "You are a helpful AI assistant.",
+    bench_metrics_out: list | None = None,
+    logits_hook: Optional[Callable[[np.ndarray], None]] = None,
+) -> str:
+    """Eager generation wrapper over ``generate_stream`` for benchmark callers."""
+    print("\nAssistant: ", end="", flush=True)
+
+    token_ids: list[int] = []
+    last_elapsed = 0.0
+    last_tps = 0.0
+    for tok in generate_stream(
+        prompt=prompt,
+        store=store,
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+        system_prompt=system_prompt,
+        bench_metrics_out=None,
+        logits_hook=logits_hook,
+    ):
+        print(tok.text, end="", flush=True)
+        token_ids.append(int(tok.token_id))
+        last_elapsed = float(tok.elapsed_s)
+        last_tps = float(tok.tokens_per_second)
+
+    n_tokens = len(token_ids)
+    tps = (n_tokens / last_elapsed) if last_elapsed > 0 else 0.0
+    if tps <= 0.0:
+        tps = last_tps
+
+    response_text = tokenizer.convert_tokens_to_string(
+        tokenizer.convert_ids_to_tokens(token_ids)
+    )
+
+    print(f"\n\nGenerated : {n_tokens} tokens  |  {tps:.2f} tok/s  |  decode {last_elapsed:.1f}s")
+    print("=" * 66)
+
+    if bench_metrics_out is not None:
+        bench_metrics_out.append(
+            {
+                "decode_tokens": n_tokens,
+                "decode_s": float(last_elapsed),
+                "tokens_per_second": float(tps),
+            }
+        )
+
+    return response_text
+
+
 # ---------------------------------------------------------------------------
 # QCSD: Quantization Cascade Speculative Decoding (Tier 2)
 # ---------------------------------------------------------------------------
@@ -2607,6 +2867,7 @@ def generate_qcsd(
     input_ids = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True
     )
+    input_ids = _normalize_input_ids(input_ids)
 
     max_seq = len(input_ids) + max_new_tokens + draft_k + 64
     rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
@@ -2903,6 +3164,7 @@ def generate_pld(
     input_ids = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True
     )
+    input_ids = _normalize_input_ids(input_ids)
     
     max_seq = len(input_ids) + max_new_tokens + draft_k + 32
     rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
@@ -3226,6 +3488,7 @@ def generate_eagle3(
     input_ids = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True
     )
+    input_ids = _normalize_input_ids(input_ids)
 
     max_seq = len(input_ids) + max_new_tokens + draft_k + 64
     rope_cos, rope_sin = build_rope_cache(max_seq, ROTARY_DIM)
@@ -3659,10 +3922,16 @@ def main() -> None:
     parser.add_argument("--fatrelu-thresholds", type=str, default=None,
                         help="Path to phi4_fatrelu_thresholds.json for Phase 3 sparsity (Profile F)")
     parser.add_argument(
+        "--gguf-path",
+        type=str,
+        default=None,
+        help="Path to Phi-4 GGUF (Q4_K_M) for Profile F2 direct superblock loading",
+    )
+    parser.add_argument(
         "--profile",
         type=str,
         default=None,
-        help="Bench profile: G = FATReLU + LUT + EAGLE-3 MTP (requires --bits 4, local mtp_head.pt)",
+        help="Bench profile: G = EAGLE-3, F2 = Q4_K_M GGUF superblock GEMV",
     )
     parser.add_argument(
         "--emit-json",
@@ -3784,6 +4053,8 @@ def main() -> None:
         print(f"  Layers ready: {len(store.layers)}/32  "
               f"| Norms ready: {len(store.layer_norms)}/32")
     store.warm_cache()
+    if args.gguf_path:
+        store.load_from_gguf(args.gguf_path)
 
     if args.profile == "G":
         if args.bits != 4:
@@ -3821,6 +4092,34 @@ def main() -> None:
                 "mean_tokens_per_cycle": m0.get("mean_tokens_accepted_per_cycle"),
                 "eagle3_enabled": bool(getattr(store, "_use_eagle3", False)),
                 "fatrelu_enabled": bool(getattr(store, "_use_fatrelu", False)),
+            }
+            print(json.dumps(out))
+        del store, tokenizer
+        gc.collect()
+        return
+
+    if args.profile == "F2":
+        if not args.gguf_path:
+            print("ERROR: --profile F2 requires --gguf-path")
+            sys.exit(1)
+        store._use_q4km = True
+        store._use_q8_gemv = True
+        store._use_native_gemv = True
+        metrics_f2: list = []
+        generate(
+            args.prompt,
+            store,
+            tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            bench_metrics_out=metrics_f2,
+        )
+        if args.emit_json:
+            m0 = metrics_f2[0] if metrics_f2 else {}
+            out = {
+                "profile": "F2",
+                "tok_per_sec": float(m0.get("tokens_per_second", 0.0)),
+                "q4km_enabled": bool(getattr(store, "_use_q4km", False)),
+                "gguf_path": args.gguf_path,
             }
             print(json.dumps(out))
         del store, tokenizer

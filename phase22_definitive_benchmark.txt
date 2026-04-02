@@ -1,0 +1,130 @@
+﻿c:/Users/aarus/projects/asdsl-framework/.venv/Scripts/python.exe : This model 
+config has set a `rope_parameters['original_max_position_embeddings']` field, 
+to be used together with `max_position_embeddings` to determine a scaling 
+factor. Please set the `factor` field of `rope_parameters`with this ratio 
+instead -- we recommend the use of this field over 
+`original_max_position_embeddings`, as it is compatible with most model 
+architectures.
+At line:1 char:1
++ c:/Users/aarus/projects/asdsl-framework/.venv/Scripts/python.exe scri ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (This model conf... architectures. 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[CONFIG] Loaded canonical benchmark config from C:\Users\aarus\projects\asdsl-framework\benchmark_config.json
+[CONFIG] prompt='' max_new_tokens=128 threads=8 draft_k=3
+[threads] Using OMP_PLACES={0-7} for P-core binding, 8 threads
+  Loading & quantizing 128 projection weights to 4-bit ...
+  (embedding + norms loaded as bfloat16)
+    16/128 (12%)  
+    32/128 (25%)  
+    48/128 (38%)  
+    64/128 (50%)  
+    80/128 (62%)  
+    96/128 (75%)  
+    112/128 (88%)  
+    128/128 (100%)  
+    128/128 (100%)  done.               
+  Caching embed float16 ... done
+[SliM] WARNING: phi4_slim_meta.json was generated in quick mode (only 4 layers calibrated) ù using for Profile E anyway
+[SliM] Loaded: 3.09 avg bits, ~2.76 GB estimated size
+  [SliM] Pre-repacking arrays for calibrated layers...
+  [SliM] Repacking done in 2.77s
+  Caching packed Q4 weights (128 tensors, rows╫cols/2) ... done (128/128) | 2416 MB
+  Inference: native AVX2 GEMV Q4 packed (gemv_q4_packed)
+  Pre-computed RoPE tables: 2048 x 64 (native ops enabled)
+[Profile D] Starting isolated subprocess (sleep 3s first)...
+[Profile D] isolated result: 1.246 tok/s sparse_T=0 dense_fallback=4480
+[Profile E] Starting isolated subprocess (sleep 3s first)...
+[Profile E] isolated result: 1.262 tok/s sparse_T=0 dense_fallback=4480
+[Profile F] Starting isolated subprocess (sleep 3s first)...
+[Profile F] isolated result: 1.883 tok/s sparse_T=0 dense_fallback=4480
+[Profile F2] Starting isolated subprocess (sleep 3s first)...
+[Profile F2] isolated result: 0.000 tok/s
+[Profile F2] subprocess error (rc=1):
+OMP: Warning #251: OMP_PLACES: syntax error, using threads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a 
+HF_TOKEN to enable higher rate limits and faster downloads.
+This model config has set a 
+`rope_parameters['original_max_position_embeddings']` field, to be used 
+together with `max_position_embeddings` to determine a scaling factor. Please 
+set the `factor` field of `rope_parameters`with this ratio instead -- we 
+recommend the use of this field over `original_max_position_embeddings`, as it 
+is compatible with most model architectures.
+Traceback (most recent call last):
+  File "<string>", line 28, in <module>
+    store.load_from_gguf('C:/Users/aarus/llama.cpp/phi-4-Q4_K_M.gguf')
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aarus\projects\asdsl-framework\experiments\phi4_cpu_run.py", 
+line 901, in load_from_gguf
+    qkv_raw, qkv_rows, qkv_cols = self._concat_q4k_rows([q, k, v])
+                                  ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\aarus\projects\asdsl-framework\experiments\phi4_cpu_run.py", 
+line 861, in _concat_q4k_rows
+    raise ValueError(f"Expected q4_k tensor, got {info.get('type')}")
+ValueError: Expected q4_k tensor, got unknown_14
+
+[Profile G] Leviathan gate BYPASSED for empirical measurement (ASDSL_FORCE_EAGLE3=1; full throughput + acceptance capture)
+[Profile G] Starting isolated subprocess (sleep 3s first)...
+[Profile G] isolated result: 0.635 tok/s sparse_T=0 dense_fallback=1184
+[Profile G] EAGLE-3 acceptance rate: 0.0%
+[Profile G] Mean tokens accepted/cycle: 0.00
+[Profile G] Leviathan gate: FAIL (break-even alpha ~41.7% for draft_k=3)
+WARNING: Profile G subprocess reports fatrelu_enabled=false
+[Profile G] skipped: models/mtp_head.pt not found
+[Profile H] Starting isolated subprocess (sleep 3s first)...
+[Profile H] isolated result: 0.981 tok/s sparse_T=0 dense_fallback=2688
+[Profile H] PLD acceptance rate: 39.8%
+[Profile I] Starting isolated subprocess (sleep 3s first)...
+[Profile I] isolated result: 0.000 tok/s
+[Profile I] Pure C++ Engine (Phase 19 NATIVE_GRAPH): 0.000 tok/s
+
+========================================================================
+ASDSL full benchmark (Phi-4 local weights)
+========================================================================
+  Native Q4 GEMV (gemv_q4_packed / AVX2): available
+  Threads (OMP / BLAS / torch / native GEMV): 8 (use --threads N to override; 0 = auto, half of logical CPUs)
+  Leviathan gate alpha: 0.133 (history mean over 25 run(s) [eagle3_acceptance_rates]); CLI prior default if no history: 0.40
+  Load+quantize: 464.3s  |  primary 4-bit  |  draft 2-bit  |  draft_k=3
+  Weights (reported): ~3645 MB  (draft bank 0 MB)
+  Physical primary breakdown: packed_Q4 1611 MB | uint8_matmul 0 MB | scales+bias 805 MB | embed_f16 1229 MB (packed path avoids 2x uint8 weight expansion for 4-bit)
+
+Profile                                         tok/s  Peak RSS (MB) Corr. footprint (MB)
+----------------------------------------------------------------------------------------
+A  AR + PyTorch matvec + FP32 KV est.            2.22           4042                 3679
+C  AR + Native Q4 GEMV + FP32 KV est.            2.16           4042                 3679
+D  AR + LUT Q4 GEMV (vpshufb, Phase 1)           1.25            n/a                 3679
+E  AR + LUT GEMV + SliM 2.2-bit (Phase 2)         1.26            n/a                 3679
+F  Native GEMV + Q8_0 (Phase B)                  1.88            n/a                 3679
+F2 Q4_K_M GGUF + Q8 GEMV (Phase 22)              0.00            n/a                 3679
+G  Native GEMV + EAGLE-3 MTP (Phase A1)          0.63            n/a                 3679
+H  Native GEMV + Q8 + PLD (Phase 16)             0.98            n/a                 3679
+I  Pure C++ Engine + Q4xQ8 (Phase 19)            0.00            n/a                 3679
+B  Native GEMV + AR + Q4 KV est. (QCSD off)         2.26           3896                 3654
+----------------------------------------------------------------------------------------
+  Corrected footprint A: primary+embed ~3645 MB + FP32 KV ~34 MB = ~3679 MB
+  Profile C (native AR): 2.16 tok/s  |  peak RSS ~4042 MB  |  same footprint model as A (~3679 MB est.)
+  Corrected footprint B (AR): primary ~3645 MB + Q4 KV est ~9 MB = ~3654 MB
+  Max sampled RSS (load / A / C / D / E / F / F2 / B): 5721 MB
+  Profile D speedup vs C: 0.58x (LUT vpshufb vs FMA)
+  Profile D speedup vs baseline (1.20 tok/s): 1.04x
+  Profile E speedup vs C: 0.58x (SliM + LUT vs FMA)
+  Profile E speedup vs D: 1.01x (SliM vs no-SliM)
+  Profile E speedup vs baseline (1.20 tok/s): 1.05x
+  llama.cpp gap closed: 1.1%
+  Appended Profile G EAGLE-3 acceptance to .qcsd_history.json (eagle3_acceptance_rates).
+  KV column: A and C use FP32 KV geometry; B adds theoretical Q4 KV payload (``KVHistory`` in phi4_cpu_run remains FP32; Q4 is planning/comparison).
+========================================================================
+
+========================================================================
+DEFINITIVE FAIR COMPARISON vs llama.cpp
+========================================================================
+llama.cpp Q4_K_M (12t, n=128, p=0): 3.06 tok/s
+ASDSL Profile C (8t, n=128, p=0):  2.16 tok/s  (below)
+ASDSL Profile F (8t, n=128, p=0):  1.88 tok/s  [Q8 GEMV]  (below)
+ASDSL Profile H (8t, n=128, p=0):  0.98 tok/s  [Q8+PLD]  (below)
+WINNER: llama.cpp leads by 0.80 tok/s (35.3%)
+========================================================================
+
+
