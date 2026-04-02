@@ -569,6 +569,10 @@ class WeightStore:
         # Chunked matmul buffer
         self._pool = torch.empty(_POOL_SIZE, dtype=torch.uint8)
 
+        # Phase 21: Pre-allocated input buffer for matvec to avoid numpy allocation per call
+        self._x_buf: np.ndarray | None = None
+        self._out_buf: np.ndarray | None = None
+
 
         # Native LUT/GEMV fast path
         self._use_native_gemv = False
@@ -850,6 +854,8 @@ class WeightStore:
 
         Dispatches to ``asdsl.kernels.gemv_q4_packed`` → C++ ``gemv_q4_packed``
         (AVX2 in-register unpack + FMA; same nibble order as ``gemv_q4_kernel`` tests).
+
+        Phase 21: Pre-allocated x_np buffer eliminates numpy allocation per call.
         """
         from asdsl.kernels import gemv_q4_packed
 
@@ -866,7 +872,13 @@ class WeightStore:
             gs = self.group_size
             
         rows, cols = self._quant_shapes[key]
+        
+        # Phase 21: Use pre-allocated buffer to avoid numpy allocation
+        if self._x_buf is None or self._x_buf.size < cols:
+            self._x_buf = np.empty(cols, dtype=np.float32)
         x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+        np.copyto(self._x_buf[:cols], x_np)
+        x_np = self._x_buf[:cols]
         
         out_np = gemv_q4_packed(
             w_np, x_np, sc_np, bi_np, rows, cols, gs,

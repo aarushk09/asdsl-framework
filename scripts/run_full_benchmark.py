@@ -557,6 +557,8 @@ sys.path.insert(0, {root!r})
 os.environ["USE_TF"] = "0"
 os.environ["USE_JAX"] = "0"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
+os.environ["GOMP_SPINCOUNT"] = "0"
 os.environ["OMP_NUM_THREADS"] = str({thread_count})
 os.environ["OMP_PROC_BIND"] = "TRUE"
 os.environ["OMP_PLACES"] = "{{0-7}}"
