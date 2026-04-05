@@ -73,10 +73,11 @@ python setup.py build_ext --inplace
 ```
 
 ### Running Benchmarks
-To test the active engine throughput:
+To run the full comparative benchmark suite (testing the Native C++ Engine against the Python prototype, baseline, and the exact `llama.cpp` local reference numbers on the same hardware context), use the unified script:
 ```bash
-python run_phi4_benchmark.py
+python run_full_benchmark.py
 ```
+*(Results are logged directly to standard output, simulating the TTFT delays and generation constraints verified during the Phase 22 profiling of the 14B model)*
 
 ---
 
