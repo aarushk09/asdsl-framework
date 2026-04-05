@@ -1,0 +1,53 @@
+{
+    "git_commit": "0ab2b4ba9df24d1039e454cc6856f643aa8f7b0a",
+    "triad_bandwidth": [
+        33.572220614117064,
+        26.654880872358728,
+        33.437863891157214,
+        33.40061520850334,
+        30.315761323146592
+    ],
+    "triad_mean": 31.476268381856585,
+    "asdsl_profile_c": {
+        "mean_tok_s": 2.2319999999999998,
+        "std_tok_s": 0.1440000000000001,
+        "min_tok_s": 2.01,
+        "max_tok_s": 2.35,
+        "raw_tok_s": [
+            2.11,
+            2.01,
+            2.35,
+            2.35,
+            2.34
+        ],
+        "temps_start": [
+            null,
+            null,
+            null,
+            null,
+            null
+        ],
+        "temps_end": [
+            null,
+            null,
+            null,
+            null,
+            null
+        ]
+    },
+    "llama_cpp_q4_km": {
+        "mean_tok_s": 7.0,
+        "std_tok_s": 0.0,
+        "min_tok_s": 7.0,
+        "max_tok_s": 7.0,
+        "raw_tok_s": [
+            7.0,
+            7.0,
+            7.0,
+            7.0,
+            7.0
+        ],
+        "note": "Pre-filled from existing llama.cpp baselines."
+    },
+    "timestamp_utc": 1775176464.073228
+}
