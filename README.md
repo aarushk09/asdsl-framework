@@ -41,10 +41,10 @@ This framework is built for research, profiling, and understanding *why* certain
 | Framework State               | Decoding Throughput | Perplexity (WikiText-103) | Peak Memory | Accelerator |
 |-------------------------------|---------------------|---------------------------|-------------|-------------|
 | **Native C++ Unified Engine (Baseline)** | **2.56 tok/s** | **19.16** | **3.2 GB** | AVX2/VNNI |
-| ASDSL Python Prototype (Highest)| 2.86 tok/s       | 19.16 | 3.2 GB | AVX2 |
+| ASDSL Python Prototype (Favorable Peak) | 2.85 tok/s       | 19.16 | 3.2 GB | AVX2 |
 | *llama.cpp Q4_K_M (Local Reference)*| *~2.72 tok/s*       | *~18-20* | *~3.0 GB* | *AVX2/VNNI* |
 
-*Note: Previous internal documentation referenced peak historical marks (like 5.15 tok/s and >10.0 tok/s) that were benchmarks on different node profiles or with layer skips. For our actual consumer hardware baseline testing, the framework hits 2.56 tok/s natively out of the box against llama.cpp's ~2.72 tok/s using identical instruction sets and hardware states.*
+*Note: The native ASDSL engine currently trails llama.cpp by ~6% in stable runs. While legacy measurements of the Python prototype showed peaks up to ~2.85 tok/s under favorable conditions, this is recognized as an anomaly to investigate (hidden caching effects, uncounted overhead, lucky scheduling) rather than a repeatable victory. The definitive throughput of the C++ pipeline is 2.56 tok/s.*
 
 ---
 
