@@ -1352,7 +1352,9 @@ void gemv_q4_32_q8_avx2(
         }
     }
 
-    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features,
+        std::max(1, out_features / asdsl::ThreadPool::get_instance().thread_count()),
+        [&](int row) {
         float acc = 0.0f;
         const uint8_t* row_blocks = blocks + row * n_groups * block_size;
         
@@ -1453,7 +1455,9 @@ void gemv_q4_32_q8_avx2_add(
         }
     }
 
-    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features,
+        std::max(1, out_features / asdsl::ThreadPool::get_instance().thread_count()),
+        [&](int row) {
         float acc = 0.0f;
         const uint8_t* row_blocks = blocks + row * n_groups * block_size;
 
@@ -1550,7 +1554,9 @@ void gemv_q4_32_q8_avx2_swiglu(
         }
     }
 
-    asdsl::ThreadPool::get_instance().parallel_for(0, inter_size, 1, [&](int row) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, inter_size,
+        std::max(1, inter_size / asdsl::ThreadPool::get_instance().thread_count()),
+        [&](int row) {
         float gate = 0.0f;
         float up = 0.0f;
         
@@ -1684,7 +1690,9 @@ void gemv_q4_32_q8_avx2_rmsnorm(
         }
     }
 
-    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features,
+        std::max(1, out_features / asdsl::ThreadPool::get_instance().thread_count()),
+        [&](int row) {
         float acc = 0.0f;
         const uint8_t* row_blocks = blocks + row * n_groups * block_size;
 
@@ -1736,8 +1744,11 @@ void gemv_asb_avx2(const uint8_t* asb_blocks, const float* x, float* y, int out_
     const uint8_t* payload_base = asb_blocks + out_features * sizeof(uint32_t) + out_features * n_groups * sizeof(uint16_t);
 
     auto& pool = asdsl::ThreadPool::get_instance();
-    pool.parallel_for(0, out_features, 4, [&](int row) {
+    pool.parallel_for(0, out_features,
+        std::max(1, out_features / pool.thread_count()),
+        [&](int row) {
         float acc = 0.0f;
+        __m256 v_global_sum = _mm256_setzero_ps();
         const uint16_t* row_perm = perm_map + row * n_groups;
         const uint8_t* payload = payload_base + row_offsets[row];
 
@@ -1746,80 +1757,61 @@ void gemv_asb_avx2(const uint8_t* asb_blocks, const float* x, float* y, int out_
             const float* x_group = x + orig_idx * group_size;
 
             uint8_t bw = payload[0];
-            
+
             uint16_t scale_h, zero_h;
             std::memcpy(&scale_h, payload + 2, 2);
             std::memcpy(&zero_h, payload + 4, 2);
-            float scale_val = fp16_to_float32(scale_h);
-            float zero_val = fp16_to_float32(zero_h);
+            // Use hardware F16C conversion (fast, single instruction on AVX2 CPUs)
+            float scale_val = _cvtsh_ss(scale_h);
+            float zero_val  = _cvtsh_ss(zero_h);
             
             payload += 8;
 
-                        if (bw == 8) {
+                        if (bw == 4) {
+                // Most common path for salience-mixed models: 4-bit
+                int bytes = group_size / 2;
                 const float* x_ptr = x_group;
                 __m256 v_scale = _mm256_set1_ps(scale_val);
                 __m256 v_zero  = _mm256_set1_ps(zero_val);
-                __m256 v_sum   = _mm256_setzero_ps();
-                
-                for (int i = 0; i < group_size; i+=8) {
-                    // Load 8 uint8_t
-                    __m128i w8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(payload + i));
-                    // Zero extend to 8 uint32_t
-                    __m256i w32 = _mm256_cvtepu8_epi32(w8);
-                    // Convert to float
-                    __m256 wf = _mm256_cvtepi32_ps(w32);
-                    // Dequantize: w * scale + zero
-                    __m256 w = _mm256_fmadd_ps(wf, v_scale, v_zero);
-                    // Load x
-                    __m256 vx = _mm256_loadu_ps(x_ptr + i);
-                    // Add to sum
-                    v_sum = _mm256_fmadd_ps(w, vx, v_sum);
-                }
-                float temp[8];
-                _mm256_storeu_ps(temp, v_sum);
-                for(int j=0; j<8; ++j) acc += temp[j];
-                
-                payload += group_size;
-            } else if (bw == 4) {
-                int bytes = group_size / 2; // 16 bytes for 32 weights
-                const float* x_ptr = x_group;
-                __m256 v_scale = _mm256_set1_ps(scale_val);
-                __m256 v_zero  = _mm256_set1_ps(zero_val);
-                __m256 v_sum   = _mm256_setzero_ps();
-                
-                for (int i = 0; i < bytes; i+=8) { // process 8 bytes = 16 weights = 2 * 8
-                    __m128i b8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(payload + i)); // 8 bytes
-                    // we want w0 = b & 0x0F, w1 = b >> 4
+                // Accumulate into persistent row-level vector sum (no per-group hsum)
+                for (int i = 0; i < bytes; i+=8) { // 8 bytes = 16 weights
+                    __m128i b8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(payload + i));
                     __m128i mask = _mm_set1_epi8(0x0F);
                     __m128i lo_nibbles = _mm_and_si128(b8, mask);
                     __m128i hi_nibbles = _mm_and_si128(_mm_srli_epi16(b8, 4), mask);
-                    
-                    // Interleaving low and high nibbles:
-                    // b0_lo, b0_hi, b1_lo, b1_hi... 
                     __m128i w16 = _mm_unpacklo_epi8(lo_nibbles, hi_nibbles);
-                    
-                    // Now w16 has 16 bytes. Process first 8
-                    __m128i w8_0 = w16; // actually first 8 bytes
+
+                    __m128i w8_0 = w16;
                     __m256i w32_0 = _mm256_cvtepu8_epi32(w8_0);
                     __m256 wf_0 = _mm256_cvtepi32_ps(w32_0);
                     __m256 w_0 = _mm256_fmadd_ps(wf_0, v_scale, v_zero);
                     __m256 vx_0 = _mm256_loadu_ps(x_ptr + i*2);
-                    v_sum = _mm256_fmadd_ps(w_0, vx_0, v_sum);
-                    
-                    // Process next 8
+                    v_global_sum = _mm256_fmadd_ps(w_0, vx_0, v_global_sum);
+
                     __m128i w8_1 = _mm_srli_si128(w16, 8);
                     __m256i w32_1 = _mm256_cvtepu8_epi32(w8_1);
                     __m256 wf_1 = _mm256_cvtepi32_ps(w32_1);
                     __m256 w_1 = _mm256_fmadd_ps(wf_1, v_scale, v_zero);
                     __m256 vx_1 = _mm256_loadu_ps(x_ptr + i*2 + 8);
-                    v_sum = _mm256_fmadd_ps(w_1, vx_1, v_sum);
+                    v_global_sum = _mm256_fmadd_ps(w_1, vx_1, v_global_sum);
                 }
-                float temp[8];
-                _mm256_storeu_ps(temp, v_sum);
-                for(int j=0; j<8; ++j) acc += temp[j];
-
                 payload += bytes;
+            } else if (bw == 8) {
+                const float* x_ptr = x_group;
+                __m256 v_scale = _mm256_set1_ps(scale_val);
+                __m256 v_zero  = _mm256_set1_ps(zero_val);
+                // Accumulate into persistent row-level vector sum (no per-group hsum)
+                for (int i = 0; i < group_size; i+=8) {
+                    __m128i w8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(payload + i));
+                    __m256i w32 = _mm256_cvtepu8_epi32(w8);
+                    __m256 wf = _mm256_cvtepi32_ps(w32);
+                    __m256 w = _mm256_fmadd_ps(wf, v_scale, v_zero);
+                    __m256 vx = _mm256_loadu_ps(x_ptr + i);
+                    v_global_sum = _mm256_fmadd_ps(w, vx, v_global_sum);
+                }
+                payload += group_size;
             } else if (bw == 2) {
+                // bw==4 is now the primary path above; bw==2 for ultra-low-precision groups
                 int bytes = group_size / 4; // 8 bytes 
                 const float* x_ptr = x_group;
                 __m256 v_scale = _mm256_set1_ps(scale_val);
@@ -1904,6 +1896,8 @@ void gemv_asb_avx2(const uint8_t* asb_blocks, const float* x, float* y, int out_
                 payload += bytes;
             }
         }
+        // Drain the persistent vector accumulator (one hsum per row, not per group)
+        acc += hsum256_ps(v_global_sum);
         y[row] = acc;
     });
 }
