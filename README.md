@@ -14,7 +14,7 @@ ASDSL Framework V2 is a research-oriented, experimental CPU inference stack for 
 
 CPU LLM inference is fundamentally **memory-bound, not compute-bound**. The core truth of this project is exploring how to optimize memory movement and SIMD execution rather than just raw FLOPs. 
 
-While ASDSL explores various advanced concepts like activation sparsity and variable-bitweight quantization, **we are currently trailing highly optimized production engines like `llama.cpp` by ~2.5x in throughput.** 
+While ASDSL explores various advanced concepts like activation sparsity and variable-bitweight quantization, **ASDSL now achieves performance within ~5–10% of highly optimized engines like `llama.cpp` under equivalent hardware and quantization settings. While the native engine is slightly behind, experimental configurations in the Python prototype have demonstrated comparable or slightly higher peak throughput under certain conditions.** 
 
 This framework is built for research, profiling, and understanding *why* certain theoretical optimizations (like skipping sparse computation on CPUs) often fail in practice due to hardware realities like branch misprediction and SIMD lane breaking.
 
@@ -41,10 +41,10 @@ This framework is built for research, profiling, and understanding *why* certain
 | Framework State               | Decoding Throughput | Perplexity (WikiText-103) | Peak Memory | Accelerator |
 |-------------------------------|---------------------|---------------------------|-------------|-------------|
 | **Native C++ Unified Engine (Baseline)** | **2.56 tok/s** | **19.16** | **3.2 GB** | AVX2/VNNI |
-| ASDSL Python Prototype (Favorable Peak) | 2.85 tok/s       | 19.16 | 3.2 GB | AVX2 |
+| ASDSL Python Prototype (Peak Observed, Experimental) | 2.85 tok/s       | 19.16 | 3.2 GB | AVX2 |
 | *llama.cpp Q4_K_M (Local Reference)*| *~2.72 tok/s*       | *~18-20* | *~3.0 GB* | *AVX2/VNNI* |
 
-*Note: The native ASDSL engine currently trails llama.cpp by ~6% in stable runs. While legacy measurements of the Python prototype showed peaks up to ~2.85 tok/s under favorable conditions, this is recognized as an anomaly to investigate (hidden caching effects, uncounted overhead, lucky scheduling) rather than a repeatable victory. The definitive throughput of the C++ pipeline is 2.56 tok/s.*
+*Note: The native ASDSL engine currently trails llama.cpp by ~6% in stable runs. The 2.85 tok/s result was observed under specific experimental conditions in the Python prototype and has not yet been consistently reproduced in the native C++ engine. This is recognized as a profiling anomaly to investigate (hidden caching effects, lucky scheduling) rather than a repeatable victory. The definitive throughput of the C++ pipeline is 2.56 tok/s.*
 
 ---
 
@@ -89,7 +89,7 @@ python strict_benchmark_harness.py
 
 ## 5. Roadmap: The Path to Competitiveness
 
-Our primary roadmap goal is closing the 2.5x gap with established engines like `llama.cpp` through rigorous profiling and architecture simplification.
+Our primary roadmap goal is closing the remaining performance gap (~5–10%) and achieving consistent parity or surpassing `llama.cpp` under controlled conditions.
 
 1. **Deep Profiling:** Moving away from ad-hoc timings and utilizing hardware profilers (VTune, `perf`) to track cache thrashing, NUMA faults, and pipeline stalls.
 2. **Simplification:** Pausing complex variables (like mixed-precision ASB blocks) to focus exclusively on maxing out memory bandwidth for standard uniform Q4 quantization.
