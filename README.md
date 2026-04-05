@@ -79,6 +79,12 @@ python run_full_benchmark.py
 ```
 *(Results are logged directly to standard output, simulating the TTFT delays and generation constraints verified during the Phase 22 profiling of the 14B model)*
 
+To run a **strict, 1:1 comparable bulletproof benchmark** against the live `C++` pipeline locally under tightly bound parameters (fixed prompt, max core affinity, N=5 iterations, greedy decoding):
+```bash
+python strict_benchmark_harness.py
+```
+*Note: `strict_benchmark_harness.py` also outputs the exact 1:1 `llama-cli` argument string required to replicate the baseline test in `llama.cpp` (including disabling hyperthreading, batch sizes, and `-n` tokens).*
+
 ---
 
 ## 5. Roadmap: The Path to Competitiveness
