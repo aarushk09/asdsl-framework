@@ -1,4 +1,0 @@
-with open('run_asb_mock.py') as f: text = f.read()
-text = text.replace('> class', 'class')
-text = text.replace('      def', '    def')
-with open('run_asb_mock.py', 'w') as f: f.write(text)
