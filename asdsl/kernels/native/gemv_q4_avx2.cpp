@@ -1308,10 +1308,14 @@ void gemv_q4_32_q8_avx2(
     const int n_groups = in_features / group_size;
     const int block_size = 18; // 2 byte fp16 scale + 16 byte data
 
-    std::vector<int8_t> x_q8_buf(in_features);
-    std::vector<float> x_scales_buf(n_groups);
-    int8_t* x_q8 = x_q8_buf.data();
-    float* x_scales = x_scales_buf.data();
+    // Thread-local scratch: zero allocation on every call after the first.
+    // Phi-4 max in_features = 17920 (gate_up), max n_groups = 17920/32 = 560.
+    constexpr int QGEMV_MAX_IN = 20480;
+    constexpr int QGEMV_MAX_NG = 640;
+    thread_local static int8_t tl_x_q8[QGEMV_MAX_IN];
+    thread_local static float  tl_x_scales[QGEMV_MAX_NG];
+    int8_t* x_q8    = tl_x_q8;
+    float*  x_scales = tl_x_scales;
 
     // Pre-quantize x to Q8 per group (SIMD logic can be borrowed from gemv_q4_q8_avx2)
     for (int g = 0; g < n_groups; g++) {
@@ -1411,10 +1415,10 @@ void gemv_q4_32_q8_avx2_add(
     const int n_groups = in_features / group_size;
     const int block_size = 18; // 2 byte fp16 scale + 16 byte data
 
-    std::vector<int8_t> x_q8_buf(in_features);
-    std::vector<float> x_scales_buf(n_groups);
-    int8_t* x_q8 = x_q8_buf.data();
-    float* x_scales = x_scales_buf.data();
+    thread_local static int8_t tl_x_q8_add[20480];
+    thread_local static float  tl_x_scales_add[640];
+    int8_t* x_q8    = tl_x_q8_add;
+    float*  x_scales = tl_x_scales_add;
 
     // Pre-quantize x to Q8 per group
     for (int g = 0; g < n_groups; g++) {
@@ -1511,10 +1515,10 @@ void gemv_q4_32_q8_avx2_swiglu(
     const int n_groups = in_features / group_size;
     const int block_size = 18;
 
-    std::vector<int8_t> x_q8_buf(in_features);
-    std::vector<float> x_scales_buf(n_groups);
-    int8_t* x_q8 = x_q8_buf.data();
-    float* x_scales = x_scales_buf.data();
+    thread_local static int8_t tl_x_q8_swiglu[20480];
+    thread_local static float  tl_x_scales_swiglu[640];
+    int8_t* x_q8    = tl_x_q8_swiglu;
+    float*  x_scales = tl_x_scales_swiglu;
 
     for (int g = 0; g < n_groups; g++) {
         const float* xg = x + g * group_size;
@@ -1622,10 +1626,10 @@ void gemv_q4_32_q8_avx2_rmsnorm(
     const int n_groups = in_features / group_size;
     const int block_size = 18;
 
-    std::vector<int8_t> x_q8_buf(in_features);
-    std::vector<float> x_scales_buf(n_groups);
-    int8_t* x_q8 = x_q8_buf.data();
-    float* x_scales = x_scales_buf.data();
+    thread_local static int8_t tl_x_q8_rms[20480];
+    thread_local static float  tl_x_scales_rms[640];
+    int8_t* x_q8    = tl_x_q8_rms;
+    float*  x_scales = tl_x_scales_rms;
 
     // 1) Compute RMS
     float sum_sq = 0.0f;

@@ -276,15 +276,41 @@ void UnifiedEngine::compute_attention_flash_q8(float* out, const float* q, int l
 
 static void gemv_f32_f32_omp(const float* W, const float* x, float* y, int rows, int cols) {
     auto& pool = get_global_thread_pool();
-    pool.parallel_for(0, rows, 64, [&](int i) {
-        float sum = 0.0f;
-        const float* w_row = W + i * cols;
-        for (int j = 0; j < cols; ++j) {
-            sum += w_row[j] * x[j];
+    const int grain = std::max(1, rows / pool.thread_count());
+    pool.parallel_for(0, rows, grain, [&](int i) {
+        const float* w_row = W + (size_t)i * cols;
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        int j = 0;
+        // Unrolled 4× AVX2 FMA: 32 floats per iteration
+        for (; j + 32 <= cols; j += 32) {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j),      _mm256_loadu_ps(x + j),      acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j + 8),  _mm256_loadu_ps(x + j + 8),  acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j + 16), _mm256_loadu_ps(x + j + 16), acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j + 24), _mm256_loadu_ps(x + j + 24), acc3);
         }
+        // Tail: remaining 8-float chunks
+        for (; j + 8 <= cols; j += 8) {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j), _mm256_loadu_ps(x + j), acc0);
+        }
+        // Horizontal sum of all accumulators
+        acc0 = _mm256_add_ps(acc0, acc1);
+        acc2 = _mm256_add_ps(acc2, acc3);
+        acc0 = _mm256_add_ps(acc0, acc2);
+        __m128 hi = _mm256_extractf128_ps(acc0, 1);
+        __m128 lo = _mm256_castps256_ps128(acc0);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        float sum = _mm_cvtss_f32(lo);
+        // Scalar tail
+        for (; j < cols; ++j) sum += w_row[j] * x[j];
         y[i] = sum;
     });
 }
+
 
 
 void UnifiedEngine::forward_batch(const int32_t* tokens, int num_tokens, int start_pos, float* out_logits, bool all_logits) {

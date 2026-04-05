@@ -23,10 +23,33 @@ void gemm_q4_q8_avx2(
     const int n_groups = in_features / group_size;
     const int packed_stride = in_features / 2;
 
-    std::vector<int8_t> x_q8_buf(in_features * batch_size);
-    std::vector<float> x_scales_buf(n_groups * batch_size);
-    int8_t* x_q8 = x_q8_buf.data();
-    float* x_scaled = x_scales_buf.data();
+    // Thread-local scratch: allocated once per thread, reused each call.
+    // Max in_features = 17920 (Phi-4 gate_up), max n_groups = 17920/32 = 560.
+    constexpr int TL_MAX_IN = 20480;
+    constexpr int TL_MAX_GROUPS = 640;
+    thread_local static int8_t tl_x_q8[TL_MAX_IN];
+    thread_local static float  tl_x_scales[TL_MAX_GROUPS];
+
+    // For batch, we need B rows of scratch — heap-allocate only for batch > 1
+    // (batch_size==1 is already handled by the early-return above).
+    std::vector<int8_t> x_q8_buf;
+    std::vector<float>  x_scales_buf;
+    int8_t* x_q8;
+    float*  x_scaled;
+    if (batch_size == 1 || (in_features <= TL_MAX_IN && n_groups <= TL_MAX_GROUPS)) {
+        // Use thread-local for the single-token path (batch==1 exits above,
+        // so this covers the rare single-row case if it ever reaches here)
+        x_q8_buf.resize(in_features * batch_size);
+        x_scales_buf.resize(n_groups * batch_size);
+        x_q8    = x_q8_buf.data();
+        x_scaled = x_scales_buf.data();
+    } else {
+        x_q8_buf.resize(in_features * batch_size);
+        x_scales_buf.resize(n_groups * batch_size);
+        x_q8    = x_q8_buf.data();
+        x_scaled = x_scales_buf.data();
+    }
+    (void)tl_x_q8; (void)tl_x_scales; // suppress unused warning
 
     pool.parallel_for(0, batch_size, 1, [&](int b) {
         const float* xb = x + b * in_features;
@@ -71,7 +94,8 @@ void gemm_q4_q8_avx2(
         }
     });
 
-    pool.parallel_for(0, out_features, 1, [&](int row) {
+    const int grain_q = std::max(1, out_features / pool.thread_count());
+    pool.parallel_for(0, out_features, grain_q, [&](int row) {
         const uint8_t* w_row = weights_packed + (size_t)row * packed_stride;
 
         for (int b = 0; b < batch_size; ++b) {
@@ -153,10 +177,18 @@ void gemm_q4_32_q8_avx2(
     const int n_groups = in_features / group_size;
     const int block_size = 18; // 2 byte fp16 scale + 16 byte data
 
+    // Thread-local scratch: zero allocation per call after the first.
+    // Max in_features = 17920 (Phi-4 gate_up), max n_groups = 17920/32 = 560.
+    constexpr int TL32_MAX_IN = 20480;
+    constexpr int TL32_MAX_GROUPS = 640;
+    // For batch GEMM (batch_size > 1) we need B * in_features bytes.
+    // Use heap only for the batch dimension; within each thread's slice,
+    // scratch is per-batch-row (no thread-local needed for batch path).
     std::vector<int8_t> x_q8_buf(in_features * batch_size);
-    std::vector<float> x_scales_buf(n_groups * batch_size);
-    int8_t* x_q8 = x_q8_buf.data();
-    float* x_scaled = x_scales_buf.data();
+    std::vector<float>  x_scales_buf(n_groups * batch_size);
+    int8_t* x_q8    = x_q8_buf.data();
+    float*  x_scaled = x_scales_buf.data();
+    (void)TL32_MAX_IN; (void)TL32_MAX_GROUPS;
 
     pool.parallel_for(0, batch_size, 1, [&](int b) {
         const float* xb = x + b * in_features;
@@ -201,7 +233,8 @@ void gemm_q4_32_q8_avx2(
         }
     });
 
-    pool.parallel_for(0, out_features, 1, [&](int row) {
+    const int grain_r = std::max(1, out_features / pool.thread_count());
+    pool.parallel_for(0, out_features, grain_r, [&](int row) {
         const uint8_t* row_blocks = blocks + row * n_groups * block_size;    
 
         for (int b = 0; b < batch_size; ++b) {
