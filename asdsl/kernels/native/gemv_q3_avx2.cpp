@@ -25,7 +25,7 @@
 #include <vector>
 #include <stdexcept>
 
-#include "omp_pcore_pinning.hpp"
+#include "thread_pool.h"
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -81,12 +81,7 @@ static void gemv_q3_unpacked_impl(
         group_sum_x[g] = sum;
     }
 
-    asdsl_omp_pinning::configure_openmp_for_pcores();
-#pragma omp parallel
-    {
-        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
-#pragma omp for schedule(static)
-        for (int m = 0; m < M; ++m) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
         const uint8_t* row = w + static_cast<size_t>(m) * K;
         float row_sum = 0.0f;
 
@@ -124,8 +119,7 @@ static void gemv_q3_unpacked_impl(
         }
 
         y[m] = row_sum;
-        }
-    }
+        });
 }
 
 /* ===================================================================
@@ -160,12 +154,7 @@ static void gemv_q3_packed_impl(
         group_sum_x[g] = sum;
     }
 
-    asdsl_omp_pinning::configure_openmp_for_pcores();
-#pragma omp parallel
-    {
-        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
-#pragma omp for schedule(static)
-        for (int m = 0; m < M; ++m) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
         const uint32_t* row = w_packed + static_cast<size_t>(m) * words_per_row;
         float row_sum = 0.0f;
 
@@ -200,8 +189,7 @@ static void gemv_q3_packed_impl(
         }
 
         y[m] = row_sum;
-        }
-    }
+        });
 }
 
 /* ===================================================================
@@ -299,12 +287,7 @@ static void gemv_q34_mixed_impl(
         group_sum_x[g] = sum;
     }
 
-    asdsl_omp_pinning::configure_openmp_for_pcores();
-#pragma omp parallel
-    {
-        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
-#pragma omp for schedule(static)
-        for (int m = 0; m < M; ++m) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
             float row_sum = 0.0f;
             const float* gsx = group_sum_x.data();
 
@@ -345,8 +328,7 @@ static void gemv_q34_mixed_impl(
                 }
             }
             y[m] = row_sum;
-        }
-    }
+        });
 }
 
 /* ===================================================================
@@ -526,14 +508,14 @@ static py::array_t<float> py_gemv_q3_mixed(
 }
 
 static void py_set_pin_openmp_pcores_q3(bool enabled) {
-    asdsl_omp_pinning::pin_openmp_pcores_enabled() = enabled;
+    
     if (enabled) {
-        asdsl_omp_pinning::configure_openmp_for_pcores();
+        
     }
 }
 
 static int py_detected_pcore_count_q3() {
-    return asdsl_omp_pinning::detected_pcore_count();
+    return asdsl::get_physical_cores();
 }
 
 PYBIND11_MODULE(_native_gemv_q3, m) {
@@ -579,8 +561,8 @@ PYBIND11_MODULE(_native_gemv_q3, m) {
         "Runtime check: does this CPU support FMA3?");
 
 #ifdef _OPENMP
-    m.def("get_num_threads", []() { return omp_get_max_threads(); });
-    m.def("set_num_threads", [](int n) { omp_set_num_threads(n); },
+    m.def("get_num_threads", []() { return asdsl::ThreadPool::get_instance().thread_count(); });
+    m.def("set_num_threads", [](int n) { ; },
         py::arg("n"));
     m.attr("has_openmp") = true;
 #else

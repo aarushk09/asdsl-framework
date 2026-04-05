@@ -49,7 +49,7 @@
 #endif
 
 #ifdef _OPENMP
-#include <omp.h>
+#include "thread_pool.h"
 #endif
 
 namespace py = pybind11;
@@ -190,8 +190,8 @@ void gemv_q4_q8_avx2(
     }
     
     // Row-parallel integer GEMV
-    #pragma omp parallel for schedule(static)
-    for (int row = 0; row < out_features; row++) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+
         float acc = 0.0f;
         const uint8_t* w_row = weights_packed + (size_t)row * packed_stride;
         
@@ -245,7 +245,8 @@ void gemv_q4_q8_avx2(
             acc += (float)dot_int * w_scale * x_scale;
         }
         y[row] = acc;
-    }
+        });
+
     
     // std::vector automatically frees memory when it goes out of scope
 }
@@ -295,8 +296,8 @@ void gemv_q4km_q8_avx2(
         }
     }
 
-    #pragma omp parallel for schedule(static)
-    for (int row = 0; row < out_features; ++row) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+
         const uint8_t* row_ptr = weights_q4km +
             static_cast<size_t>(row) * n_blocks_per_row * Q4K_BLOCK_SIZE;
         float acc = 0.0f;
@@ -347,7 +348,8 @@ void gemv_q4km_q8_avx2(
         }
 
         y[row] = acc;
-    }
+        });
+
 }
 
 /**
@@ -387,7 +389,7 @@ static inline __m256 cvt_lo8_u8_ps(__m128i bytes) {
  * FP32 conversion happens only once per group for the scale/bias step.
  * =================================================================== */
 
-static void gemv_q4_packed_impl(
+void gemv_q4_packed_impl(
     const uint8_t* __restrict w_packed,
     const float*   __restrict x,
     const float*   __restrict scales,
@@ -443,8 +445,8 @@ static void gemv_q4_packed_impl(
     }
 
     // Phase 2: row-parallel fused in-register unpack + integer dot product.
-    #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; ++m) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
+
         const uint8_t* row = w_packed + static_cast<size_t>(m) * packed_stride;
         float row_sum = 0.0f;
 
@@ -582,7 +584,8 @@ static void gemv_q4_packed_impl(
         }
 
         y[m] = row_sum;
-    }
+        });
+
 }
 
 /* ===================================================================
@@ -592,7 +595,7 @@ static void gemv_q4_packed_impl(
  * group before applying the affine correction.
  * =================================================================== */
 
-static void gemv_q4_packed_impl_v2(
+void gemv_q4_packed_impl_v2(
     const uint8_t* __restrict w_packed,
     const float*   __restrict x,
     const float*   __restrict scales,
@@ -618,8 +621,8 @@ static void gemv_q4_packed_impl_v2(
     // Phase 2: row-parallel fused dequant + dot product.
     // In-register unpacking: load packed bytes, extract nibbles with
     // shift+AND, interleave to linear order, then FMA with x.
-    #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; ++m) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
+
         const uint8_t* row = w_packed + static_cast<size_t>(m) * packed_stride;
         float row_sum = 0.0f;
 
@@ -674,14 +677,15 @@ static void gemv_q4_packed_impl_v2(
         }
 
         y[m] = row_sum;
-    }
+        });
+
 }
 
 /* ===================================================================
  * Core Kernel: Unpacked uint8 GEMV (drop-in for WeightStore path)
  * =================================================================== */
 
-static void gemv_q4_unpacked_impl(
+void gemv_q4_unpacked_impl(
     const uint8_t* __restrict w,
     const float*   __restrict x,
     const float*   __restrict scales,
@@ -701,8 +705,8 @@ static void gemv_q4_unpacked_impl(
         group_sum_x[g] = hsum256_ps(acc);
     }
 
-    #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; ++m) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
+
         const uint8_t* row = w + static_cast<size_t>(m) * K;
         float row_sum = 0.0f;
 
@@ -730,7 +734,8 @@ static void gemv_q4_unpacked_impl(
         }
 
         y[m] = row_sum;
-    }
+        });
+
 }
 
 /* ===================================================================
@@ -854,7 +859,7 @@ static void validate_gemv_args(
  * Y_batch: [batch_size, M] row-major float32, CALLER ZERO-INITIALISED.
  * =================================================================== */
 
-static void matmul_batch_q4_impl(
+void matmul_batch_q4_impl(
     const uint8_t* __restrict w_packed,   // [M, K/2]
     const float*   __restrict scales,     // [M * (K/group_size)]
     const float*   __restrict biases,     // [M * (K/group_size)]
@@ -865,8 +870,8 @@ static void matmul_batch_q4_impl(
     const int n_groups     = K / group_size;
     const int packed_stride = K / 2;   // packed bytes per output row
 
-    #pragma omp parallel for schedule(static)
-    for (int r = 0; r < M; ++r) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int r) {
+
         const uint8_t* row_w = w_packed + (size_t)r * packed_stride;
 
         float acc[64] = {};
@@ -923,7 +928,8 @@ static void matmul_batch_q4_impl(
         for (int b = 0; b < B && b < 64; ++b) {
             Y_batch[(size_t)b * M + r] = acc[b];
         }
-    }
+        });
+
 }
 
 /* PyBind11 wrapper */
@@ -1271,9 +1277,9 @@ Modifies Y_batch in-place (adds to it — caller should zero before calling).
         "Runtime check: does this CPU support AVX-512 VNNI?");
 
 #ifdef _OPENMP
-    m.def("get_num_threads", []() { return omp_get_max_threads(); },
+    m.def("get_num_threads", []() { return asdsl::ThreadPool::get_instance().thread_count(); },
         "Get max OpenMP thread count.");
-    m.def("set_num_threads", [](int n) { omp_set_num_threads(n); },
+    m.def("set_num_threads", [](int n) {  },
         "Set OpenMP thread count.", py::arg("n"));
     m.attr("has_openmp") = true;
 #else
@@ -1282,4 +1288,622 @@ Modifies Y_batch in-place (adds to it — caller should zero before calling).
         "No-op: built without OpenMP.", py::arg("n"));
     m.attr("has_openmp") = false;
 #endif
+}
+
+
+// Helper for FP16 -> FP32 conversion
+inline float _cvtsh_ss(unsigned short x) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16(x)));
+}
+
+// 18-byte Block (fp16 scale + 16 uint8 data)
+void gemv_q4_32_q8_avx2(
+    const uint8_t* blocks,
+    const float*   x,
+    float*         y,
+    int            out_features,
+    int            in_features,
+    int            group_size
+) {
+    const int n_groups = in_features / group_size;
+    const int block_size = 18; // 2 byte fp16 scale + 16 byte data
+
+    std::vector<int8_t> x_q8_buf(in_features);
+    std::vector<float> x_scales_buf(n_groups);
+    int8_t* x_q8 = x_q8_buf.data();
+    float* x_scales = x_scales_buf.data();
+
+    // Pre-quantize x to Q8 per group (SIMD logic can be borrowed from gemv_q4_q8_avx2)
+    for (int g = 0; g < n_groups; g++) {
+        const float* xg = x + g * group_size;
+        int8_t* xq = x_q8 + g * group_size;
+        
+        __m256 max_abs = _mm256_setzero_ps();
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 v = _mm256_loadu_ps(xg + j);
+            __m256 a = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+            max_abs = _mm256_max_ps(max_abs, a);
+        }
+        __m128 lo = _mm256_castps256_ps128(max_abs);
+        __m128 hi = _mm256_extractf128_ps(max_abs, 1);
+        lo = _mm_max_ps(lo, hi);
+        lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_max_ps(lo, _mm_movehdup_ps(lo));
+        float amax = _mm_cvtss_f32(lo);
+
+        if (amax < 1e-9f) {
+            memset(xq, 0, group_size);
+            x_scales[g] = 1.0f;
+            continue;
+        }
+
+        float scale = amax / 127.0f;
+        float inv_scale = 127.0f / amax;
+        x_scales[g] = scale;
+
+        __m256 vscale = _mm256_set1_ps(inv_scale);
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 v = _mm256_loadu_ps(xg + j);
+            __m256 scaled = _mm256_mul_ps(v, vscale);
+            __m256i int32 = _mm256_cvtps_epi32(scaled);
+            __m128i int16 = _mm_packs_epi32(_mm256_castsi256_si128(int32), _mm256_extracti128_si256(int32, 1));
+            __m128i int8 = _mm_packs_epi16(int16, int16);
+            _mm_storel_epi64((__m128i*)(xq + j), int8);
+        }
+    }
+
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+        float acc = 0.0f;
+        const uint8_t* row_blocks = blocks + row * n_groups * block_size;
+        
+        for (int g = 0; g < n_groups; g++) {
+            const uint8_t* block = row_blocks + g * block_size;
+            
+            // Decode fp16 scale
+            uint16_t scale_fp16;
+            memcpy(&scale_fp16, block, 2);
+            float w_scale = _cvtsh_ss(scale_fp16);
+
+            const uint8_t* w_group = block + 2;
+            const int8_t* x_group_q8 = x_q8 + g * group_size;
+            float x_scale = x_scales[g];
+
+            __m256i acc_int = _mm256_setzero_si256();
+            const __m128i mask_nibble = _mm_set1_epi8(0x0F);
+            const __m256i eight_256 = _mm256_set1_epi16(8);
+
+            for (int i = 0; i < group_size; i += 32) {
+                __m128i packed = _mm_loadu_si128((const __m128i*)(w_group + i / 2));
+                __m128i lo = _mm_and_si128(packed, mask_nibble);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_nibble);
+                
+                __m128i w0_15_u8 = _mm_unpacklo_epi8(lo, hi);
+                __m128i w16_31_u8 = _mm_unpackhi_epi8(lo, hi);
+                
+                __m256i w0_15 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w0_15_u8), eight_256);
+                __m256i w16_31 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w16_31_u8), eight_256);
+
+                __m256i x0_15 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i)));
+                __m256i x16_31 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i + 16)));
+
+                acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w0_15, x0_15));
+                acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w16_31, x16_31));
+            }
+            int32_t dot_int = hsum256_epi32(acc_int);
+            acc += dot_int * w_scale * x_scale;
+        }
+        y[row] = acc;
+    });
+}
+
+
+
+void gemv_q4_32_q8_avx2_add(
+    const uint8_t* blocks,
+    const float*   x,
+    float*         y,   // acts as accumulator
+    int            out_features,
+    int            in_features,
+    int            group_size
+) {
+    const int n_groups = in_features / group_size;
+    const int block_size = 18; // 2 byte fp16 scale + 16 byte data
+
+    std::vector<int8_t> x_q8_buf(in_features);
+    std::vector<float> x_scales_buf(n_groups);
+    int8_t* x_q8 = x_q8_buf.data();
+    float* x_scales = x_scales_buf.data();
+
+    // Pre-quantize x to Q8 per group
+    for (int g = 0; g < n_groups; g++) {
+        const float* xg = x + g * group_size;
+        int8_t* xq = x_q8 + g * group_size;
+
+        __m256 max_abs = _mm256_setzero_ps();
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 v = _mm256_loadu_ps(xg + j);
+            __m256 a = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+            max_abs = _mm256_max_ps(max_abs, a);
+        }
+        __m128 lo = _mm256_castps256_ps128(max_abs);
+        __m128 hi = _mm256_extractf128_ps(max_abs, 1);
+        lo = _mm_max_ps(lo, hi);
+        lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_max_ps(lo, _mm_movehdup_ps(lo));
+        float amax = _mm_cvtss_f32(lo);
+
+        if (amax < 1e-9f) {
+            memset(xq, 0, group_size);
+            x_scales[g] = 1.0f;
+            continue;
+        }
+
+        float scale = amax / 127.0f;
+        float inv_scale = 127.0f / amax;
+        x_scales[g] = scale;
+
+        __m256 vscale = _mm256_set1_ps(inv_scale);
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 v = _mm256_loadu_ps(xg + j);
+            __m256 scaled = _mm256_mul_ps(v, vscale);
+            __m256i int32 = _mm256_cvtps_epi32(scaled);
+            __m128i int16 = _mm_packs_epi32(_mm256_castsi256_si128(int32), _mm256_extracti128_si256(int32, 1));
+            __m128i int8 = _mm_packs_epi16(int16, int16);
+            _mm_storel_epi64((__m128i*)(xq + j), int8);
+        }
+    }
+
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+        float acc = 0.0f;
+        const uint8_t* row_blocks = blocks + row * n_groups * block_size;
+
+        for (int g = 0; g < n_groups; g++) {
+            const uint8_t* block = row_blocks + g * block_size;
+            uint16_t scale_fp16;
+            memcpy(&scale_fp16, block, 2);
+            float w_scale = _cvtsh_ss(scale_fp16);
+
+            const uint8_t* w_group = block + 2;
+            const int8_t* x_group_q8 = x_q8 + g * group_size;
+            float x_scale = x_scales[g];
+
+            __m256i acc_int = _mm256_setzero_si256();
+            const __m128i mask_nibble = _mm_set1_epi8(0x0F);
+            const __m256i eight_256 = _mm256_set1_epi16(8);
+
+            for (int i = 0; i < group_size; i += 32) {
+                __m128i packed = _mm_loadu_si128((const __m128i*)(w_group + i / 2));
+                __m128i lo = _mm_and_si128(packed, mask_nibble);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_nibble);
+
+                __m128i w0_15_u8 = _mm_unpacklo_epi8(lo, hi);
+                __m128i w16_31_u8 = _mm_unpackhi_epi8(lo, hi);
+                __m256i w0_15 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w0_15_u8), eight_256);
+                __m256i w16_31 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w16_31_u8), eight_256);
+
+                __m256i x0_15 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i)));
+                __m256i x16_31 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i + 16)));
+
+                acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w0_15, x0_15));
+                acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w16_31, x16_31));
+            }
+            int32_t dot_int = hsum256_epi32(acc_int);
+            acc += dot_int * w_scale * x_scale;
+        }
+        y[row] += acc; // The crucial diff for O_proj and Down_proj
+    });
+}
+
+
+
+void gemv_q4_32_q8_avx2_swiglu(
+    const uint8_t* blocks,   // gate_up proj weights
+    const float*   x,        // hidden norm
+    float*         y,        // swiglu output (size: intermediate_size)
+    int            inter_size, // out_features is 2 * inter_size, but we output inter_size 
+    int            in_features,
+    int            group_size
+) {
+    const int n_groups = in_features / group_size;
+    const int block_size = 18;
+
+    std::vector<int8_t> x_q8_buf(in_features);
+    std::vector<float> x_scales_buf(n_groups);
+    int8_t* x_q8 = x_q8_buf.data();
+    float* x_scales = x_scales_buf.data();
+
+    for (int g = 0; g < n_groups; g++) {
+        const float* xg = x + g * group_size;
+        int8_t* xq = x_q8 + g * group_size;
+
+        __m256 max_abs = _mm256_setzero_ps();
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 v = _mm256_loadu_ps(xg + j);
+            __m256 a = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+            max_abs = _mm256_max_ps(max_abs, a);
+        }
+        __m128 lo = _mm256_castps256_ps128(max_abs);
+        __m128 hi = _mm256_extractf128_ps(max_abs, 1);
+        lo = _mm_max_ps(lo, hi);
+        lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_max_ps(lo, _mm_movehdup_ps(lo));
+        float amax = _mm_cvtss_f32(lo);
+
+        if (amax < 1e-9f) {
+            memset(xq, 0, group_size);
+            x_scales[g] = 1.0f;
+            continue;
+        }
+
+        float scale = amax / 127.0f;
+        float inv_scale = 127.0f / amax;
+        x_scales[g] = scale;
+
+        __m256 vscale = _mm256_set1_ps(inv_scale);
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 v = _mm256_loadu_ps(xg + j);
+            __m256 scaled = _mm256_mul_ps(v, vscale);
+            __m256i int32 = _mm256_cvtps_epi32(scaled);
+            __m128i int16 = _mm_packs_epi32(_mm256_castsi256_si128(int32), _mm256_extracti128_si256(int32, 1));
+            __m128i int8 = _mm_packs_epi16(int16, int16);
+            _mm_storel_epi64((__m128i*)(xq + j), int8);
+        }
+    }
+
+    asdsl::ThreadPool::get_instance().parallel_for(0, inter_size, 1, [&](int row) {
+        float gate = 0.0f;
+        float up = 0.0f;
+        
+        // Gate is row, Up is row + inter_size
+        const uint8_t* row_gate_blocks = blocks + row * n_groups * block_size;
+        const uint8_t* row_up_blocks = blocks + (row + inter_size) * n_groups * block_size;
+
+        for (int p = 0; p < 2; p++) { // 0 for gate, 1 for up
+            const uint8_t* row_block_p = (p == 0 ? row_gate_blocks : row_up_blocks);
+            for (int g = 0; g < n_groups; g++) {
+                const int8_t* x_group_q8 = x_q8 + g * group_size;
+                float x_scale = x_scales[g];
+                const uint8_t* block = row_block_p + g * block_size;
+                uint16_t scale_fp16;
+                memcpy(&scale_fp16, block, 2);
+                float w_scale = _cvtsh_ss(scale_fp16);
+                
+                const uint8_t* w_group = block + 2;
+                __m256i acc_int = _mm256_setzero_si256();
+                const __m128i mask_nibble = _mm_set1_epi8(0x0F);
+                const __m256i eight_256 = _mm256_set1_epi16(8);
+
+                for (int i = 0; i < group_size; i += 32) {
+                    __m128i packed = _mm_loadu_si128((const __m128i*)(w_group + i / 2));
+                    __m128i lo = _mm_and_si128(packed, mask_nibble);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_nibble);
+
+                    __m128i w0_15_u8 = _mm_unpacklo_epi8(lo, hi);
+                    __m128i w16_31_u8 = _mm_unpackhi_epi8(lo, hi);
+                    __m256i w0_15 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w0_15_u8), eight_256);
+                    __m256i w16_31 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w16_31_u8), eight_256);
+
+                    __m256i x0_15 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i)));
+                    __m256i x16_31 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i + 16)));
+
+                    acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w0_15, x0_15));
+                    acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w16_31, x16_31));
+                }
+                int32_t dot_int = hsum256_epi32(acc_int);
+                if (p == 0) gate += dot_int * w_scale * x_scale;
+                else        up += dot_int * w_scale * x_scale;
+            }
+        }
+        
+        // SwiGLU fusion (x * sigmoid(x) * y)
+        float sig = 1.0f / (1.0f + std::exp(-gate));
+        y[row] = gate * sig * up;
+    });
+}
+
+
+
+void gemv_q4_32_q8_avx2_rmsnorm(
+    const uint8_t* blocks,
+    const float*   x,
+    float*         y,
+    int            out_features,
+    int            in_features,
+    int            group_size,
+    const float*   rms_weight,
+    float          rms_eps
+) {
+    const int n_groups = in_features / group_size;
+    const int block_size = 18;
+
+    std::vector<int8_t> x_q8_buf(in_features);
+    std::vector<float> x_scales_buf(n_groups);
+    int8_t* x_q8 = x_q8_buf.data();
+    float* x_scales = x_scales_buf.data();
+
+    // 1) Compute RMS
+    float sum_sq = 0.0f;
+    int i = 0;
+    __m256 v_sum = _mm256_setzero_ps();
+    for (; i + 8 <= in_features; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        v_sum = _mm256_add_ps(v_sum, _mm256_mul_ps(vx, vx));
+    }
+    float sum_sq_arr[8];
+    _mm256_storeu_ps(sum_sq_arr, v_sum);
+    for (int j = 0; j < 8; ++j) sum_sq += sum_sq_arr[j];
+    for (; i < in_features; ++i) {
+        sum_sq += x[i] * x[i];
+    }
+    float inv_rms = 1.0f / std::sqrt(sum_sq / in_features + rms_eps);
+
+    // 2) Scale with RMS and Pre-quantize
+    __m256 v_inv_rms = _mm256_set1_ps(inv_rms);
+    for (int g = 0; g < n_groups; g++) {
+        const float* xg = x + g * group_size;
+        const float* rwg = rms_weight + g * group_size;
+        int8_t* xq = x_q8 + g * group_size;
+
+        __m256 max_abs = _mm256_setzero_ps();
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 vx = _mm256_loadu_ps(xg + j);
+            __m256 rw = _mm256_loadu_ps(rwg + j);
+            __m256 v = _mm256_mul_ps(_mm256_mul_ps(vx, v_inv_rms), rw);
+            __m256 a = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+            max_abs = _mm256_max_ps(max_abs, a);
+        }
+        
+        __m128 lo = _mm256_castps256_ps128(max_abs);
+        __m128 hi = _mm256_extractf128_ps(max_abs, 1);
+        lo = _mm_max_ps(lo, hi);
+        lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_max_ps(lo, _mm_movehdup_ps(lo));
+        float amax = _mm_cvtss_f32(lo);
+
+        if (amax < 1e-9f) {
+            memset(xq, 0, group_size);
+            x_scales[g] = 1.0f;
+            continue;
+        }
+
+        float scale = amax / 127.0f;
+        float inv_scale = 127.0f / amax;
+        x_scales[g] = scale;
+
+        __m256 vscale = _mm256_set1_ps(inv_scale);
+        for (int j = 0; j < group_size; j += 8) {
+            __m256 vx = _mm256_loadu_ps(xg + j);
+            __m256 rw = _mm256_loadu_ps(rwg + j);
+            __m256 v = _mm256_mul_ps(_mm256_mul_ps(vx, v_inv_rms), rw);
+            
+            __m256 scaled = _mm256_mul_ps(v, vscale);
+            __m256i int32 = _mm256_cvtps_epi32(scaled);
+            __m128i int16 = _mm_packs_epi32(_mm256_castsi256_si128(int32), _mm256_extracti128_si256(int32, 1));
+            __m128i int8 = _mm_packs_epi16(int16, int16);
+            _mm_storel_epi64((__m128i*)(xq + j), int8);
+        }
+    }
+
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+        float acc = 0.0f;
+        const uint8_t* row_blocks = blocks + row * n_groups * block_size;
+
+        for (int g = 0; g < n_groups; g++) {
+            const uint8_t* block = row_blocks + g * block_size;
+            
+            uint16_t scale_fp16;
+            memcpy(&scale_fp16, block, 2);
+            float w_scale = _cvtsh_ss(scale_fp16);
+
+            const uint8_t* w_group = block + 2;
+            const int8_t* x_group_q8 = x_q8 + g * group_size;
+            float x_scale = x_scales[g];
+
+            __m256i acc_int = _mm256_setzero_si256();
+            const __m128i mask_nibble = _mm_set1_epi8(0x0F);
+            const __m256i eight_256 = _mm256_set1_epi16(8);
+
+            for (int i = 0; i < group_size; i += 32) {
+                __m128i packed = _mm_loadu_si128((const __m128i*)(w_group + i / 2));
+                __m128i lo = _mm_and_si128(packed, mask_nibble);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_nibble);
+
+                __m128i w0_15_u8 = _mm_unpacklo_epi8(lo, hi);
+                __m128i w16_31_u8 = _mm_unpackhi_epi8(lo, hi);
+
+                __m256i w0_15 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w0_15_u8), eight_256);
+                __m256i w16_31 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(w16_31_u8), eight_256);
+
+                __m256i x0_15 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i)));
+                __m256i x16_31 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x_group_q8 + i + 16)));
+
+                acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w0_15, x0_15));
+                acc_int = _mm256_add_epi32(acc_int, _mm256_madd_epi16(w16_31, x16_31));
+            }
+            int32_t dot_int = hsum256_epi32(acc_int);
+            acc += dot_int * w_scale * x_scale;
+        }
+        y[row] = acc;
+    });
+}
+    // Implementation of Unified ASB (Adaptive Salience Block) decode.
+void gemv_asb_avx2(const uint8_t* asb_blocks, const float* x, float* y, int out_features, int in_features, int group_size) {
+    int n_groups = in_features / group_size;
+    
+    // Layout: [RowOffsets: out_features * 4 bytes] + [Permutations: out_features * n_groups * 2 bytes] + [Payload]
+    const uint32_t* row_offsets = reinterpret_cast<const uint32_t*>(asb_blocks);
+    const uint16_t* perm_map = reinterpret_cast<const uint16_t*>(asb_blocks + out_features * sizeof(uint32_t));
+    const uint8_t* payload_base = asb_blocks + out_features * sizeof(uint32_t) + out_features * n_groups * sizeof(uint16_t);
+
+    auto& pool = asdsl::ThreadPool::get_instance();
+    pool.parallel_for(0, out_features, 4, [&](int row) {
+        float acc = 0.0f;
+        const uint16_t* row_perm = perm_map + row * n_groups;
+        const uint8_t* payload = payload_base + row_offsets[row];
+
+        for (int g = 0; g < n_groups; ++g) {
+            uint16_t orig_idx = row_perm[g];
+            const float* x_group = x + orig_idx * group_size;
+
+            uint8_t bw = payload[0];
+            
+            uint16_t scale_h, zero_h;
+            std::memcpy(&scale_h, payload + 2, 2);
+            std::memcpy(&zero_h, payload + 4, 2);
+            float scale_val = fp16_to_float32(scale_h);
+            float zero_val = fp16_to_float32(zero_h);
+            
+            payload += 8;
+
+                        if (bw == 8) {
+                const float* x_ptr = x_group;
+                __m256 v_scale = _mm256_set1_ps(scale_val);
+                __m256 v_zero  = _mm256_set1_ps(zero_val);
+                __m256 v_sum   = _mm256_setzero_ps();
+                
+                for (int i = 0; i < group_size; i+=8) {
+                    // Load 8 uint8_t
+                    __m128i w8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(payload + i));
+                    // Zero extend to 8 uint32_t
+                    __m256i w32 = _mm256_cvtepu8_epi32(w8);
+                    // Convert to float
+                    __m256 wf = _mm256_cvtepi32_ps(w32);
+                    // Dequantize: w * scale + zero
+                    __m256 w = _mm256_fmadd_ps(wf, v_scale, v_zero);
+                    // Load x
+                    __m256 vx = _mm256_loadu_ps(x_ptr + i);
+                    // Add to sum
+                    v_sum = _mm256_fmadd_ps(w, vx, v_sum);
+                }
+                float temp[8];
+                _mm256_storeu_ps(temp, v_sum);
+                for(int j=0; j<8; ++j) acc += temp[j];
+                
+                payload += group_size;
+            } else if (bw == 4) {
+                int bytes = group_size / 2; // 16 bytes for 32 weights
+                const float* x_ptr = x_group;
+                __m256 v_scale = _mm256_set1_ps(scale_val);
+                __m256 v_zero  = _mm256_set1_ps(zero_val);
+                __m256 v_sum   = _mm256_setzero_ps();
+                
+                for (int i = 0; i < bytes; i+=8) { // process 8 bytes = 16 weights = 2 * 8
+                    __m128i b8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(payload + i)); // 8 bytes
+                    // we want w0 = b & 0x0F, w1 = b >> 4
+                    __m128i mask = _mm_set1_epi8(0x0F);
+                    __m128i lo_nibbles = _mm_and_si128(b8, mask);
+                    __m128i hi_nibbles = _mm_and_si128(_mm_srli_epi16(b8, 4), mask);
+                    
+                    // Interleaving low and high nibbles:
+                    // b0_lo, b0_hi, b1_lo, b1_hi... 
+                    __m128i w16 = _mm_unpacklo_epi8(lo_nibbles, hi_nibbles);
+                    
+                    // Now w16 has 16 bytes. Process first 8
+                    __m128i w8_0 = w16; // actually first 8 bytes
+                    __m256i w32_0 = _mm256_cvtepu8_epi32(w8_0);
+                    __m256 wf_0 = _mm256_cvtepi32_ps(w32_0);
+                    __m256 w_0 = _mm256_fmadd_ps(wf_0, v_scale, v_zero);
+                    __m256 vx_0 = _mm256_loadu_ps(x_ptr + i*2);
+                    v_sum = _mm256_fmadd_ps(w_0, vx_0, v_sum);
+                    
+                    // Process next 8
+                    __m128i w8_1 = _mm_srli_si128(w16, 8);
+                    __m256i w32_1 = _mm256_cvtepu8_epi32(w8_1);
+                    __m256 wf_1 = _mm256_cvtepi32_ps(w32_1);
+                    __m256 w_1 = _mm256_fmadd_ps(wf_1, v_scale, v_zero);
+                    __m256 vx_1 = _mm256_loadu_ps(x_ptr + i*2 + 8);
+                    v_sum = _mm256_fmadd_ps(w_1, vx_1, v_sum);
+                }
+                float temp[8];
+                _mm256_storeu_ps(temp, v_sum);
+                for(int j=0; j<8; ++j) acc += temp[j];
+
+                payload += bytes;
+            } else if (bw == 2) {
+                int bytes = group_size / 4; // 8 bytes 
+                const float* x_ptr = x_group;
+                __m256 v_scale = _mm256_set1_ps(scale_val);
+                __m256 v_zero  = _mm256_set1_ps(zero_val);
+                __m256 v_sum   = _mm256_setzero_ps();
+                
+                // Group is 32 elements. 8 bytes -> 32 elements. We loop 4 bytes = 16 elements.
+                for (int i = 0; i < bytes; i+=4) {
+                    __m128i b4 = _mm_cvtsi32_si128(*(reinterpret_cast<const int*>(payload + i))); // 4 bytes
+                    __m128i mask = _mm_set1_epi8(0x03);
+                    __m128i w0 = _mm_and_si128(b4, mask);
+                    __m128i w1 = _mm_and_si128(_mm_srli_epi16(b4, 2), mask);
+                    __m128i w2 = _mm_and_si128(_mm_srli_epi16(b4, 4), mask);
+                    __m128i w3 = _mm_and_si128(_mm_srli_epi16(b4, 6), mask);
+                    
+                    // Unpack: we have 4 bytes. w0 has 4 elements, w1 has 4, w2 has 4, w3 has 4.
+                    // Elements mapping:
+                    // b0_w0, b1_w0, b2_w0, b3_w0... (Wait, w0[byte_idx] corresponds to element(byte_idx*4 + 0))
+                    // The scalar does: for each byte...
+                    //   byte = payload[i]
+                    //   sum += (byte & 0x03) * x[0] + ((byte>>2)&0x3) * x[1] ...
+                    
+                    // So we can unpack 4 bytes into 4 int32s!
+                    // Wait, let's just do it directly.
+                    // w0 has 4 bytes (0..3). w1 has 4 bytes.
+                    __m128i w0_32 = _mm_cvtepu8_epi32(w0);
+                    __m128i w1_32 = _mm_cvtepu8_epi32(w1);
+                    __m128i w2_32 = _mm_cvtepu8_epi32(w2);
+                    __m128i w3_32 = _mm_cvtepu8_epi32(w3);
+                    
+                    // Convert to float
+                    __m128 wf0 = _mm_cvtepi32_ps(w0_32);
+                    __m128 wf1 = _mm_cvtepi32_ps(w1_32);
+                    __m128 wf2 = _mm_cvtepi32_ps(w2_32);
+                    __m128 wf3 = _mm_cvtepi32_ps(w3_32);
+                    
+                    // Dequantize (float4)
+                    __m128 v_sc128 = _mm_set1_ps(scale_val);
+                    __m128 v_z128  = _mm_set1_ps(zero_val);
+                    wf0 = _mm_fmadd_ps(wf0, v_sc128, v_z128); // e[0], e[4], e[8], e[12]
+                    wf1 = _mm_fmadd_ps(wf1, v_sc128, v_z128); // e[1], e[5], e[9], e[13]
+                    wf2 = _mm_fmadd_ps(wf2, v_sc128, v_z128); // e[2], e[6], e[10],e[14]
+                    wf3 = _mm_fmadd_ps(wf3, v_sc128, v_z128); // e[3], e[7], e[11],e[15]
+                    
+                    // Unroll X gathering
+                    // x_ptr points to 16 elements. 
+                    // Let's load 4 floats
+                    float x0 = x_ptr[0], x1 = x_ptr[1], x2 = x_ptr[2], x3 = x_ptr[3];
+                    float x4 = x_ptr[4], x5 = x_ptr[5], x6 = x_ptr[6], x7 = x_ptr[7];
+                    float x8 = x_ptr[8], x9 = x_ptr[9], x10= x_ptr[10],x11= x_ptr[11];
+                    float x12= x_ptr[12],x13= x_ptr[13],x14= x_ptr[14],x15= x_ptr[15];
+                    
+                    __m128 vx0 = _mm_set_ps(x12, x8, x4, x0); // note _mm_set_ps is (e3, e2, e1, e0) reversed
+                    __m128 vx1 = _mm_set_ps(x13, x9, x5, x1);
+                    __m128 vx2 = _mm_set_ps(x14, x10, x6, x2);
+                    __m128 vx3 = _mm_set_ps(x15, x11, x7, x3);
+                    
+                    // sum += wf0 * vx0 + ... 
+                    __m128 sum128 = _mm_fmadd_ps(wf0, vx0, _mm_fmadd_ps(wf1, vx1, _mm_fmadd_ps(wf2, vx2, _mm_mul_ps(wf3, vx3))));
+                    // reduce sum128 and add to v_sum or acc
+                    float temp_s[4];
+                    _mm_storeu_ps(temp_s, sum128);
+                    acc += temp_s[0] + temp_s[1] + temp_s[2] + temp_s[3];
+                    
+                    x_ptr += 16;
+                }
+                payload += bytes;
+            } else if (bw == 2) {
+                int bytes = group_size / 4; // 8
+                const float* x_ptr = x_group;
+                float sum = 0.0f;
+                for (int i = 0; i < bytes; i++) {
+                    uint8_t b = payload[i];
+                    float w0 = static_cast<float>(b & 0x03) * scale_val + zero_val;
+                    float w1 = static_cast<float>((b >> 2) & 0x03) * scale_val + zero_val;
+                    float w2 = static_cast<float>((b >> 4) & 0x03) * scale_val + zero_val;
+                    float w3 = static_cast<float>(b >> 6) * scale_val + zero_val;
+                    sum += w0 * x_ptr[0] + w1 * x_ptr[1] + w2 * x_ptr[2] + w3 * x_ptr[3];
+                    x_ptr += 4;
+                }
+                acc += sum;
+                payload += bytes;
+            }
+        }
+        y[row] = acc;
+    });
 }

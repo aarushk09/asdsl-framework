@@ -34,7 +34,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-#include "omp_pcore_pinning.hpp"
+#include "thread_pool.h"
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -120,12 +120,7 @@ static void fused_dequant_gemv_q8_impl(
     const int tile_groups =
         cache_tiling ? std::max(1, CACHE_K_BLOCK_FLOATS / std::max(group_size, 1)) : groups_per_row;
 
-    asdsl_omp_pinning::configure_openmp_for_pcores();
-#pragma omp parallel
-    {
-        asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
-#pragma omp for schedule(static)
-        for (int m = 0; m < M; ++m) {
+    asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
             float row_sum = 0.0f;
             const uint8_t* w_row = w + static_cast<size_t>(m) * K;
             const float* sc_row = scales + static_cast<size_t>(m) * groups_per_row;
@@ -145,8 +140,7 @@ static void fused_dequant_gemv_q8_impl(
             }
 
             y[m] = row_sum;
-        }
-    }
+        });
 }
 
 /* ===================================================================
@@ -201,14 +195,14 @@ static py::array_t<float> py_fused_dequant_gemv(
 }
 
 static void py_set_pin_openmp_pcores(bool enabled) {
-    asdsl_omp_pinning::pin_openmp_pcores_enabled() = enabled;
+    
     if (enabled) {
-        asdsl_omp_pinning::configure_openmp_for_pcores();
+        
     }
 }
 
 static int py_detected_pcore_count() {
-    return asdsl_omp_pinning::detected_pcore_count();
+    return asdsl::get_physical_cores();
 }
 
 static bool has_avx2() {

@@ -33,3 +33,7 @@ void gemv_q4_avx2(
 #ifdef __cplusplus
 }
 #endif
+
+void gemv_q4_32_q8_avx2(const uint8_t* blocks, const float* x, float* y, int out_features, int in_features, int group_size);
+void gemm_q4_32_q8_avx2(const uint8_t* blocks, const float* x, float* y, int out_features, int in_features, int group_size, int batch_size);
+void gemv_asb_avx2(const uint8_t* asb_blocks, const float* x, float* y, int out_features, int in_features, int group_size);

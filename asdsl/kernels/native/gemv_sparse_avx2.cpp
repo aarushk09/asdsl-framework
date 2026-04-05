@@ -35,7 +35,7 @@ static inline int ctz32(uint32_t v) { return __builtin_ctz(v); }
 #endif
 
 #ifdef _OPENMP
-#include <omp.h>
+#include "thread_pool.h"
 #endif
 
 namespace py = pybind11;
@@ -78,8 +78,7 @@ static void gemv_sparse_unpacked_impl(
 
     if (active_col_indices != nullptr && n_active_cols > 0) {
         // Fast path: caller provides a pre-computed list of active columns
-        #pragma omp parallel for schedule(static)
-        for (int m = 0; m < M; ++m) {
+        asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
             const uint8_t* row = w + static_cast<size_t>(m) * K;
 
             // Per-group accumulators
@@ -100,13 +99,12 @@ static void gemv_sparse_unpacked_impl(
                 row_sum += scales[gidx] * g_dot[g] + biases[gidx] * g_sumx[g];
             }
             y[m] = row_sum;
-        }
+        });
     } else {
         // Bitmask-based path: scan bitmask words
         const int n_words = (K + 31) / 32;
 
-        #pragma omp parallel for schedule(static)
-        for (int m = 0; m < M; ++m) {
+        asdsl::ThreadPool::get_instance().parallel_for(0, M, 1, [&](int m) {
             const uint8_t* row = w + static_cast<size_t>(m) * K;
 
             std::vector<float> g_dot(groups_per_row, 0.0f);
@@ -136,7 +134,7 @@ static void gemv_sparse_unpacked_impl(
                 row_sum += scales[gidx] * g_dot[g] + biases[gidx] * g_sumx[g];
             }
             y[m] = row_sum;
-        }
+        });
     }
 }
 
@@ -293,26 +291,19 @@ static void sparse_down_proj_T_impl(
     // WARNING: active rows share output (y_out), so we use critical section or reduction.
     // For correctness with OpenMP, accumulate into thread-local buffer and reduce.
 
-    int nthreads = 1;
-#ifdef _OPENMP
-    nthreads = omp_get_max_threads();
-    if (nthreads > 8) nthreads = 8;
-#endif
+    int nthreads = asdsl::ThreadPool::get_instance().thread_count();
+    if (nthreads <= 0) nthreads = 1;
 
     // Thread-local accumulation buffers to avoid false sharing
     std::vector<std::vector<float>> local_y(nthreads, std::vector<float>(out_dim, 0.0f));
 
-    #pragma omp parallel for schedule(dynamic, 4) num_threads(nthreads)
-    for (int ai = 0; ai < n_active; ai++) {
-        int thread_id = 0;
-#ifdef _OPENMP
-        thread_id = omp_get_thread_num();
-#endif
+    asdsl::ThreadPool::get_instance().parallel_for(0, n_active, 4, [&](int ai) {
+        int thread_id = ai % nthreads; // approximation as ThreadPool lacks get_thread_num
         int r = active_rows[ai];
-        if (r < 0 || r >= in_dim) continue;
+        if (r < 0 || r >= in_dim) return;
 
         float x_val = sparse_x[r];
-        if (x_val == 0.0f) continue;
+        if (x_val == 0.0f) return;
 
         const uint8_t* row_ptr = w_T_packed + static_cast<size_t>(r) * row_packed_stride;
         const float*   sc_ptr  = scales_T   + r * n_out_groups;
@@ -373,7 +364,7 @@ static void sparse_down_proj_T_impl(
                 out_g[j * 2 + 1] += s * (float((byte >> 4) & 0x0F)) + b;
             }
         }
-    }
+    });
 
     // Reduce thread-local buffers into y_out
     for (int t = 0; t < nthreads; t++) {

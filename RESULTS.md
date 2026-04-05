@@ -267,3 +267,17 @@ Current Phase 22 loader validates shape compatibility and Q4_K-only projection c
 ### Validation
 
 Full test suite: `160 passed, 1 skipped`.
+
+
+Found that QKV Matvec diverges at layer 0 token 0 in prompt_tokens:
+Python qkv dt: [-1.002170443534851, 1.654745101928711, 1.1035118103027344, 1.348406434059143] 
+C++ qkv dt: [-1.01559, 1.68162, 1.13217, 1.36389] 
+
+
+Started Step 4 testing. 4 bit. Fixing QKV bug. 
+
+### Phase 22: Native 4-bit Inference with RoPE Fix
+- Fixed half_head offset bug in RoPE unified_engine.cpp. Attention embeddings no longer corrupted.
+- Verified baseline accuracy generating 'Gravity is the force...'.
+- Current 4-bit native generation speed: **2.15 tokens/sec**.
+- Moving to next optimization step to beat llama.cpp 4-bit speeds.

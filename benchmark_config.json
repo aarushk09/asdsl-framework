@@ -1,29 +1,30 @@
 {
-  "schema_version": "1.2",
-  "locked_at_phase": 16,
-  "prompt": "",
-  "max_new_tokens": 128,
-  "threads": 8,
-  "thread_affinity": "p_cores_only",
-  "draft_k": 3,
-  "fatrelu_thresholds": "phi4_fatrelu_thresholds.json",
-  "slim_meta": "phi4_slim_meta.json",
-  "inter_profile_sleep_seconds": 3,
-  "comparison_target": {
-    "name": "llama.cpp",
-    "version": "build 08f21453a (8589)",
-    "command": "llama-bench -m phi-4-Q4_K_M.gguf -p 0 -n 128 -ngl 0 -t 12",
-    "result_tok_per_sec": 3.06,
-    "result_stddev": 0.14,
-    "threads": 12,
-    "quantization": "Q4_K_M",
-    "note": "llama.cpp uses P-core affinity (effective 8 threads), ASDSL now matches"
-  },
-  "rationale": {
-    "threads": "8 P-cores only (matching llama.cpp's effective thread affinity on Raptor Lake)",
-    "max_new_tokens": "128 matches llama.cpp -n 128",
-    "prompt": "empty matches llama.cpp -p 0",
-    "draft_k": "3 for speculative decoding profiles",
-    "p_core_affinity": "Windows SetProcessAffinityMask with mask=0xFF pins to logical CPUs 0-7 (8 P-cores)"
-  }
+    "schema_version": "1.2",
+    "locked_at_phase": 16,
+    "prompt": "",
+    "max_new_tokens": 128,
+    "threads": 8,
+    "thread_affinity": "p_cores_only",
+    "draft_k": 3,
+    "fatrelu_thresholds": "phi4_fatrelu_thresholds.json",
+    "slim_meta": "phi4_slim_meta.json",
+    "inter_profile_sleep_seconds": 3,
+    "comparison_target": {
+        "name": "llama.cpp",
+        "version": "build 08f21453a (8589)",
+        "command": "llama-bench -m phi-4-Q4_K_M.gguf -p 0 -n 128 -ngl 0 -t 12",
+        "result_tok_per_sec": 3.06,
+        "result_stddev": 0.14,
+        "threads": 12,
+        "quantization": "Q4_K_M",
+        "note": "llama.cpp uses P-core affinity (effective 8 threads), ASDSL now matches"
+    },
+    "rationale": {
+        "threads": "8 P-cores only (matching llama.cpp's effective thread affinity on Raptor Lake)",
+        "max_new_tokens": "128 matches llama.cpp -n 128",
+        "prompt": "empty matches llama.cpp -p 0",
+        "draft_k": "3 for speculative decoding profiles",
+        "p_core_affinity": "Windows SetProcessAffinityMask with mask=0xFF pins to logical CPUs 0-7 (8 P-cores)"
+    },
+    "omp_pcore_pinning": false
 }
