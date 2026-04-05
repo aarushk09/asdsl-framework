@@ -148,12 +148,18 @@ void UnifiedEngine::rope_apply_inplace(float* q, float* k, const float* cos_tabl
     }
 }
 
-void UnifiedEngine::swiglu_inplace(float* gate, float* up, int size) {
+void UnifiedEngine::swiglu_inplace(float* gate, float* up, int size, float threshold) {
     int i = 0;
     for (; i < size; ++i) {
         float x = gate[i];
         float sig = 1.0f / (1.0f + std::exp(-x));
-        gate[i] = x * sig * up[i];
+        float val = x * sig * up[i];
+        
+        if (threshold > 0.0f && std::abs(val) < threshold) {
+            val = 0.0f;
+        }
+        
+        gate[i] = val;
     }
 }
 
@@ -370,12 +376,12 @@ pool.parallel_for(0, num_tokens, 1, [&](int i) {
 
         // SwiGLU Batch
 
-        pool.parallel_for(0, num_tokens, 1, [&](int i) {  
+        pool.parallel_for(0, num_tokens, 1, [&](int i) {
             float* gu_row = b_gu_out.data() + i * 2 * config_.intermediate_size;
-            swiglu_inplace(gu_row, gu_row + config_.intermediate_size, config_.intermediate_size);
+            swiglu_inplace(gu_row, gu_row + config_.intermediate_size, config_.intermediate_size, lw.fatrelu_threshold);
         });
 
-        // Down proj Batch (we can reuse b_gu_out's first half as input)
+        // Down proj Batch(we can reuse b_gu_out's first half as input)
         // b_gu_out is (num_tokens x 2*intermediate), gate is first half.
         // Wait, gemm_q4_q8_avx2 expects input vectors to be contiguous. 
         // We need to pack the SwiGLU output into a shape of (num_tokens x intermediate_size).
@@ -460,7 +466,7 @@ void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
                         2 * config_.intermediate_size, config_.hidden_size, config_.group_size);
 
         // SwiGLU
-        swiglu_inplace(gu_out_.data(), gu_out_.data() + config_.intermediate_size, config_.intermediate_size);
+        swiglu_inplace(gu_out_.data(), gu_out_.data() + config_.intermediate_size, config_.intermediate_size, lw.fatrelu_threshold);
 
         // Down proj
         gemv_asb_avx2(lw.down_proj, gu_out_.data(), hidden_.data(),
@@ -550,8 +556,8 @@ void UnifiedEngine::forward_token_draft(int token_id, int pos, float* out_logits
         rmsnorm_f32(hidden_.data(), hidden_.data(), lw.rms_ffn, config_.hidden_size, config_.rms_norm_eps);
 
         gemv_asb_avx2(lw.gate_up_proj, hidden_.data(), gu_out_.data(), 2 * config_.intermediate_size, config_.hidden_size, config_.group_size);
-        swiglu_inplace(gu_out_.data(), gu_out_.data() + config_.intermediate_size, config_.intermediate_size);
-        
+        swiglu_inplace(gu_out_.data(), gu_out_.data() + config_.intermediate_size, config_.intermediate_size, lw.fatrelu_threshold);
+
         std::memcpy(gate_buf_.data(), gu_out_.data(), config_.intermediate_size * sizeof(float));
         gemv_asb_avx2(lw.down_proj, gate_buf_.data(), hidden_.data(), config_.hidden_size, config_.intermediate_size, config_.group_size);
 
@@ -730,8 +736,10 @@ public:
             auto down_proj = l_dict["down_proj"].cast<py::array_t<uint8_t>>();
             lw.down_proj = get_ptr(down_proj);
             
-            
-            
+            if (l_dict.contains("fatrelu_threshold")) {
+                lw.fatrelu_threshold = l_dict["fatrelu_threshold"].cast<float>();
+            }
+
             weights_.layers[layer_idx] = lw;
         }
 
@@ -742,6 +750,11 @@ public:
         // Release GIL during generation process
         py::gil_scoped_release release;
         return engine_->generate(prompt, max_tokens);
+    }
+
+    std::vector<int32_t> generate_swift(std::vector<int32_t> prompt, int max_tokens, int draft_k) {
+        py::gil_scoped_release release;
+        return engine_->generate_swift(prompt, max_tokens, draft_k);
     }
 };
 
@@ -767,5 +780,6 @@ PYBIND11_MODULE(_native_unified, m) {
         py::arg("cos_table"),
         py::arg("sin_table"),
         py::arg("layers_dict"))
-        .def("generate", &asdsl::UnifiedEnginePy::generate);
+        .def("generate", &asdsl::UnifiedEnginePy::generate)
+        .def("generate_swift", &asdsl::UnifiedEnginePy::generate_swift);
 }

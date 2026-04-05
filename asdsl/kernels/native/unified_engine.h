@@ -19,10 +19,11 @@ struct LayerWeights {
     const float* rms_ffn;
 
     const uint8_t* gate_up_proj;
-    
+
 
     const uint8_t* down_proj;
-    
+
+    float fatrelu_threshold = 0.0f;
 };
 
 struct EngineConfig {
@@ -105,7 +106,7 @@ private:
 
     void rmsnorm_f32(float* out, const float* in, const float* weight, int size, float eps);
     void rope_apply_inplace(float* q, float* k, const float* cos_table, const float* sin_table, int pos, int rotary_dim);
-    void swiglu_inplace(float* gate, float* up, int size);
+    void swiglu_inplace(float* gate, float* up, int size, float threshold = 0.0f);
     void compute_attention_flash_q8(float* out, const float* q, int layer_id, int seq_pos);
     void set_kv_cache(int layer, int pos, const float* k, const float* v);
     void vec_add_inplace(float* dest, const float* src, int size);
