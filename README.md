@@ -34,19 +34,17 @@ This framework is built for research, profiling, and understanding *why* certain
 
 ## 2. Current Performance Benchmarks (April 2026)
 
-**Target Model:** `microsoft/phi-4` (14B Parameters)  
+**Target Model:** microsoft/phi-4 (14B Parameters)  
 **Quantization:** Q4 (4-bit Group Size 32)  
 **Hardware:** Intel Core i7/i9 equivalent (12 P-Cores, AVX2/VNNI, 24.0 GB/s Peak Bandwidth)
 
 | Framework State               | Decoding Throughput | Perplexity (WikiText-103) | Peak Memory | Accelerator |
 |-------------------------------|---------------------|---------------------------|-------------|-------------|
-| Python Scalar Baseline        | ~1.00 tok/s         | 61.15                     | ~7.0 GB     | Scalar      |
-| Restored Baseline (Affinity)  | 1.91 tok/s          | 19.16                     | 4.9 GB      | AVX2        |
-| Mmap Zero-Copy Safetensors    | 4.02 tok/s          | 19.16                     | 3.2 GB      | AVX2        |
-| **Native Fused C++ Loop**     | **5.15 tok/s**      | **19.16**                 | **3.2 GB**  | AVX2/VNNI   |
-| *llama.cpp Q4_K_M (Reference)*| *>10.0 tok/s*       | *~18-20*                  | *~3.0 GB*   | *AVX2/VNNI* |
+| **Native C++ Unified Engine (Baseline)** | **2.56 tok/s** | **19.16** | **3.2 GB** | AVX2/VNNI |
+| ASDSL Python Prototype (Highest)| 2.86 tok/s       | 19.16 | 3.2 GB | AVX2 |
+| *llama.cpp Q4_K_M (Local Reference)*| *~2.72 tok/s*       | *~18-20* | *~3.0 GB* | *AVX2/VNNI* |
 
-*Note: The 5.15 tok/s ceiling represents our peak native C++ loop performance. We do not claim this is "state of the art" or "near theoretical maximum." The remaining performance gap comes from cache effects, memory alignment, NUMA faults, and scheduling optimizations that mature projects have solved.*
+*Note: Previous internal documentation referenced peak historical marks (like 5.15 tok/s and >10.0 tok/s) that were benchmarks on different node profiles or with layer skips. For our actual consumer hardware baseline testing, the framework hits 2.56 tok/s natively out of the box against llama.cpp's ~2.72 tok/s using identical instruction sets and hardware states.*
 
 ---
 
