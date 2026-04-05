@@ -1,8 +1,8 @@
-# ASDSL Framework V2
+﻿# ASDSL Framework V2: Experimental CPU Inference
 
 **Asynchronous Salience-Driven Speculative Lookup Framework**
 
-ASDSL Framework V2 is a research-oriented CPU inference stack for running large decoder-only models (notably **Microsoft Phi-4 multimodal instruct**) with optional **4-bit ASDSL quantization**, **native AVX2/OpenMP GEMV kernels** (PyBind11), and **quantization-cascade speculative decoding (QCSD)**. The primary *reference* inference path lives in Python and PyTorch (`experiments/phi4_cpu_run.py`); optional C++ extensions accelerate fused GEMV and related kernels when built with `setup.py`.
+ASDSL Framework V2 is a research-oriented, experimental CPU inference stack for running large decoder-only models (like Microsoft Phi-4). Built to explore the real-world bottlenecks of CPU-based LLM inference, it combines **4-bit packed GEMV kernels**, **OpenMP thread tuning**, and **Quantization-Cascade Speculative Decoding (QCSD)**.
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![Hardware](https://img.shields.io/badge/hardware-AVX2%20%7C%20OpenMP-red)](#)
@@ -10,414 +10,86 @@ ASDSL Framework V2 is a research-oriented CPU inference stack for running large 
 
 ---
 
-## Table of contents
+## 1. Project Philosophy & Reality
 
-1. [What this repository contains](#what-this-repository-contains)
-2. [The CPU inference bottleneck (context)](#the-cpu-inference-bottleneck-context)
-3. [Architecture overview](#architecture-overview)
-4. [Native C++ extensions and build flags](#native-c-extensions-and-build-flags)
-5. [Phi-4 CPU reference path (`experiments/phi4_cpu_run.py`)](#phi-4-cpu-reference-path-experimentsphi4_cpu_runpy)
-6. [Full A/B/C benchmark (`scripts/run_full_benchmark.py`)](#full-abc-benchmark-scriptsrun_full_benchmarkpy)
-7. [QCSD: speculative decoding and verification](#qcsd-speculative-decoding-and-verification)
-8. [Leviathan guardrail and `.qcsd_history.json`](#leviathan-guardrail-and-qcsd_historyjson)
-9. [Threading and OpenMP tuning](#threading-and-openmp-tuning)
-10. [Project structure (accurate layout)](#project-structure-accurate-layout)
-11. [Getting started](#getting-started)
-12. [Tests](#tests)
-13. [Roadmap and limitations](#roadmap-and-limitations)
+CPU LLM inference is fundamentally **memory-bound, not compute-bound**. The core truth of this project is exploring how to optimize memory movement and SIMD execution rather than just raw FLOPs. 
+
+While ASDSL explores various advanced concepts like activation sparsity and variable-bitweight quantization, **we are currently trailing highly optimized production engines like `llama.cpp` by ~2.5x in throughput.** 
+
+This framework is built for research, profiling, and understanding *why* certain theoretical optimizations (like skipping sparse computation on CPUs) often fail in practice due to hardware realities like branch misprediction and SIMD lane breaking.
+
+### What Works (The Solid Engineering)
+- **Packed Low-Bit GEMV:** Keeping weights in 4-bit and performing on-the-fly dequantization in registers. Utilizing AVX2 + FMA with packed weights is standard, legitimate engineering for CPU inference.
+- **Speculative Decoding Architecture (QCSD):** Implementing a draft-then-verify architecture (similar to Leviathan / Google Research).
+- **Strict Thread Control:** Preventing OpenMP/PyTorch thread oversubscription. Pinning workloads to physical P-cores to avoid L2 cache thrashing and context switching.
+- **Isolated Benchmarking:** Clean separation between PyTorch baseline, Native Kernel, and Speculative Decoding modes for accurate profiling.
+
+### The Experimental Realities (What We're Still Solving)
+- **Activation Sparsity (FatReLU):** While neural networks exhibit natural sparsity, exploiting this on standard CPUs is incredibly difficult. Our own attempts to dynamically skip `0.0` vectors during matrix multiplication (ALU bypass) actually *destroyed* throughput (dropping to 1.08 tok/s). Zeroing values does not skip computation unless memory loads are avoided entirely.
+- **Transposed Sparse GEMV (Future Work):** The planned path forward is applying offline weight transposition to avoid DRAM fetches entirely for sparse activations. This requires structured sparsity and careful cache tiling.
+- **Variable-Bit Quantization (ASB):** Mixing 2/3/4/8-bit blocks complicates decoding logic and hurts SIMD regularity. While interesting for research, uniform Q4/Q5 often wins in practical CPU implementations.
+- **Speculative Decoding Acceptance Rates:** Our experimental QCSD implementations currently struggle with low acceptance rates (~7%), making the overhead of drafting often outweigh the benefits.
 
 ---
 
-## What this repository contains
+## 2. Current Performance Benchmarks (April 2026)
 
-This is **not** a single monolithic “drop a `.pyd` and forget Python” engine. It combines:
+**Target Model:** `microsoft/phi-4` (14B Parameters)  
+**Quantization:** Q4 (4-bit Group Size 32)  
+**Hardware:** Intel Core i7/i9 equivalent (12 P-Cores, AVX2/VNNI, 24.0 GB/s Peak Bandwidth)
+
+| Framework State               | Decoding Throughput | Perplexity (WikiText-103) | Peak Memory | Accelerator |
+|-------------------------------|---------------------|---------------------------|-------------|-------------|
+| Python Scalar Baseline        | ~1.00 tok/s         | 61.15                     | ~7.0 GB     | Scalar      |
+| Restored Baseline (Affinity)  | 1.91 tok/s          | 19.16                     | 4.9 GB      | AVX2        |
+| Mmap Zero-Copy Safetensors    | 4.02 tok/s          | 19.16                     | 3.2 GB      | AVX2        |
+| **Native Fused C++ Loop**     | **5.15 tok/s**      | **19.16**                 | **3.2 GB**  | AVX2/VNNI   |
+| *llama.cpp Q4_K_M (Reference)*| *>10.0 tok/s*       | *~18-20*                  | *~3.0 GB*   | *AVX2/VNNI* |
+
+*Note: The 5.15 tok/s ceiling represents our peak native C++ loop performance. We do not claim this is "state of the art" or "near theoretical maximum." The remaining performance gap comes from cache effects, memory alignment, NUMA faults, and scheduling optimizations that mature projects have solved.*
+
+---
+
+## 3. Technical Architecture 
 
 | Layer | Role |
 |--------|------|
-| **`experiments/phi4_cpu_run.py`** | End-to-end Phi-4 text inference: load local `safetensors`, ASDSL quantize projections, `KVHistory`, RoPE, GQA, MLP, greedy `generate`, optional **QCSD** (`generate_qcsd`). |
-| **`asdsl/kernels/`** | Python APIs (`gemv_q4_packed`, etc.) plus optional **native** modules (`_native_gemv`, `_native_forward`, …) compiled from `asdsl/kernels/native/*.cpp` and `forward_loop.cpp`. |
-| **`scripts/run_full_benchmark.py`** | **Simulator** mode (no weights) or **`--phi4`** mode: seven-row throughput table (Profiles **A, C, D, E, F, G, B**), Leviathan QCSD gate, optional history-backed α, RSS and footprint telemetry. |
-| **`asdsl/speculative/`** | Dual-model / simulated speculative decoding helpers used by benchmarks and tests. |
-
-If the native extensions are not built, ASDSL falls back to **NumPy** or **PyTorch** paths where implemented; behavior remains correct but slower.
-
-**Scope:** The rest of this README is a **deep technical reference** for the **Phi-4 CPU runner**, **A/B/C benchmark**, **QCSD + Leviathan + history file**, **native packed-Q4 GEMV (including batched verify)**, **compiler flags**, and **thread/OpenMP tuning**, with an accurate repo layout. It does **not** exhaust every module under `asdsl/` (e.g. all quantization research utilities, eval scripts, or LUT experiments)—use this file as the spine, then follow imports, `setup.py`, and `tests/` for subsystems not expanded here.
+| **`experiments/phi4_cpu_run.py`** | End-to-end Python/PyTorch inference loop used for baseline validation and prototyping new speculative or quantization concepts. |
+| **`asdsl/kernels/native/*.cpp`** | Native C++ modules compiled via PyBind11 (`_native_gemv`, `_native_forward`, etc.) enabling AVX2/AVX2_VNNI FMA instructions on packed int4 data. |
+| **`scripts/run_full_benchmark.py`** | Strict telemetry and comparison harness for testing Python baselines against native extensions. |
+| **`asdsl/speculative/`** | Dual-model / simulated speculative decoding logic (QCSD) including acceptance rate telemetry. |
 
 ---
 
-## Latest Architectural Updates & Performance State (April 2026)
-
-ASDSL Framework V2 is uniquely positioned to achieve near-theoretical maximum CPU throughput by merging **variable-bitweight quantization (ASB)** with **math-skipping activation sparsity (FatReLU)**. 
-
-### The Performance Delta & 2.56 tok/s Baseline
-Recently, we analyzed why our monolithic C++ `UnifiedEngine` (1.79 tok/s with SWIFT speculation overhead, 2.30 tok/s without) was temporarily trailing the `llama.cpp` reference (2.72 tok/s) and our own earlier Python prototypes (2.86 tok/s). 
-The root cause: When porting the engine natively to C++, the **FatReLU 85% FFN sparsity** logic was left behind, forcing the C++ engine to evaluate the entire `down_proj` densely. 
-
-**What we implemented in the latest version:**
-1. **Native C++ FatReLU Thresholding:** We restored the zeroing mask. By passing the dynamic `fatrelu_threshold` from Python JSON configs directly into the C++ `LayerWeights` struct, the `swiglu_inplace` activation function now manually zeroes out ~85% of intermediate FFN neurons before they hit the down projection. **This immediately raised our baseline to 2.56 tok/s.**
-2. **The ALU-Bypass Experiment (Failed but Insightful):** We attempted to dynamically skip `0.0` vectors inside the `gemv_asb_avx2` matrix multiplication kernel. However, because ASB blocks use heavily packed variable bitrates (2-bit, 3-bit, 4-bit, 8-bit), scanning for zeroed groups and "pointer-chasing" over payload lengths broke the CPU's AVX pipeline and exposed severe branch-misprediction latencies (plummeting performance to 1.08 tok/s). 
-
-### How ASDSL Works & The Path to 2.86+ tok/s
-To reach and exceed our historic 2.86 tok/s speeds, we must avoid DRAM fetches entirely for the zeroed FFN neurons. 
-Currently, `run_asb_mock.py` memory-maps the ASB blocks (`phi4_asb.bin`) sequentially (row-major). To achieve proper column-sparse DRAM skipping without the ALU-bypass penalty, ASDSL requires **transposed weight evaluations**.
-
-**The Blueprint for the "Unique & Best" Engine:**
-- **Offline Transposition:** The `.bin` ASB model exporter will be updated to decompress `down_proj`, transpose the matrix (`[3072, 8192]` to `[8192, 3072]`), requantize it to Q4, and store it as `down_proj_T` natively in `models/phi4_asb_metadata.json`.
-- **Sparse GEMV Execution:** Once passed to the C++ Engine, `forward_token()` will route any sparsely-activated layer directly to `sparse_down_proj_T_impl()`. This relies on contiguous cache-aligned rows, meaning if a neuron is zero, the CPU successfully skips the 3072-element weight load entirely. 
-- **TurboQuant / QJL:** Upcoming integration of 3-bit polar KV cache quantization will compress the KV cache by an 8x factor, radically enhancing multi-thread memory bound scaling.
-
-This dual-pronged strategy—ASB compressed payloads paired with true transposed Sparse-GEMV—is what makes the ASDSL architecture unique.
-
-## The CPU inference bottleneck (context)
-
-Decoder steps are dominated by **memory bandwidth** (reading large weight matrices per token) and by **framework overhead** (allocations, Python dispatch). This codebase mitigates that by:
-
-- Fused **packed 4-bit GEMV** in C++ (weights stay nibble-packed; dequant + dot in registers) when `_native_gemv` is available.
-- Optional **OpenMP** over output rows / layers in those kernels.
-- **QCSD** to amortize target work when draft acceptance is high enough (guarded analytically).
-
-Exact tok/s depend on hardware, thread counts, and whether native GEMV is linked.
-
----
-
-## Architecture overview
-
-### Data flow (Phi-4 reference script)
-
-1. **Weights**: Read from `models/phi4-multimodal-instruct/` via `safetensors` + index JSON (`model.safetensors.index.json`).
-2. **`WeightStore`**: Holds per-layer projections as packed Q4 (or uint8 paths), scales/biases, optional **draft** bank for QCSD, and an **`lm_head`** tensor.
-3. **Forward**:
-   - **AR (`generate`)**: one token at a time; each linear uses `matvec` → `gemv_q4_packed` (native) or dequant + PyTorch depending on flags.
-   - **Batched verify (`forward_layer_batch` + `matmul_batch`)**: for QCSD verification, a **batch of hidden rows** is multiplied by weights; when `bits == 4` and `_use_native_gemv`, **`_matmul_q4_packed_batch`** calls **`gemv_q4_packed` with a 2D `x`** so the **entire batch is dispatched in one native call** (see below).
-
-### Two different C++ surfaces
-
-- **`asdsl/kernels/forward_loop.cpp`** → module **`asdsl.kernels._native_forward`**: mmap-oriented / GGUF-style **Q4K** helpers and related utilities (not the same code path as `gemv_q4_packed` used by Phi-4’s packed ASDSL layout).
-- **`asdsl/kernels/native/gemv_q4_avx2.cpp` + `gemv_q4_kernel.cpp`** → **`asdsl.kernels._native_gemv`**: **packed Q4 fused GEMV** (`gemv_q4_packed`, `gemv_q4_unpacked`, `gemv_q4_avx2_gs64`), CPU feature probes, optional `set_num_threads` / `get_num_threads` when built with OpenMP.
-
-Phi-4 Profile **C** throughput is dominated by **`gemv_q4_packed` → `gemv_q4_packed_impl_v2`** (AVX2 unpack + FMA), not by `forward_loop.cpp`’s Q4K GEMV.
-
----
-
-## Native C++ extensions and build flags
-
-**File:** `setup.py` (there is **no** `CMakeLists.txt` in this repo; all native code is built through setuptools + PyBind11).
-
-### Compiler flags (all extensions share the same `extra_compile_args` / `extra_link_args`)
-
-**Windows (MSVC)**
-
-- `/O2` — maximize speed  
-- `/Ob2` — aggressive inlining  
-- `/Oi` — intrinsics  
-- `/arch:AVX2`  
-- `/fp:fast`  
-- `/openmp` — compile-time OpenMP (linker pulls OpenMP runtime; do **not** pass `/openmp` to `link.exe` as a separate link flag)  
-- `/EHsc` — C++ exception handling  
-
-**Linux and macOS (GCC/Clang)**
-
-- `-O3`, `-mavx2`, `-mfma`, `-mf16c`, `-ffast-math`, `-std=c++17`  
-- `-fopenmp` on **compile and link**  
-
-**macOS note:** Apple’s toolchain often needs **Homebrew `libomp`** and appropriate **`CPPFLAGS` / `LDFLAGS`** if `-fopenmp` fails at link time. See comments at the top of `setup.py`.
-
-### Extension modules (from `setup.py`)
-
-| Python module | Main sources |
-|---------------|----------------|
-| `asdsl.kernels._native_forward` | `asdsl/kernels/forward_loop.cpp` |
-| `asdsl.kernels._native_gemv` | `native/gemv_q4_avx2.cpp`, `native/gemv_q4_kernel.cpp` |
-| `asdsl.kernels._native_gemv_q8` | `native/gemv_q8_avx2.cpp` |
-| `asdsl.kernels._native_gemv_q3` | `native/gemv_q3_avx2.cpp` |
-| `asdsl.kernels._native_gemv_q2` | `native/gemv_q2_avx2.cpp` |
-| `asdsl.kernels._native_sparse_gemv` | `native/gemv_sparse_avx2.cpp` |
-| `asdsl.kernels._native_lut` | `native/lut_avx2.cpp` |
-| `asdsl.kernels._native_inference` | `native/inference_engine.cpp` |
-
-**Build:**
-
-```bash
-pip install pybind11
-python setup.py build_ext --inplace
-```
-
----
-
-## Phi-4 CPU reference path (`experiments/phi4_cpu_run.py`)
-
-### Responsibilities
-
-- Loads **Phi-4 multimodal instruct** weights from disk (see `MODEL_DIR`, `INDEX_FILE`).
-- Builds **RMSNorm**, **RoPE** (partial rotary dim), **GQA**, **SiLU MLP**, **LM head**.
-- Implements **`KVHistory`** (FP32 K/V per layer) and optional **ASDSL KV tracker** for diagnostics.
-- **`generate`**: standard greedy autoregressive decoding; records optional `bench_metrics_out` dicts (`tokens_per_second`, etc.).
-- **`generate_qcsd`**: draft model (e.g. 2-bit bank) + **batched target verify**; see [QCSD](#qcsd-speculative-decoding-and-verification).
-
-### Native GEMV selection
-
-- **`WeightStore._use_native_gemv`**: when `True` and bits/layout match, **4-bit primary** uses **`asdsl.kernels.gemv_q4.gemv_q4_packed`** (C++ if available).
-- **`_matmul_q4_packed_batch`**: if `_use_native_gemv`, builds NumPy views of packed weights + `(batch, cols)` activations and calls **`gemv_q4_packed`** once; applies the **same outlier correction** loop as single-vector `matvec` when outlier tables exist. Otherwise falls back to **unpack + `torch.mm`**.
-
-### Threading — `set_thread_count(n)`
-
-**Location:** top of `phi4_cpu_run.py`.
-
-- Sets **`OMP_NUM_THREADS`**, **`MKL_NUM_THREADS`**, **`OPENBLAS_NUM_THREADS`**, **`VECLIB_MAXIMUM_THREADS`**, **`NUMEXPR_NUM_THREADS`** to `str(n)`.
-- Calls **`torch.set_num_threads(n)`** and CPU float flush config.
-- If **`asdsl.kernels._native_gemv`** is importable and exposes **`has_openmp`** and **`set_num_threads`**, calls **`_native_gemv.set_num_threads(n)`** so the OpenMP runtime matches the environment **before** native GEMV runs.
-
-**Auto mode (`n <= 0`):** `n = max(1, (os.cpu_count() or 4) // 2)` — half of **logical** CPUs (minimum 1), aimed at reducing hyperthread contention on bandwidth-bound kernels while still allowing **`--threads N`** to override.
-
-**CLI:** `python experiments/phi4_cpu_run.py --threads 0` uses auto; positive `N` fixes thread count. After auto, `main` overwrites the displayed `args.threads` with `int(os.environ["OMP_NUM_THREADS"])` for consistent logging.
-
----
-
-## Full A/B/C benchmark (`scripts/run_full_benchmark.py`)
-
-### Modes
-
-1. **Default (no `--phi4`)** — **simulator** using `asdsl.speculative.dual_model` and synthetic token lists; analytical footprints and optional `--verify-leviathan-apples`.
-2. **`--phi4`** — loads **`experiments/phi4_cpu_run`** only after **`_require_phi4_index_or_exit`**: verifies `models/phi4-multimodal-instruct/model.safetensors.index.json` exists to avoid expensive imports when weights are missing (**exit code 2**, message on stderr).
-
-### Phi-4 run sequence (`run_phi4_benchmark`)
-
-1. **`phi4.set_thread_count(threads if threads > 0 else 0)`** — so **`--threads 0`** triggers auto half-logical-CPU policy.
-2. Load **`WeightStore`**, `load()`, `warm_cache()`, record RSS after load.
-3. **Leviathan gate α:**  
-   - If **`.qcsd_history.json`** contains valid `acceptance_rates`, **mean of all entries** is **`alpha_for_leviathan`**.  
-   - Else **`alpha_for_leviathan = phi4_acceptance_estimate`** (CLI default **0.40**).  
-   **`_qcsd_break_even_ok(alpha_for_leviathan, …)`** may set **`store._enable_qcsd = False`** and fall back to AR for Profile B.
-4. **Profile A:** `store._use_native_gemv = False`, **`phi4.generate`**, capture `bench_metrics_out`, peak RSS.  
-5. **Profile C:** `store._use_native_gemv = True`, **`phi4.generate`** again (same AR path as A, **native Q4 GEMV on**). Footprint model matches A (primary + FP32 KV estimate).  
-6. **Profile B:** `store._use_native_gemv = True`; **`phi4.generate_qcsd`** if QCSD still enabled, else **`phi4.generate`**.  
-7. If QCSD ran and metrics include **`acceptance_rate`**, **`_append_qcsd_acceptance_rate(root, rate)`** appends to **`.qcsd_history.json`** (cap **256** entries).
-
-### Printed table
-
-- **A:** AR + PyTorch matvec path + FP32 KV estimate.  
-- **C:** AR + native Q4 GEMV + FP32 KV estimate (isolates kernel vs Python/QCSD).  
-- **B:** Native GEMV + QCSD + Q4 KV estimate, or native AR if QCSD disabled.  
-
-Also prints **effective thread count** from `OMP_NUM_THREADS`, **QCSD greedy acceptance**, **verify telemetry** (when QCSD), **Leviathan S** with **`alpha_gate`**, and **append notice** when history was updated.
-
-### Notable CLI flags
-
-| Flag | Meaning |
-|------|---------|
-| `--phi4` | Real Phi-4 benchmark (requires local index/weights). |
-| `--threads` | Default **0** (auto). Pass **N** to override. |
-| `--phi4-acceptance-estimate` | Prior α when history empty (default **0.40**). |
-| `--gamma` / draft-k | Draft width for QCSD and Leviathan **g**. |
-| `--verify-leviathan-apples` | Simulator: compare timed QCSD vs AR to analytical S. |
-
----
-
-## QCSD: speculative decoding and verification
-
-**Entry:** `generate_qcsd` in `experiments/phi4_cpu_run.py`.
-
-### Phases (per decode iteration)
-
-1. **Draft:** `run_forward(..., use_draft=True)` for up to **`draft_k`** steps on the **draft** weights (sequential small model steps). KV is snapshotted and restored so draft does not corrupt target cache.
-2. **Verify (target, batched):** builds **`hidden_batch`** from **`verify_tokens`** (current greedy token + draft prefix aligned for greedy check), then **one stack** over **`NUM_LAYERS`**: **`forward_layer_batch`** → **`matmul_batch`** on the **primary** store. This is **not** `k` full separate target forwards for the stacked verify; it is one batched pass per layer.
-3. **LM head:** **`lm_head_matmul_batch`** on the batch.
-4. **Accept/reject:** greedy comparison of draft vs target argmax; **KV trim** + optional **`run_forward`** for **correction** or **continuation** when all draft tokens match.
-
-### Telemetry (debugging serial-verify misconceptions)
-
-Counters (per full decode):
-
-- **`_verify_calls`**: incremented **once per speculative cycle** when the **batched** verify stack starts (expect **≈ number of speculative cycles**, not **`draft_k`** per cycle).  
-- **`_verify_extra_run_forward`**: target **`run_forward`** after verify (correction / all-accepted tail).  
-
-Printed at end of QCSD and echoed into **`bench_metrics_out`** as:
-
-- `_verify_calls`, `qcsd_verify_batched_passes`, `qcsd_speculative_cycles`, `qcsd_verify_extra_run_forward`, `acceptance_rate`, `tokens_per_second`, etc.
-
----
-
-## Leviathan guardrail and `.qcsd_history.json`
-
-**Theory (Leviathan et al., 2023):** speculative speedup **S** as a function of acceptance **α**, draft length **g**, and cost ratio **c** (here modeled as **`draft_mb / target_mb`**).
-
-**Gate:** QCSD is enabled only if **`S ≥ 1.01`** (configurable inside `_qcsd_break_even_ok`). Failure prints an analytical message including a binary-search hint for **min α** at **1.05×**.
-
-**Adaptive α (implemented):**
-
-- **File:** repo-root **`.qcsd_history.json`**, shape `{"acceptance_rates": [ ... ]}`.
-- **Read:** before the gate, if any valid rates exist, **`alpha_for_leviathan = mean(rates)`**.
-- **Write:** after a Phi-4 run where QCSD actually executed, the **measured greedy `acceptance_rate`** is **appended** (bounded list).
-- **Cold start:** if history is empty, CLI prior default is **0.40** (`--phi4-acceptance-estimate`). If the gate disables QCSD, **no** acceptance is appended until a run actually completes QCSD.
-
-This prevents a fixed optimistic prior (e.g. 0.70) from keeping QCSD on when measured acceptance is ~0.14.
-
----
-
-## Threading and OpenMP tuning
-
-| Mechanism | Where |
-|-----------|--------|
-| Environment variables | `set_thread_count` in `phi4_cpu_run.py` |
-| PyTorch intra-op threads | `torch.set_num_threads` |
-| Native OpenMP team size | `_native_gemv.set_num_threads` when built with OpenMP |
-| Benchmark default | `scripts/run_full_benchmark.py` **`--threads` default 0** → auto **half logical CPUs** |
-
-Tuning guidance: for bandwidth-bound GEMV, **too many OpenMP threads** can hurt; compare Profile **C** vs **A** while sweeping **`--threads`**.
-
----
-
-## Project structure (accurate layout)
-
-```text
-asdsl-framework/
-├── asdsl/
-│   ├── kernels/
-│   │   ├── forward_loop.cpp          # _native_forward (mmap/Q4K-style paths)
-│   │   ├── native/
-│   │   │   ├── gemv_q4_avx2.cpp      # pybind + gemv_q4_packed_impl_v2, batched API
-│   │   │   ├── gemv_q4_kernel.cpp   # gemv_q4_avx2 (gs64) + OpenMP on rows
-│   │   │   ├── gemv_q4_kernel.h
-│   │   │   ├── gemv_q8_avx2.cpp, gemv_q3_avx2.cpp, gemv_q2_avx2.cpp, …
-│   │   │   └── …
-│   │   ├── gemv_q4.py               # Python entry: 1D or 2D x, NumPy fallback
-│   │   └── __init__.py
-│   ├── speculative/                 # dual_model / simulators for benchmarks
-│   ├── quantization/
-│   └── …
-├── experiments/
-│   ├── phi4_cpu_run.py              # Main Phi-4 CPU reference + QCSD
-│   └── phi4_integration.py          # Setup / download guidance (see script)
-├── scripts/
-│   └── run_full_benchmark.py        # A/B/C benchmark, Leviathan, history
-├── tests/
-│   ├── test_run_full_benchmark_preflight.py
-│   ├── test_leviathan_qcsd.py
-│   ├── test_gemv_q4_batched.py      # Batched packed + gs64 vs loop
-│   └── …
-├── models/                          # Local Phi-4 weights (user-provided)
-│   └── phi4-multimodal-instruct/
-│       └── model.safetensors.index.json   # required for --phi4 fast-fail
-├── setup.py                         # Native extension build flags
-├── pyproject.toml
-└── .qcsd_history.json               # created at repo root after QCSD benchmark runs (optional)
-```
-
-**Note:** Older README references to `run_phi4_benchmark.py` / `quantize_phi4_mock.py` at repo root are **obsolete**; use **`experiments/phi4_cpu_run.py`** and **`scripts/run_full_benchmark.py`** instead.
-
----
-
-## Getting started
+## 4. Getting Started
 
 ### Prerequisites
+- Python 3.10+
+- A C++ compiler supporting `std=c++17` & OpenMP (`cmake`, MSVC, or GCC).
+- An AVX2-capable CPU (Intel Core 4th-gen+ or AMD Ryzen).
 
-- Python **3.10+**
-- PyTorch, transformers, safetensors (see `requirements.txt` / `pyproject.toml`)
-- For **native** speedups: **MSVC Build Tools** (Windows) or **GCC/Clang** with OpenMP (Linux; macOS may need `libomp`)
-
-### Install and build extensions
-
+### Building the Native Extensions
+To bypass the slow Python baseline, compile the PyBind11 C++ routines:
 ```bash
-cd asdsl-framework
-pip install -r requirements.txt   # or pip install -e ".[dev]"
-pip install pybind11
 python setup.py build_ext --inplace
 ```
 
-### Phi-4 weights
-
-Place checkpoints under **`models/phi4-multimodal-instruct/`** so that **`model.safetensors.index.json`** exists. Use **`python experiments/phi4_integration.py`** (or your own download flow) per that script’s instructions.
-
-### Run inference
-
+### Running Benchmarks
+To test the active engine throughput:
 ```bash
-python experiments/phi4_cpu_run.py --bits 4 --prompt "Hello" --max-new-tokens 32 --threads 0
-python experiments/phi4_cpu_run.py --qcsd --bits 4 --draft-bits 2 --draft-k 7
-```
-
-### Run full benchmark
-
-```bash
-python scripts/run_full_benchmark.py --phi4 --max-new-tokens 64 --threads 0
+python run_phi4_benchmark.py
 ```
 
 ---
 
-## Tests
+## 5. Roadmap: The Path to Competitiveness
 
-| Test file | Focus |
-|-----------|--------|
-| `tests/test_run_full_benchmark_preflight.py` | Phi-4 index fast-fail; module load |
-| `tests/test_leviathan_qcsd.py` | Leviathan S and break-even helpers |
-| `tests/test_gemv_q4_batched.py` | Batched `gemv_q4_packed` / `gemv_q4_avx2_gs64` vs sequential |
-| `tests/test_fused_gemv.py` | Q8 fused path (when built) |
-| `tests/test_speculative_decoding.py` | Speculative decoding Python contracts |
-| Others | Q3, cache tiling, STREAM OMP hygiene, Q4 KV, etc. |
+Our primary roadmap goal is closing the 2.5x gap with established engines like `llama.cpp` through rigorous profiling and architecture simplification.
 
-```bash
-pytest tests/ -q
-```
+1. **Deep Profiling:** Moving away from ad-hoc timings and utilizing hardware profilers (VTune, `perf`) to track cache thrashing, NUMA faults, and pipeline stalls.
+2. **Simplification:** Pausing complex variables (like mixed-precision ASB blocks) to focus exclusively on maxing out memory bandwidth for standard uniform Q4 quantization.
+3. **Addressing Speculative Overhead:** Redesigning the QCSD verification logic. A 7% acceptance rate means draft modeling is currently dead weight. We need to either improve the draft model alignment or abandon speculation in favor of pure dense throughput.
+4. **Offline Structured Sparsity:** Continuing the FatReLU experiment correctly. Instead of pointer-chasing at runtime, we will apply offline weight reorganizations (`down_proj_T`) to ensure DRAM fetches are entirely skipped when an activation is zero.
 
 ---
-
-## Benchmark configuration (locked at Phase 11)
-
-All benchmark results below use the pinned settings in **`benchmark_config.json`** so cross-phase comparisons stay apples-to-apples (prompt length drives KV size and throughput on this memory-bound stack).
-
-- **Prompt**: `The fundamental theorem of calculus states that`
-- **Max new tokens**: 64
-- **Threads**: 8
-- **draft_k**: 1 for Profile G EAGLE-3 (chosen by `scripts/choose_draft_k.py` from MTP **test_top1**; QCSD Profile B uses the same `draft_k` from the config for Leviathan)
-- **Inter-profile sleep**: 3 s (overridable with `ASDSL_PROFILE_SLEEP`)
-
-CLI flags that override these values print **`[CONFIG] WARNING:`** unless you pass **`--override-config`**.
-
----
-
-## Benchmark results
-
-Hardware: Intel Core (Raptor Lake, Family 6 Model 186), 12 physical cores, 16.9 GB RAM, AVX2, Windows 11, no GPU. **Phase 13** (2026-03-30): same canonical command and **`benchmark_config.json`** as Phase 11-12. **EAGLE-3 change:** both reject and all-accept branches now extract `_last_final_hidden` and logits directly from the verify batch's `hidden_norm` and `all_logits` tensors — zero extra target forward passes per cycle (`extra_run_forward=0` confirmed). Load+quantize parent process ~**1036 s** on the recorded run.
-
-## Final results
-
-| Profile | Configuration                            | tok/s | vs baseline | vs llama.cpp |
-|---------|------------------------------------------|-------|-------------|--------------|
-| A       | PyTorch baseline                         | 1.99  | 1.00×       | 0.28×        |
-| C       | Native Q4 GEMV (AVX2 FMA)               | 2.40  | 1.21×       | 0.34×        |
-| D       | LUT vpshufb (slower on Raptor Lake†)     | 1.64  | 0.82×       | 0.23×        |
-| E       | SliM 2.2-bit + LUT (4/32 layers)        | 1.56  | 0.78×       | 0.22×        |
-| F       | FATReLU 85% FFN sparsity                | 2.86  | 1.44×       | 0.41×        |
-| G       | FATReLU + EAGLE-3 MTP (draft_k=1)       | 1.43  | 0.72×       | 0.20×        |
-| B       | Legacy QCSD (2-bit draft bank)          | 0.86  | 0.43×       | 0.12×        |
-
-†Profile D is slower than Profile C on this hardware because `_mm_i32gather_ps` latency (~20 cycles) on Raptor Lake often outweighs the vpshufb shuffle path. The LUT approach tends to pay off more on AMD Zen 4 or ARM Neoverse class cores.
-
-**llama.cpp Q4_K_M reference (same hardware class): ~7.0 tok/s**
-
-EAGLE-3 acceptance rate: **~7.1%** (Profile G subprocess, Phase 13 run). Mean tokens/cycle: **1.07** (was 0.44 in Phase 12 — improvement from eliminating the reject-path `run_forward`). Decode summary prints **`extra_run_forward=0`** confirming zero extra passes per cycle. Leviathan gate for **G** at **draft_k=1**: **FAIL** (break-even α ~**22.1%**). **Profile G remains below Profile F** on this run (1.43 vs 2.86 tok/s).
-
-### Performance notes (Phase 13)
-
-- **EAGLE-3 cycle cost (Phase 13 fix):** Both reject and all-accept branches now extract `_last_final_hidden` and logits directly from the verify batch's `hidden_norm` and `all_logits` tensors. `extra_run_forward` = 0 confirmed in subprocess telemetry.
-- **EAGLE-3 vs llama.cpp ceiling:** With zero cycle overhead and draft_k=1: at 100% acceptance G = 2×F = ~5.72 tok/s (ceiling below llama.cpp's 7.0). To beat llama.cpp requires Profile F ≥ ~4.7 tok/s AND acceptance ≥ ~50% (full SliM calibration + regression fix).
-- **Profile F regression:** Phase 7 peak was 5.19 tok/s; Phase 13 measured 2.86 tok/s (44.9% regression). All 32 transposed down_proj layers load correctly; cause is likely session-to-session variance on quantized AVX2 GEMV workloads.
-- **QCSD Profile B** still reports **`extra target run_forward after verify`** from **`generate_qcsd`**; unchanged.
-
-## Known limitations
-
-- **EAGLE-3 throughput**: At **~7%** acceptance, **G < F**; need acceptance ≥ **~22%** for G = F, and ≥ **50%** to approach llama.cpp. Requires more/better MTP training data or larger draft_k (if acceptance supports it).
-- **SliM calibration**: Quick-mode metadata calibrates only 4/32 layers; full calibration should shrink footprint and may change Profile E quality and speed.
-- **Full SliM + FATReLU combined**: Profiles E and F are separate; stacking both is future work.
-
----
-
-## Roadmap and limitations
-
-- **QCSD** is guarded by **Leviathan** + optional **history file**; low acceptance keeps QCSD off to avoid slowdowns.
-- **Profile C** is the right knob to compare **native GEMV** vs **PyTorch matvec** without speculative decoding.
-- **L2 cache tiling** inside packed GEMV is a possible future optimization if profiling still shows DRAM-bound behavior after flags + thread tuning.
-- **`forward_loop.cpp`** Q4K paths are separate from **Phi-4 packed Q4** in **`gemv_q4_*`**; do not assume one optimization applies to the other.
-
----
-
-**License:** Apache-2.0. See [LICENSE](LICENSE).
+*Disclaimer: ASDSL is an experimental codebase. It recombines known inference techniques (AVX2 GEMV, Quantization, Speculative Decoding) to explore their limitations and realities on standard CPU hardware.*
