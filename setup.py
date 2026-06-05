@@ -77,7 +77,10 @@ def get_native_extensions():
             "asdsl.kernels._native_gemv",
             [
                 "asdsl/kernels/native/gemv_q4_avx2.cpp",
+                "asdsl/kernels/native/gemv_q4_preq_restored.cpp",
+                "asdsl/kernels/native/gemv_q4_128.cpp",
                 "asdsl/kernels/native/gemv_q4_kernel.cpp",
+                "asdsl/kernels/native/lm_head_avx2.cpp",
             ],
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
@@ -151,11 +154,29 @@ def get_native_extensions():
         Pybind11Extension(
             "asdsl.kernels._native_unified",
             [
-                "asdsl/kernels/native/unified_engine.cpp",                  "asdsl/kernels/native/gemm_batch.cpp",                "asdsl/kernels/native/gemv_q4_avx2.cpp",
+                "asdsl/kernels/native/unified_engine.cpp",
+                "asdsl/kernels/native/gemm_batch.cpp",
+                "asdsl/kernels/native/gemv_q4_avx2.cpp",
+                "asdsl/kernels/native/gemv_q4_preq_restored.cpp",
+                "asdsl/kernels/native/gemv_q4_128.cpp",
+                "asdsl/kernels/native/gemv_q4_s256.cpp",
                 "asdsl/kernels/native/gemv_q4_kernel.cpp",
-                "asdsl/kernels/native/gemv_q8_avx2.cpp"
+                "asdsl/kernels/native/gemv_q8_avx2.cpp",
+                "asdsl/kernels/native/lm_head_avx2.cpp",
             ],
             extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
+            define_macros=[("PYBIND11_DETAILED_ERROR_MESSAGES", "1")],
+            language="c++",
+        ),
+
+        # HEP: AES-NI weight synthesis kernel (AVX2 + AES-NI + OpenMP)
+        # On Windows, AES-NI is enabled automatically with /arch:AVX2 on Raptor Lake.
+        # On Linux/macOS, we explicitly add -maes to enable AES-NI intrinsics.
+        Pybind11Extension(
+            "asdsl.kernels._native_hep",
+            ["asdsl/kernels/native/gemv_hep_aesni.cpp"],
+            extra_compile_args=extra_compile_args + ([] if sys.platform == "win32" else ["-maes"]),
             extra_link_args=extra_link_args,
             define_macros=[("PYBIND11_DETAILED_ERROR_MESSAGES", "1")],
             language="c++",

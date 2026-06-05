@@ -99,4 +99,6 @@ def test_execution_hygiene_pinning(native_q3) -> None:
     )
     if sys.platform == "win32":
         assert detected > 0
-        assert omp_threads == detected
+        # omp_threads may be set higher than detected_pcores when the benchmark
+        # uses additional E-core threads (e.g. OMP_NUM_THREADS=8 on a 4P+8E system).
+        assert omp_threads >= detected

@@ -1,0 +1,76 @@
+{
+  "project": "ASDSL x nCPU Integration",
+  "hardware": "Intel Core Raptor Lake i7, 12P+4E cores, DDR4-3200, 15.75 GB, Windows 10",
+  "model": "Phi-4-multimodal-instruct (14B parameters)",
+  "quantization": "4-bit asymmetric, group_size=32, MSE-optimal scales",
+
+  "throughput": {
+    "phase1_baseline_tok_s": 2.36,
+    "phase8_final_tok_s": 3.69,
+    "phase10_decode_check_tok_s": 3.38,
+    "improvement_pct_vs_phase1": 56.4,
+    "first_token_ms": 355,
+    "measurement": "decode throughput, tokens 2-128, comprehensive_bench.py --bits 4 --dispatch"
+  },
+
+  "quality": {
+    "prose_ppl_10t_4bit_dispatch": 9.4,
+    "prose_ppl_20t_4bit_dispatch": 16.99,
+    "prose_ppl_20t_fp16": 6.83,
+    "wikitext_ppl_64t_4bit_dispatch": 138.58,
+    "wikitext_ppl_64t_8bit": 96.52,
+    "wikitext_ppl_64t_fp16": 96.5,
+    "wikitext_ppl_512t_4bit_dispatch": 622.41,
+    "quantization_degradation_pct_wikitext_64": 43.6,
+    "ratio_4bit_over_fp16_wikitext_64": 1.436,
+    "phase3_ppl_11_90_validity": "invalid_baseline",
+    "phase3_ppl_11_90_note": "Not reproducible on current stack (138-189 WikiText-64 with same model/tokenizer). Historical run used all-LUT dispatch assignments; see phase10_baseline.json."
+  },
+
+  "memory": {
+    "ram_peak_gb": 4.0,
+    "weight_bytes_packed_q4": 1610612736,
+    "compression_ratio": "6.4x"
+  },
+
+  "vs_llama_cpp": {
+    "comparison_run": true,
+    "artifact": "benchmarks/results/llama_cpp_comparison.json",
+    "llama_cpp_build": "b9297 win-cpu-x64",
+    "gguf": "ShayanCyan/phi4-multimodal-quantisized-gguf phi4-mm-Q4_K_M.gguf",
+    "asdsl_decode_tok_s_ignore_eos_128": 2.945,
+    "llama_cpp_cli_decode_tok_s": 13.2,
+    "llama_bench_tg_tok_s": 11.915,
+    "asdsl_pct_of_llama_cli": 22.3,
+    "ram_asdsl_peak_mb": 4019,
+    "ram_gguf_file_mb": 2368,
+    "note": "128-token greedy decode, 8 threads, chat prompt <|user|>The<|end|><|assistant|>, --ignore-eos on both stacks. llama.cpp ~4x faster steady decode; ASDSL pays ~8.5 min quantize-at-load vs mmap GGUF."
+  },
+
+  "techniques_implemented": {
+    "lut_kernel": "correct but not used at Phi-4 matrix sizes (L2 budget exceeded)",
+    "parallel_quantization": "vectorized 9-candidate grid search (2x speedup at quant time)",
+    "dispatch_policy": "O(1)/O(log n)/O(n) hierarchy, calibration-based routing",
+    "sparse_gemv": "implemented and correct; disabled by default (insufficient activation sparsity on Phi-4 for throughput gain)",
+    "learned_correction": "implemented (32x MLP, 320KB); trained on synthetic data pending real calibration run",
+    "numpy_forward_stack": "32 layers in single numpy path, no per-layer torch (Phase 7)",
+    "lm_head_parallel": "OpenMP F16C (Phase 8); memory-bound, minimal gain",
+    "rope_tables": "corrected ROTARY_DIM=96, 48-wide tables (Phase 9 fix)"
+  },
+
+  "key_learnings": [
+    "LUT kernel O(1) depth advantage requires matrix to fit in L2 cache (~512KB). Phi-4 projections are 6-512MB per tile — LUT not applicable at this model size.",
+    "Dispatch overhead matters: Python routing added 0.5 tok/s regression until precomputed dispatch table was added (Phase 6).",
+    "The largest single gains came from fixing bugs (RoPE tables Phase 8/9, torch-numpy boundary Phase 7) not from new algorithms.",
+    "At 16-17% DDR4 bandwidth utilization, remaining headroom requires either fewer bytes (2-bit quantization) or wider SIMD (AVX-512 on compatible hardware).",
+    "WikiText-2 absolute PPL is a poor gate for instruct-tuned multimodal models; relative 4-bit vs FP16 on the same corpus is the correct quality metric.",
+    "On WikiText-64, 4-bit Q4 is ~44% worse PPL than FP16; 8-bit matches FP16. Absolute PPL<=12.40 (Phase 3) is not a valid target for this configuration."
+  ],
+
+  "recommended_quality_gate": {
+    "metric": "ppl_4bit_dispatch / ppl_fp16",
+    "target_max_ratio": 1.10,
+    "current_wikitext_64_ratio": 1.436,
+    "meets_gate": false
+  }
+}

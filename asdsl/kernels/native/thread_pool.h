@@ -8,6 +8,7 @@
 #include <functional>
 #include <algorithm>
 #include <iostream>
+#include <chrono>
 #include <immintrin.h>
 #include <cstdint>
 #include <cassert>
@@ -23,6 +24,9 @@
 #endif
 
 namespace asdsl {
+
+class ThreadPool;
+extern thread_local ThreadPool* tl_active_pool;
 
 // Get physical core count
 inline int get_physical_cores() {
@@ -106,11 +110,32 @@ class ThreadPool {
 
         Job* local_job = nullptr;
         uint64_t local_job_id = 0;
+        // Graduated backoff counter for idle periods (no active job).
+        // Phases: <32768 → _mm_pause(), <36864 → yield(), else → sleep(1µs).
+        //
+        // Threshold tuning: at ~10 ns per _mm_pause(), 32768 iterations ≈ 327 µs.
+        // The longest inter-barrier gap during forward_token() is swiglu_quantize
+        // on 17920 elements, measured at ~15 µs on this hardware. 327 µs >> 15 µs,
+        // so workers will always still be in _mm_pause() when the next parallel_for
+        // fires during active generation. yield() is only reached between generate()
+        // calls (user think-time), preventing thermal throttling on long sessions.
+        int idle_spin = 0;
+
         while (!stop_flag.load(std::memory_order_relaxed)) {
             Job* expected = current_job.load(std::memory_order_acquire);
             if (expected == nullptr) {
                 local_job = nullptr;
+                // Graduated backoff: spin → yield → sleep
+                if (++idle_spin < 32768) {
+                    _mm_pause();
+                } else if (idle_spin < 36864) {
+                    std::this_thread::yield();
+                } else {
+                    std::this_thread::sleep_for(std::chrono::microseconds(1));
+                    idle_spin = 36864; // cap to avoid integer overflow
+                }
             } else if (expected != local_job || local_job_id != expected->job_id) {
+                idle_spin = 0; // reset backoff on new job
                 local_job = expected;
                 local_job_id = expected->job_id;
                 local_job->workers_inside.fetch_add(1, std::memory_order_relaxed);
@@ -128,18 +153,180 @@ class ThreadPool {
                 }
                 local_job->workers_inside.fetch_sub(1, std::memory_order_release);
             } else {
-                _mm_pause(); // Spin wait
+                // Brief spin: waiting for master to clear current_job after all tasks
+                // are completed. This window is typically <50 cycles — do not back off.
+                _mm_pause();
             }
         }
     }
 
 public:
+
+    // Logical processor IDs for P-cores ONLY (highest EfficiencyClass), no HT siblings.
+    //
+    // Rationale: on Intel Raptor Lake (8P + 4E), including E-cores hurts bandwidth-bound
+    // workloads. All 12 cores share the same memory controller; E-core DRAM requests
+    // compete for bandwidth without proportional throughput contribution due to lower
+    // per-core sustained frequency and memory bus priority. llama.cpp achieves 3.44 tok/s
+    // with -t 8 (P-cores only); ASDSL's 12-thread config degraded effective BW from
+    // 20.4 GB/s to 17.5 GB/s (measured). Filtering to P-cores targets parity.
+    static std::vector<int> get_pcore_logical_ids() {
+        std::vector<int> ids;
+#if defined(_WIN32)
+        DWORD buffer_size = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &buffer_size);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            // API unavailable: conservative fallback — use half of logical cores (P-cores on HT)
+            int n = (int)std::thread::hardware_concurrency();
+            int half = std::max(1, n / 2);
+            for (int i = 0; i < half; ++i) ids.push_back(i);
+            return ids;
+        }
+        std::vector<char> buf(buffer_size);
+        GetLogicalProcessorInformationEx(RelationProcessorCore,
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf.data(), &buffer_size);
+
+        struct CoreEntry {
+            int id;
+            BYTE eff;
+        };
+
+        // Pass 1: find the maximum EfficiencyClass (= P-core class)
+        BYTE max_eff = 0;
+        DWORD off = 0;
+        while (off < buffer_size) {
+            auto* info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + off);
+            if (info->Relationship == RelationProcessorCore) {
+                if (info->Processor.EfficiencyClass > max_eff)
+                    max_eff = info->Processor.EfficiencyClass;
+            }
+            off += info->Size;
+        }
+
+        // Pass 2: collect only P-core logical IDs (EfficiencyClass == max_eff)
+        std::vector<CoreEntry> entries;
+        off = 0;
+        while (off < buffer_size) {
+            auto* info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + off);
+            if (info->Relationship == RelationProcessorCore &&
+                info->Processor.EfficiencyClass == max_eff) {
+                for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
+                    KAFFINITY mask = info->Processor.GroupMask[g].Mask;
+                    USHORT group = info->Processor.GroupMask[g].Group;
+                    // First set bit only: one logical CPU per physical core (skip HT sibling)
+                    for (int bit = 0; bit < 64; ++bit) {
+                        if (mask & (KAFFINITY(1) << bit)) {
+                            entries.push_back({(int)(group * 64 + bit), max_eff});
+                            break;
+                        }
+                    }
+                }
+            }
+            off += info->Size;
+        }
+        std::sort(entries.begin(), entries.end(), [](const CoreEntry& a, const CoreEntry& b) {
+            return a.id < b.id;
+        });
+        for (const auto& e : entries) ids.push_back(e.id);
+#else
+        // Linux: assume first half of logical cores are P-cores (no SMT on typical setups)
+        int n = (int)std::thread::hardware_concurrency();
+        int half = std::max(1, n / 2);
+        for (int i = 0; i < half; ++i) ids.push_back(i);
+#endif
+        if (ids.empty()) {
+            // Final fallback: at least 1 thread
+            int n = (int)std::thread::hardware_concurrency();
+            int half = std::max(1, n / 2);
+            for (int i = 0; i < half; ++i) ids.push_back(i);
+        }
+        return ids;
+    }
+
+    // Returns ALL logical CPU IDs for P-cores, including HyperThreading siblings.
+    // On a 4P+HT system returns [0,1,2,3,4,5,6,7]; on 8P without HT returns [0..7].
+    // Use this for OMP_PLACES to fill all P-core execution slots.
+    static std::vector<int> get_all_pcore_logical_ids() {
+        std::vector<int> ids;
+#if defined(_WIN32)
+        DWORD buffer_size = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &buffer_size);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            int n = (int)std::thread::hardware_concurrency();
+            int half = std::max(1, n / 2);
+            for (int i = 0; i < half * 2; ++i) ids.push_back(i);
+            return ids;
+        }
+        std::vector<char> buf(buffer_size);
+        GetLogicalProcessorInformationEx(RelationProcessorCore,
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf.data(), &buffer_size);
+
+        // Pass 1: find max EfficiencyClass (= P-core class)
+        BYTE max_eff = 0;
+        DWORD off = 0;
+        while (off < buffer_size) {
+            auto* info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + off);
+            if (info->Relationship == RelationProcessorCore) {
+                if (info->Processor.EfficiencyClass > max_eff)
+                    max_eff = info->Processor.EfficiencyClass;
+            }
+            off += info->Size;
+        }
+
+        // Pass 2: collect ALL logical IDs for P-cores (every set bit, including HT siblings)
+        off = 0;
+        while (off < buffer_size) {
+            auto* info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + off);
+            if (info->Relationship == RelationProcessorCore &&
+                info->Processor.EfficiencyClass == max_eff) {
+                for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
+                    KAFFINITY mask = info->Processor.GroupMask[g].Mask;
+                    USHORT group = info->Processor.GroupMask[g].Group;
+                    for (int bit = 0; bit < 64; ++bit) {
+                        if (mask & (KAFFINITY(1) << bit)) {
+                            ids.push_back((int)(group * 64 + bit));
+                        }
+                    }
+                }
+            }
+            off += info->Size;
+        }
+        std::sort(ids.begin(), ids.end());
+#else
+        int n = (int)std::thread::hardware_concurrency();
+        int half = std::max(1, n / 2);
+        for (int i = 0; i < half; ++i) ids.push_back(i);
+#endif
+        if (ids.empty()) {
+            int n = (int)std::thread::hardware_concurrency();
+            for (int i = 0; i < n; ++i) ids.push_back(i);
+        }
+        return ids;
+    }
+
+    // Default constructor: auto-detect P-cores and spawn one worker per core.
     ThreadPool() {
         persistent_job.job_id = 0;
-        int n_threads = get_physical_cores();
+        auto pcore_ids = get_pcore_logical_ids();
+        int n_threads = (int)pcore_ids.size();
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back(&ThreadPool::worker_loop, this, i);
-            pin_thread_to_core(workers.back(), i);
+            pin_thread_to_core(workers.back(), pcore_ids[i]);
+        }
+    }
+
+    // Zero-worker constructor: no background threads are created.
+    // All parallel_for calls fall through to serial execution on the master thread
+    // (or are never called when replaced with #pragma omp parallel for).
+    // Use this when parallelism is handled externally (e.g. OpenMP).
+    explicit ThreadPool(int n_workers) {
+        persistent_job.job_id = 0;
+        if (n_workers <= 0) return;  // zero-worker mode: no threads created
+        auto pcore_ids = get_pcore_logical_ids();
+        n_workers = std::min(n_workers, (int)pcore_ids.size());
+        for (int i = 0; i < n_workers; ++i) {
+            workers.emplace_back(&ThreadPool::worker_loop, this, i);
+            pin_thread_to_core(workers.back(), pcore_ids[i]);
         }
     }
 
@@ -198,13 +385,28 @@ public:
             _mm_pause();
         }
 
-        current_job.store(nullptr, std::memory_order_release);
-
-        // Wait for workers to leave the job's loop
+        // Drain workers BEFORE clearing current_job and before touching persistent_job
+        // again. The original order (clear current_job first, then drain workers_inside)
+        // was a data race: after current_job becomes nullptr workers exit their chunk loop
+        // and decrement workers_inside, but between the nullptr store and the
+        // workers_inside drain the *next* parallel_for call (from any engine instance)
+        // could overwrite persistent_job.func with a new lambda.  Any worker thread
+        // that had not yet executed its final local_job->func(i) would then call the
+        // new lambda with a stale index, crashing into the new engine's data.
+        //
+        // Correct order:
+        //   1. Decrement master's workers_inside share.
+        //   2. Wait until every worker has also decremented (fully exited chunk loop).
+        //   3. Only then clear current_job so the next submission can safely mutate
+        //      persistent_job.
         job.workers_inside.fetch_sub(1, std::memory_order_release);
         while (job.workers_inside.load(std::memory_order_acquire) > 0) {
             _mm_pause();
         }
+
+        // All workers have exited the chunk loop and no longer hold a reference to
+        // persistent_job.func.  It is now safe to let a new submission overwrite it.
+        current_job.store(nullptr, std::memory_order_release);
     }
     
     // Helper for 2D tiling (e.g. nested loops)
@@ -232,11 +434,30 @@ public:
         });
     }
 
-    // Global singleton access
+    // Per-call-stack active pool: set by UnifiedEngine before every kernel
+    // dispatch so that free functions (gemv_q4_avx2.cpp etc.) that call
+    // get_instance() transparently use the engine's own isolated pool.
+    // Falls back to a process-wide default if no engine has set the pointer
+    // (e.g. kernels called directly from Python without an engine instance).
     static ThreadPool& get_instance() {
-        static ThreadPool pool;
-        return pool;
+        // tl_active_pool is set/cleared by ScopedActivePool (below).
+        // Defined in thread_pool.h as inline thread_local to avoid ODR issues.
+        if (tl_active_pool) return *tl_active_pool;
+        // Fallback singleton for code paths not driven through UnifiedEngine.
+        static ThreadPool fallback_pool;
+        return fallback_pool;
     }
+};
+
+// Thread-local pointer written by UnifiedEngine before every parallel_for
+// dispatch and cleared afterward.  Declared inline so it can live in a header
+// included by multiple translation units without ODR violations (C++17).
+inline thread_local ThreadPool* tl_active_pool = nullptr;
+
+// RAII guard: sets tl_active_pool for the duration of a scope.
+struct ScopedActivePool {
+    explicit ScopedActivePool(ThreadPool* p) { tl_active_pool = p; }
+    ~ScopedActivePool()                      { tl_active_pool = nullptr; }
 };
 
 } // namespace asdsl

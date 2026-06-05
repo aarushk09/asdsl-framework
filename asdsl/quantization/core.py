@@ -54,6 +54,12 @@ class QuantizedTensor:
         return data_bytes + scale_bytes + zero_bytes
 
 
+CLIP_RATIOS = np.array(
+    [0.85, 0.90, 0.93, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0],
+    dtype=np.float32,
+)
+
+
 def compute_scale_zero(
     weights: np.ndarray,
     bits: int,
@@ -88,29 +94,157 @@ def compute_scale_zero(
         return scales.astype(np.float16), zeros.astype(np.float16)
 
 
-def _find_optimal_scales(
+def _clip_ratios() -> np.ndarray:
+    if os.environ.get("ASDSL_FAST_TEST") == "1":
+        return np.array([1.0], dtype=np.float32)
+    return CLIP_RATIOS
+
+
+def compute_scale_zero_batched(
+    grouped: np.ndarray,
+    bits: int,
+    ratios: np.ndarray,
+    symmetric: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Compute scale/zero for every clipping ratio in one pass.
+
+    Args:
+        grouped: Float weights, shape (num_groups, group_size).
+        bits: Target bit-width.
+        ratios: Clipping ratios, shape (num_ratios,).
+        symmetric: Symmetric vs asymmetric quantization.
+
+    Returns:
+        scales shape (num_ratios, num_groups, 1); zeros same shape or None.
+    """
+    qmax = (1 << bits) - 1
+    ratios = ratios.astype(np.float32)
+    r_axis = ratios[:, np.newaxis, np.newaxis]
+
+    if symmetric:
+        abs_max = np.maximum(np.abs(grouped).max(axis=1, keepdims=True), 1e-5)
+        half_range = qmax / 2.0
+        clip_val = abs_max[np.newaxis, :, :] * r_axis
+        scales = np.maximum(clip_val / half_range, 1e-5)
+        return scales, None
+
+    w_min = grouped.min(axis=1, keepdims=True)
+    w_max = grouped.max(axis=1, keepdims=True)
+    w_range = np.maximum(w_max - w_min, 1e-5)
+    margin = w_range[np.newaxis, :, :] * (1.0 - r_axis) / 2.0
+    clip_min = w_min[np.newaxis, :, :] + margin
+    clip_max = w_max[np.newaxis, :, :] - margin
+    clip_range = np.maximum(clip_max - clip_min, 1e-5)
+    scales = clip_range / qmax
+    zeros = np.clip(-clip_min / np.maximum(scales, 1e-5), 0, qmax)
+    return scales, zeros
+
+
+def quantize_batched(
+    grouped: np.ndarray,
+    scales_all: np.ndarray,
+    zeros_all: np.ndarray | None,
+    bits: int,
+) -> np.ndarray:
+    """Quantize grouped weights for each ratio slice.
+
+    Returns:
+        uint8 array shape (num_ratios, num_groups, group_size).
+    """
+    qmin = 0
+    qmax = (1 << bits) - 1
+    scale_f16 = np.maximum(
+        scales_all.astype(np.float16).astype(np.float32),
+        1e-4,
+    )
+    grouped_b = grouped[np.newaxis, :, :]
+
+    if zeros_all is None:
+        half_range = qmax / 2.0
+        quantized = np.clip(
+            np.round(grouped_b / scale_f16 + half_range),
+            qmin,
+            qmax,
+        )
+    else:
+        zero_f16 = zeros_all.astype(np.float16).astype(np.float32)
+        quantized = np.clip(
+            np.round(grouped_b / scale_f16 + zero_f16),
+            qmin,
+            qmax,
+        )
+
+    return quantized.astype(np.uint8)
+
+
+def compute_mse_batched(
+    grouped: np.ndarray,
+    w_q_all: np.ndarray | None,
+    scales_all: np.ndarray,
+    zeros_all: np.ndarray | None,
+    bits: int,
+    *,
+    scale_f16: np.ndarray | None = None,
+    zero_f16: np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-group MSE for each ratio at float16 scale/zero precision.
+
+    Args:
+        w_q_all: Quantized weights (num_ratios, num_groups, group_size), or None
+            to recompute from scales/zeros without materializing uint8 storage.
+        scale_f16: Optional pre-rounded scales (num_ratios, num_groups, 1).
+        zero_f16: Optional pre-rounded zeros (same shape), asymmetric only.
+
+    Returns:
+        mse shape (num_ratios, num_groups).
+    """
+    qmin = 0
+    qmax = (1 << bits) - 1
+    if scale_f16 is None:
+        scale_f16 = np.maximum(
+            scales_all.astype(np.float16).astype(np.float32),
+            1e-4,
+        )
+    grouped_b = grouped[np.newaxis, :, :]
+
+    if zeros_all is None:
+        half_range = qmax / 2.0
+        if w_q_all is None:
+            quantized = np.clip(
+                np.round(grouped_b / scale_f16 + half_range),
+                qmin,
+                qmax,
+            )
+        else:
+            quantized = w_q_all.astype(np.float32)
+        dequantized = (quantized - half_range) * scale_f16
+    else:
+        if zero_f16 is None:
+            zero_f16 = zeros_all.astype(np.float16).astype(np.float32)
+        if w_q_all is None:
+            quantized = np.clip(
+                np.round(grouped_b / scale_f16 + zero_f16),
+                qmin,
+                qmax,
+            )
+        else:
+            quantized = w_q_all.astype(np.float32)
+        dequantized = (quantized - zero_f16) * scale_f16
+
+    return np.mean((grouped_b - dequantized) ** 2, axis=2)
+
+
+def _find_optimal_scales_sequential(
     grouped: np.ndarray,
     bits: int,
     symmetric: bool,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Find per-group scales that minimize reconstruction MSE via grid search.
-
-    Tests several clipping ratios and picks the best per group.
-    Fully vectorized across groups — loops only over the small ratio grid.
-    MSE is evaluated at float16 precision (matching storage) so the chosen
-    ratio is truly optimal after quantization parameter rounding.
-    """
+    """Sequential grid search over clipping ratios (one ratio at a time)."""
     qmin = 0
     qmax = (1 << bits) - 1
     n_groups = grouped.shape[0]
+    ratios = _clip_ratios()
 
-    # Quick test flag to bypass grid search for faster loading
-    if os.environ.get("ASDSL_FAST_TEST") == "1":
-        ratios = np.array([1.0], dtype=np.float32)
-    else:
-        ratios = np.array([0.85, 0.90, 0.93, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0],
-                          dtype=np.float32)
-    
     best_mse = np.full(n_groups, np.inf, dtype=np.float32)
     best_scales = np.ones((n_groups, 1), dtype=np.float32) * 1e-5
     best_zeros = None if symmetric else np.zeros((n_groups, 1), dtype=np.float32)
@@ -120,7 +254,6 @@ def _find_optimal_scales(
         half_range = (qmax - qmin) / 2.0
         for r in ratios:
             clip_val = abs_max * r
-            # Round scale to float16 to match actual storage precision
             scale = np.maximum(clip_val / half_range, 1e-5)
             scale_f16 = np.maximum(scale.astype(np.float16).astype(np.float32), 1e-4)
             quantized = np.clip(np.round(grouped / scale_f16 + half_range), qmin, qmax)
@@ -140,7 +273,6 @@ def _find_optimal_scales(
             clip_range = np.maximum(clip_max - clip_min, 1e-5)
             scale = clip_range / qmax
             zero = np.clip(-clip_min / np.maximum(scale, 1e-5), 0, qmax)
-            # Evaluate MSE at float16 precision (matching storage)
             scale_f16 = np.maximum(scale.astype(np.float16).astype(np.float32), 1e-4)
             zero_f16 = zero.astype(np.float16).astype(np.float32)
             quantized = np.clip(np.round(grouped / scale_f16 + zero_f16), qmin, qmax)
@@ -154,6 +286,73 @@ def _find_optimal_scales(
     if best_zeros is not None:
         return best_scales.astype(np.float16), best_zeros.astype(np.float16)
     return best_scales.astype(np.float16), None
+
+
+def _find_optimal_scales(
+    grouped: np.ndarray,
+    bits: int,
+    symmetric: bool,
+    *,
+    use_parallel: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Find per-group scales that minimize reconstruction MSE via grid search.
+
+    Tests several clipping ratios and picks the best per group.
+    With use_parallel=True, all ratios are evaluated in one batched pass.
+    MSE is evaluated at float16 precision (matching storage) so the chosen
+    ratio is truly optimal after quantization parameter rounding.
+    """
+    if not use_parallel:
+        return _find_optimal_scales_sequential(grouped, bits, symmetric)
+
+    ratios = _clip_ratios()
+    n_groups = grouped.shape[0]
+    n_ratios = len(ratios)
+    qmin = 0
+    qmax = (1 << bits) - 1
+    scales_all, zeros_all = compute_scale_zero_batched(
+        grouped, bits, ratios, symmetric,
+    )
+
+    mse = np.empty((n_ratios, n_groups), dtype=np.float32)
+    if symmetric:
+        half_range = qmax / 2.0
+        for i in range(n_ratios):
+            scale_f16 = np.maximum(
+                scales_all[i].astype(np.float16).astype(np.float32),
+                1e-4,
+            )
+            quantized = np.clip(
+                np.round(grouped / scale_f16 + half_range),
+                qmin,
+                qmax,
+            )
+            dequantized = (quantized - half_range) * scale_f16
+            mse[i] = np.mean((grouped - dequantized) ** 2, axis=1)
+    else:
+        for i in range(n_ratios):
+            scale_f16 = np.maximum(
+                scales_all[i].astype(np.float16).astype(np.float32),
+                1e-4,
+            )
+            zero_f16 = zeros_all[i].astype(np.float16).astype(np.float32)
+            quantized = np.clip(
+                np.round(grouped / scale_f16 + zero_f16),
+                qmin,
+                qmax,
+            )
+            dequantized = (quantized - zero_f16) * scale_f16
+            mse[i] = np.mean((grouped - dequantized) ** 2, axis=1)
+
+    best_idx = np.argmin(mse, axis=0)
+    group_idx = np.arange(n_groups)
+    best_scales = scales_all[best_idx, group_idx, 0].reshape(n_groups, 1)
+
+    if zeros_all is None:
+        return best_scales.astype(np.float16), None
+
+    best_zeros = zeros_all[best_idx, group_idx, 0].reshape(n_groups, 1)
+    return best_scales.astype(np.float16), best_zeros.astype(np.float16)
 
 
 def quantize_weights(

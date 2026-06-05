@@ -175,6 +175,11 @@ def _gemv_q4_numpy_unpacked(
 
 def _ensure_f32_contiguous(arr) -> np.ndarray:
     """Convert torch.Tensor or any array to contiguous float32 numpy."""
+    if isinstance(arr, np.ndarray):
+        if arr.dtype == np.float32 and arr.flags["C_CONTIGUOUS"]:
+            return arr
+        if arr.dtype == np.float32:
+            return np.ascontiguousarray(arr)
     try:
         import torch
 
@@ -183,6 +188,12 @@ def _ensure_f32_contiguous(arr) -> np.ndarray:
     except ImportError:
         pass
     return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _ensure_u8_contiguous_fast(arr) -> np.ndarray:
+    if isinstance(arr, np.ndarray) and arr.dtype == np.uint8 and arr.flags["C_CONTIGUOUS"]:
+        return arr
+    return _ensure_u8_contiguous(arr)
 
 
 def _ensure_u8_contiguous(arr) -> np.ndarray:
@@ -209,8 +220,11 @@ def gemv_q4_packed(
     M: int,
     K: int,
     group_size: int,
+    out: np.ndarray | None = None,
     use_lut: bool = False,
     use_q8: bool = False,
+    lut_cache=None,
+    bits: int = 4,
 ) -> np.ndarray:
     """Fused 4-bit packed GEMV: y = dequant(W_q4) @ x.
 
@@ -224,9 +238,11 @@ def gemv_q4_packed(
         M:          Output dimension (rows).
         K:          Input dimension (columns).
         group_size: Elements per quantization group.
-        use_lut:    If True, use the vpshufb LUT kernel (Phase 1) instead of FMA.
-                    Falls back to FMA path if _native_lut is not available.
+        use_lut:    If True, use Phase 1 LUT-native path when lut_cache is provided,
+                    else legacy vpshufb LUT, else FMA.
         use_q8:     If True, use dynamic Q8 activation quantization + madd_epi16 (Phase B).
+        lut_cache:  Optional LUTProjectionCache from warm_cache (prebuilt T tables).
+        bits:       Weight bit-width for LUT dispatch policy (default 4).
 
     Returns:
         Output float32, shape (M,) if x is 1-D, else (B, M).
@@ -234,7 +250,9 @@ def gemv_q4_packed(
     x = _ensure_f32_contiguous(x)
     scales = _ensure_f32_contiguous(scales)
     biases = _ensure_f32_contiguous(biases)
-    w_packed = _ensure_u8_contiguous(w_packed)
+    w_packed = _ensure_u8_contiguous_fast(w_packed)
+    if out is not None and (out.shape[0] != M or out.dtype != np.float32):
+        raise ValueError(f"out must be float32 shape ({M},), got {out.shape} {out.dtype}")
 
     if x.ndim == 1:
         if x.shape[0] != K:
@@ -254,18 +272,43 @@ def gemv_q4_packed(
             _native.gemv_q4_q8_avx2(w_packed, scales, x, y, M, K, group_size)
             return y
 
-    # LUT path (Phase 1): vpshufb-based kernel
+    # LUT path (Phase 1): prebuilt-table LUT or legacy vpshufb
     if use_lut and x.ndim == 1:
-        nl = _try_import_lut()
-        if nl is not None:
-            try:
-                return np.asarray(
-                    nl.gemv_lut_q4_tiled(w_packed, scales, biases, x, M, K, group_size)
-                )
-            except Exception as e:
-                logger.warning("LUT kernel failed (%s), falling back to FMA path", e)
+        from asdsl.lut.lut_dispatcher import LUTKernelDispatcher
+
+        return LUTKernelDispatcher.dispatch(
+            w_packed,
+            x,
+            scales,
+            biases,
+            M,
+            K,
+            group_size,
+            lut_cache=lut_cache,
+            bits=bits,
+            use_lut=True,
+            _try_import_lut=_try_import_lut,
+            _native_available=_native_available,
+            _native=_native,
+            _gemv_numpy=_gemv_q4_numpy_packed,
+        )
 
     if _native_available:
+        if out is not None and x.ndim == 1:
+            if hasattr(_native, "gemv_q4_packed_into"):
+                _native.gemv_q4_packed_into(
+                    w_packed, x, scales, biases, out, M, K, group_size
+                )
+                return out
+            np.copyto(
+                out,
+                np.asarray(
+                    _native.gemv_q4_packed(
+                        w_packed, x, scales, biases, M, K, group_size
+                    )
+                ),
+            )
+            return out
         return np.asarray(
             _native.gemv_q4_packed(w_packed, x, scales, biases, M, K, group_size)
         )

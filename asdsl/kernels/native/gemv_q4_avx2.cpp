@@ -251,6 +251,108 @@ void gemv_q4_q8_avx2(
     // std::vector automatically frees memory when it goes out of scope
 }
 
+static int q4km_prefetch_blocks_ahead() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("ASDSL_Q4KM_PREFETCH_BLOCKS");
+        v = e ? std::max(0, std::atoi(e)) : 2;
+    }
+    return v;
+}
+
+static int q4km_unroll_rows_for(int out_features) {
+    const char* e = std::getenv("ASDSL_Q4KM_UNROLL_ROWS");
+    if (e) {
+        const int requested = std::atoi(e);
+        if (requested <= 1) {
+            return 1;
+        }
+        return std::min(requested, 8);
+    }
+    // Default 8-row unroll on gate_up-sized projections (16384 rows).
+    if (out_features >= 8192) {
+        return 8;
+    }
+    if (out_features >= 2048) {
+        return 4;
+    }
+    return 1;
+}
+
+static inline float q4km_dot_superblock(
+    const uint8_t* blk,
+    const int8_t* x_q8_blk,
+    const float* x_scales_blk
+) {
+    uint16_t d_h;
+    uint16_t dmin_h;
+    std::memcpy(&d_h, blk + 0, sizeof(uint16_t));
+    std::memcpy(&dmin_h, blk + 2, sizeof(uint16_t));
+    const float d = fp16_to_float32(d_h);
+    const float dmin = fp16_to_float32(dmin_h);
+    const uint8_t* packed_scales = blk + 4;
+    const uint8_t* qs_base = blk + 16;
+
+    float acc = 0.0f;
+    for (int sb = 0; sb < 8; ++sb) {
+        const float sub_scale = d * static_cast<float>(get_6bit_packed(packed_scales, sb));
+        const float sub_min = dmin * static_cast<float>(get_6bit_packed(packed_scales, sb + 8));
+
+        const uint8_t* qs = qs_base + sb * 16;
+        const int8_t* xq = x_q8_blk + sb * 32;
+        const float x_scale = x_scales_blk[sb];
+
+        __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
+        __m128i mask = _mm_set1_epi8(0x0F);
+        __m128i lo = _mm_and_si128(packed, mask);
+        __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
+        __m128i w0_u8 = _mm_unpacklo_epi8(lo, hi);
+        __m128i w1_u8 = _mm_unpackhi_epi8(lo, hi);
+
+        __m256i w0 = _mm256_cvtepu8_epi16(w0_u8);
+        __m256i w1 = _mm256_cvtepu8_epi16(w1_u8);
+        __m256i x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(xq)));
+        __m256i x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(xq + 16)));
+
+        __m256i acc_int = _mm256_add_epi32(_mm256_madd_epi16(w0, x0), _mm256_madd_epi16(w1, x1));
+        const int32_t dot_int = hsum256_epi32(acc_int);
+
+        int32_t xsum_int = 0;
+        for (int i = 0; i < 32; ++i) {
+            xsum_int += static_cast<int32_t>(xq[i]);
+        }
+
+        acc += (sub_scale * static_cast<float>(dot_int) - sub_min * static_cast<float>(xsum_int)) * x_scale;
+    }
+    return acc;
+}
+
+static inline float q4km_dot_one_row(
+    const uint8_t* row_ptr,
+    int n_blocks_per_row,
+    const int8_t* x_q8_buf,
+    const float* x_scales,
+    int prefetch_ahead
+) {
+    float acc = 0.0f;
+    for (int b = 0; b < n_blocks_per_row; b += 2) {
+        const uint8_t* blk0 = row_ptr + static_cast<size_t>(b) * Q4K_BLOCK_SIZE;
+        if (prefetch_ahead > 0 && b + prefetch_ahead < n_blocks_per_row) {
+            _mm_prefetch(
+                reinterpret_cast<const char*>(row_ptr +
+                    static_cast<size_t>(b + prefetch_ahead) * Q4K_BLOCK_SIZE),
+                _MM_HINT_T0);
+        }
+        acc += q4km_dot_superblock(blk0, x_q8_buf + b * Q4K_N_PER_BLOCK, x_scales + b * 8);
+        if (b + 1 < n_blocks_per_row) {
+            const uint8_t* blk1 = row_ptr + static_cast<size_t>(b + 1) * Q4K_BLOCK_SIZE;
+            acc += q4km_dot_superblock(
+                blk1, x_q8_buf + (b + 1) * Q4K_N_PER_BLOCK, x_scales + (b + 1) * 8);
+        }
+    }
+    return acc;
+}
+
 void gemv_q4km_q8_avx2(
     const uint8_t* weights_q4km,
     const float* x,
@@ -296,60 +398,24 @@ void gemv_q4km_q8_avx2(
         }
     }
 
-    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, 1, [&](int row) {
+    const int prefetch_ahead = q4km_prefetch_blocks_ahead();
+    const int row_step = q4km_unroll_rows_for(out_features);
+    const size_t row_stride = static_cast<size_t>(n_blocks_per_row) * Q4K_BLOCK_SIZE;
 
-        const uint8_t* row_ptr = weights_q4km +
-            static_cast<size_t>(row) * n_blocks_per_row * Q4K_BLOCK_SIZE;
-        float acc = 0.0f;
-
-        for (int b = 0; b < n_blocks_per_row; ++b) {
-            const uint8_t* blk = row_ptr + static_cast<size_t>(b) * Q4K_BLOCK_SIZE;
-
-            uint16_t d_h;
-            uint16_t dmin_h;
-            std::memcpy(&d_h, blk + 0, sizeof(uint16_t));
-            std::memcpy(&dmin_h, blk + 2, sizeof(uint16_t));
-            const float d = fp16_to_float32(d_h);
-            const float dmin = fp16_to_float32(dmin_h);
-            const uint8_t* packed_scales = blk + 4;
-            const uint8_t* qs_base = blk + 16;
-
-            for (int sb = 0; sb < 8; ++sb) {
-                const float sub_scale = d * static_cast<float>(get_6bit_packed(packed_scales, sb));
-                const float sub_min = dmin * static_cast<float>(get_6bit_packed(packed_scales, sb + 8));
-
-                const uint8_t* qs = qs_base + sb * 16;
-                const int base_elem = b * Q4K_N_PER_BLOCK + sb * 32;
-                const int8_t* xq = x_q8_buf.data() + base_elem;
-                const float x_scale = x_scales[base_elem / 32];
-
-                __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
-                __m128i mask = _mm_set1_epi8(0x0F);
-                __m128i lo = _mm_and_si128(packed, mask);
-                __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
-                __m128i w0_u8 = _mm_unpacklo_epi8(lo, hi);
-                __m128i w1_u8 = _mm_unpackhi_epi8(lo, hi);
-
-                __m256i w0 = _mm256_cvtepu8_epi16(w0_u8);
-                __m256i w1 = _mm256_cvtepu8_epi16(w1_u8);
-                __m256i x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(xq)));
-                __m256i x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(xq + 16)));
-
-                __m256i acc_int = _mm256_add_epi32(_mm256_madd_epi16(w0, x0), _mm256_madd_epi16(w1, x1));
-                const int32_t dot_int = hsum256_epi32(acc_int);
-
-                int32_t xsum_int = 0;
-                for (int i = 0; i < 32; ++i) {
-                    xsum_int += static_cast<int32_t>(xq[i]);
-                }
-
-                acc += (sub_scale * static_cast<float>(dot_int) - sub_min * static_cast<float>(xsum_int)) * x_scale;
+    asdsl::ThreadPool::get_instance().parallel_for(0, out_features, row_step, [&](int row0) {
+        const int row_end = std::min(row0 + row_step, out_features);
+        for (int row = row0; row < row_end; ++row) {
+            const uint8_t* row_ptr = weights_q4km + static_cast<size_t>(row) * row_stride;
+            if (row_step >= 8 && row + row_step < out_features) {
+                _mm_prefetch(
+                    reinterpret_cast<const char*>(weights_q4km +
+                        static_cast<size_t>(row + row_step) * row_stride),
+                    _MM_HINT_T0);
             }
+            y[row] = q4km_dot_one_row(
+                row_ptr, n_blocks_per_row, x_q8_buf.data(), x_scales.data(), prefetch_ahead);
         }
-
-        y[row] = acc;
-        });
-
+    });
 }
 
 /**
@@ -1260,6 +1326,76 @@ Modifies Y_batch in-place (adds to it — caller should zero before calling).
         py::arg("out_features"), py::arg("in_features"));
 
     m.attr("has_q4km_gemv") = true;
+
+    m.def("quantize_activation_avx2",
+        [](py::array_t<float, py::array::c_style | py::array::forcecast> x,
+           py::array_t<int8_t, py::array::c_style | py::array::forcecast> x_q8,
+           py::array_t<float, py::array::c_style | py::array::forcecast> x_scales,
+           int in_features, int group_size) {
+            py::gil_scoped_release release;
+            quantize_activation_avx2(
+                static_cast<const float*>(x.request().ptr),
+                static_cast<int8_t*>(x_q8.request().ptr),
+                static_cast<float*>(x_scales.request().ptr),
+                in_features, group_size);
+        },
+        py::arg("x"), py::arg("x_q8"), py::arg("x_scales"),
+        py::arg("in_features"), py::arg("group_size") = 32);
+
+#define ASDSL_DEF_PREQ_FP32(NAME, FN) \
+    m.def(NAME, \
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> blocks, \
+           py::array_t<float, py::array::c_style | py::array::forcecast> x, \
+           py::array_t<float, py::array::c_style | py::array::forcecast> y, \
+           int out_features, int in_features, int group_size) { \
+            py::gil_scoped_release release; \
+            FN(static_cast<const uint8_t*>(blocks.request().ptr), \
+               static_cast<const float*>(x.request().ptr), \
+               static_cast<float*>(y.request().ptr), \
+               out_features, in_features, group_size); \
+        }, \
+        py::arg("blocks"), py::arg("x_fp32"), py::arg("y"), \
+        py::arg("out_features"), py::arg("in_features"), py::arg("group_size") = 32)
+
+    m.def("gemv_q4_32_preq_avx2",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> blocks,
+           py::array_t<int8_t, py::array::c_style | py::array::forcecast> x_q8,
+           py::array_t<float, py::array::c_style | py::array::forcecast> x_scales,
+           py::array_t<float, py::array::c_style | py::array::forcecast> y,
+           int out_features, int in_features, int group_size) {
+            py::gil_scoped_release release;
+            gemv_q4_32_preq_avx2(
+                static_cast<const uint8_t*>(blocks.request().ptr),
+                static_cast<const int8_t*>(x_q8.request().ptr),
+                static_cast<const float*>(x_scales.request().ptr),
+                static_cast<float*>(y.request().ptr),
+                out_features, in_features, group_size);
+        },
+        py::arg("blocks"), py::arg("x_q8"), py::arg("x_scales"), py::arg("y"),
+        py::arg("out_features"), py::arg("in_features"), py::arg("group_size") = 32);
+
+    ASDSL_DEF_PREQ_FP32("gemv_q4_32_preq_4row_avx2", gemv_q4_32_preq_4row_avx2);
+    ASDSL_DEF_PREQ_FP32("gemv_q4_32_preq_8row_avx2", gemv_q4_32_preq_8row_avx2);
+    ASDSL_DEF_PREQ_FP32("gemv_q4_32_preq_fused_avx2", gemv_q4_32_preq_fused_avx2);
+    ASDSL_DEF_PREQ_FP32("gemv_q4_32_preq_g4fused_4row_avx2", gemv_q4_32_preq_g4fused_4row_avx2);
+#undef ASDSL_DEF_PREQ_FP32
+
+    m.def("gemv_q4_128_preq_avx2",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> blocks,
+           py::array_t<int8_t, py::array::c_style | py::array::forcecast> x_q8,
+           py::array_t<float, py::array::c_style | py::array::forcecast> x_scales,
+           py::array_t<float, py::array::c_style | py::array::forcecast> y,
+           int out_features, int in_features, int group_size) {
+            py::gil_scoped_release release;
+            gemv_q4_128_preq_avx2(
+                static_cast<const uint8_t*>(blocks.request().ptr),
+                static_cast<const int8_t*>(x_q8.request().ptr),
+                static_cast<const float*>(x_scales.request().ptr),
+                static_cast<float*>(y.request().ptr),
+                out_features, in_features, group_size);
+        },
+        py::arg("blocks"), py::arg("x_q8"), py::arg("x_scales"), py::arg("y"),
+        py::arg("out_features"), py::arg("in_features"), py::arg("group_size") = 128);
 
     m.def("check_avx2", &check_avx2_support,
         "Runtime check: does this CPU support AVX2?");

@@ -972,18 +972,162 @@ int generate_token_mmap_stub(
     int head_dim,
     int vocab_size,
     KVCache& cache) {
-    (void)seq_pos;
-    (void)store;
-    (void)num_layers;
-    (void)dim;
-    (void)hidden_dim;
-    (void)num_heads;
-    (void)num_kv_heads;
-    (void)head_dim;
-    (void)cache;
-    if (vocab_size <= 0) {
+    
+    if (token_id < 0 || token_id >= vocab_size) {
         return 0;
     }
+    
+    const int q_dim = num_heads * head_dim;
+    const int kv_dim = num_kv_heads * head_dim;
+    const int inter_dim = hidden_dim;
+    
+    std::vector<float> hidden(dim, 0.0f);
+    std::vector<float> residual(dim, 0.0f);
+    std::vector<float> qkv_out(q_dim + 2 * kv_dim, 0.0f);
+    std::vector<float> q_arr(q_dim, 0.0f);
+    std::vector<float> k_arr(kv_dim, 0.0f);
+    std::vector<float> v_arr(kv_dim, 0.0f);
+    std::vector<float> att_out(q_dim, 0.0f);
+    std::vector<float> ffn_gate(inter_dim, 0.0f);
+    std::vector<float> ffn_up(inter_dim, 0.0f);
+    std::vector<float> ffn_combined(inter_dim, 0.0f);
+    std::vector<float> logits(vocab_size, 0.0f);
+    
+    const MmapWeights::TensorInfo* embed_t = store.get_tensor("embed");
+    if (!embed_t) {
+        return 0;
+    }
+    
+    const float* embed_data = reinterpret_cast<const float*>(embed_t->ptr);
+    const size_t embed_offset = static_cast<size_t>(token_id) * dim;
+    std::memcpy(hidden.data(), embed_data + embed_offset, dim * sizeof(float));
+    
+    for (int layer = 0; layer < num_layers; ++layer) {
+        std::memcpy(residual.data(), hidden.data(), dim * sizeof(float));
+        
+        std::string rms1_key = "l" + std::to_string(layer) + "_rms1";
+        const MmapWeights::TensorInfo* rms1_t = store.get_tensor(rms1_key);
+        if (rms1_t) {
+            const float* rms1_w = reinterpret_cast<const float*>(rms1_t->ptr);
+            float rms = 0.0f;
+            for (int i = 0; i < dim; ++i) {
+                rms += hidden[i] * hidden[i];
+            }
+            rms = std::sqrt(rms / dim + 1e-5f);
+            const float rms_inv = 1.0f / rms;
+            for (int i = 0; i < dim; ++i) {
+                hidden[i] = hidden[i] * rms_inv * rms1_w[i];
+            }
+        }
+        
+        std::string qkv_key = "l" + std::to_string(layer) + "_qkv";
+        const MmapWeights::TensorInfo* qkv_t = store.get_tensor(qkv_key);
+        if (!qkv_t) break;
+        
+        std::fill(qkv_out.begin(), qkv_out.end(), 0.0f);
+        gemv_q4k_avx2_rows(
+            reinterpret_cast<const BlockQ4K*>(qkv_t->ptr),
+            hidden.data(),
+            qkv_out.data(),
+            q_dim + 2 * kv_dim,
+            dim,
+            qkv_t->interleaved4
+        );
+        
+        std::memcpy(q_arr.data(), qkv_out.data(), q_dim * sizeof(float));
+        std::memcpy(k_arr.data(), qkv_out.data() + q_dim, kv_dim * sizeof(float));
+        std::memcpy(v_arr.data(), qkv_out.data() + q_dim + kv_dim, kv_dim * sizeof(float));
+        
+        cache.set_history(layer, seq_pos, k_arr.data(), v_arr.data());
+        
+        std::memcpy(att_out.data(), q_arr.data(), q_dim * sizeof(float));
+        
+        std::string o_key = "l" + std::to_string(layer) + "_o";
+        const MmapWeights::TensorInfo* o_t = store.get_tensor(o_key);
+        if (o_t) {
+            std::vector<float> o_out(dim, 0.0f);
+            gemv_q4k_avx2_rows(
+                reinterpret_cast<const BlockQ4K*>(o_t->ptr),
+                att_out.data(),
+                o_out.data(),
+                dim,
+                q_dim,
+                o_t->interleaved4
+            );
+            for (int i = 0; i < dim; ++i) {
+                hidden[i] = o_out[i] + residual[i];
+            }
+        }
+        
+        std::memcpy(residual.data(), hidden.data(), dim * sizeof(float));
+        
+        std::string rms2_key = "l" + std::to_string(layer) + "_rms2";
+        const MmapWeights::TensorInfo* rms2_t = store.get_tensor(rms2_key);
+        if (rms2_t) {
+            const float* rms2_w = reinterpret_cast<const float*>(rms2_t->ptr);
+            float rms = 0.0f;
+            for (int i = 0; i < dim; ++i) {
+                rms += hidden[i] * hidden[i];
+            }
+            rms = std::sqrt(rms / dim + 1e-5f);
+            const float rms_inv = 1.0f / rms;
+            for (int i = 0; i < dim; ++i) {
+                hidden[i] = hidden[i] * rms_inv * rms2_w[i];
+            }
+        }
+        
+        std::string gate_key = "l" + std::to_string(layer) + "_gate";
+        std::string up_key = "l" + std::to_string(layer) + "_up";
+        const MmapWeights::TensorInfo* gate_t = store.get_tensor(gate_key);
+        const MmapWeights::TensorInfo* up_t = store.get_tensor(up_key);
+        
+        if (gate_t && up_t) {
+            std::fill(ffn_gate.begin(), ffn_gate.end(), 0.0f);
+            std::fill(ffn_up.begin(), ffn_up.end(), 0.0f);
+            
+            gemv_q4k_avx2_rows(
+                reinterpret_cast<const BlockQ4K*>(gate_t->ptr),
+                hidden.data(),
+                ffn_gate.data(),
+                inter_dim,
+                dim,
+                gate_t->interleaved4
+            );
+            
+            gemv_q4k_avx2_rows(
+                reinterpret_cast<const BlockQ4K*>(up_t->ptr),
+                hidden.data(),
+                ffn_up.data(),
+                inter_dim,
+                dim,
+                up_t->interleaved4
+            );
+            
+            for (int i = 0; i < inter_dim; ++i) {
+                float up_val = ffn_up[i];
+                float silu_val = up_val / (1.0f + std::exp(-up_val));
+                ffn_combined[i] = ffn_gate[i] * silu_val;
+            }
+        }
+        
+        std::string down_key = "l" + std::to_string(layer) + "_down";
+        const MmapWeights::TensorInfo* down_t = store.get_tensor(down_key);
+        if (down_t) {
+            std::fill(hidden.begin(), hidden.end(), 0.0f);
+            gemv_q4k_avx2_rows(
+                reinterpret_cast<const BlockQ4K*>(down_t->ptr),
+                ffn_combined.data(),
+                hidden.data(),
+                dim,
+                inter_dim,
+                down_t->interleaved4
+            );
+            for (int i = 0; i < dim; ++i) {
+                hidden[i] += residual[i];
+            }
+        }
+    }
+    
     int safe = token_id % vocab_size;
     return safe < 0 ? safe + vocab_size : safe;
 }

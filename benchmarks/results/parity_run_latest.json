@@ -1,0 +1,51 @@
+{
+  "timestamp_utc": "2026-06-03T02:30:16.205635+00:00",
+  "manifest": "benchmarks\\results\\parity_manifest.json",
+  "threads": 12,
+  "n_runs": 5,
+  "gguf_sha256": "fb8897a6038bb0bf04194d111a07a79f58e54f7e5d781b712140b73a5ff056cc",
+  "session_asdsl": {
+    "thermal": {
+      "initial_sleep_s": 60,
+      "max_temp_c": 65,
+      "temp_c": null,
+      "throttled": false,
+      "waited_s": 0,
+      "baseline_dot_ms": 12.042799964547157,
+      "proceeded": true
+    },
+    "configs": {
+      "C0": {
+        "decode_2_N": {
+          "runs": [
+            9.14,
+            9.57,
+            8.76,
+            7.97,
+            9.83
+          ],
+          "mean": 9.054,
+          "std": 0.654,
+          "min": 7.97,
+          "max": 9.83
+        },
+        "full_1_N": {
+          "runs": [
+            9.14,
+            9.57,
+            8.76,
+            7.97,
+            9.83
+          ],
+          "mean": 9.054,
+          "std": 0.654,
+          "min": 7.97,
+          "max": 9.83
+        },
+        "high_variance_warning": [
+          "ASDSL std 0.654 > 0.2"
+        ]
+      }
+    }
+  }
+}

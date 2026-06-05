@@ -34,6 +34,63 @@ void gemv_q4_avx2(
 }
 #endif
 
+void gemv_q4_32_preq_avx2(
+    const uint8_t* blocks,
+    const int8_t* x_q8,
+    const float* x_scales,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size);
+/** FP32 activations: per-group Q8 quant inside GEMV (no separate quantize pass). */
+void gemv_q4_32_preq_fused_avx2(
+    const uint8_t* blocks,
+    const float* x_fp32,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size);
+/** Phase 23: 4-row + 4-group fused inner loop (128 weights / group iteration). */
+void gemv_q4_32_preq_g4fused_4row_avx2(
+    const uint8_t* blocks,
+    const float* x_fp32,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size);
+
+void gemv_q4_32_preq_4row_avx2(
+    const uint8_t* blocks,
+    const float* x_fp32,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size);
+/** Optional 8-row unroll (benchmark via ASDSL_GEMV_UNROLL=8). */
+void gemv_q4_32_preq_8row_avx2(
+    const uint8_t* blocks,
+    const float* x_fp32,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size);
+void quantize_activation_avx2(
+    const float* x,
+    int8_t* x_q8,
+    float* x_scales,
+    int in_features,
+    int group_size);
+
+/** Q4_128 symmetric preq GEMV (66-byte blocks, group_size=128). */
+void gemv_q4_128_preq_avx2(
+    const uint8_t* blocks,
+    const int8_t* x_q8,
+    const float* x_scales,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size);
 void gemv_q4_32_q8_avx2(const uint8_t* blocks, const float* x, float* y, int out_features, int in_features, int group_size);
 void gemm_q4_32_q8_avx2(const uint8_t* blocks, const float* x, float* y, int out_features, int in_features, int group_size, int batch_size);
 void gemv_asb_avx2(const uint8_t* asb_blocks, const float* x, float* y, int out_features, int in_features, int group_size);
+void gemv_q4km_q8_avx2(const uint8_t* weights_q4km, const float* x, float* y, int out_features, int in_features);

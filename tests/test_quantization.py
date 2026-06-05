@@ -1,4 +1,4 @@
-"""Tests for the core quantization engine."""
+﻿"""Tests for the core quantization engine."""
 
 import numpy as np
 import pytest
@@ -18,14 +18,14 @@ class TestBitPacking:
     """Tests for sub-byte bit packing and unpacking."""
 
     def test_pack_unpack_2bit_roundtrip(self):
-        """2-bit values should survive pack → unpack roundtrip."""
+        """2-bit values should survive pack ΓåÆ unpack roundtrip."""
         values = np.array([0, 1, 2, 3, 1, 0, 3, 2], dtype=np.uint8)
         packed = _pack_bits(values, bits=2)
         unpacked = _unpack_bits(packed, bits=2)
         np.testing.assert_array_equal(unpacked[: len(values)], values)
 
     def test_pack_unpack_4bit_roundtrip(self):
-        """4-bit values should survive pack → unpack roundtrip."""
+        """4-bit values should survive pack ΓåÆ unpack roundtrip."""
         values = np.array([0, 15, 7, 8, 1, 14, 3, 12], dtype=np.uint8)
         packed = _pack_bits(values, bits=4)
         unpacked = _unpack_bits(packed, bits=4)
@@ -39,7 +39,7 @@ class TestBitPacking:
         np.testing.assert_array_equal(unpacked[: len(values)], values)
 
     def test_pack_unpack_3bit_roundtrip(self):
-        """3-bit values should survive pack → unpack roundtrip."""
+        """3-bit values should survive pack ΓåÆ unpack roundtrip."""
         values = np.array([0, 1, 2, 3, 4, 5, 6, 7], dtype=np.uint8)
         packed = _pack_bits(values, bits=3)
         unpacked = _unpack_bits(packed, bits=3)
@@ -81,7 +81,7 @@ class TestScaleComputation:
 
 
 class TestQuantization:
-    """Tests for full quantize → dequantize pipeline."""
+    """Tests for full quantize ΓåÆ dequantize pipeline."""
 
     @pytest.mark.parametrize("bits", [2, 4, 8])
     def test_quantize_dequantize_shape_preserved(self, bits):

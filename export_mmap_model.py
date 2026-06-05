@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import struct
 import numpy as np
@@ -8,7 +8,8 @@ from safetensors import safe_open
 from tqdm import tqdm
 
 ROOT = Path(__file__).parent
-MODEL_DIR = ROOT / "models" / "phi4-multimodal-instruct"
+SNAPSHOT_ID = "932b33c0ec9ca189badeb22480721a8de9d0e006"
+MODEL_DIR = Path(f"C:/Users/aarus/.cache/huggingface/hub/models--microsoft--phi-4/snapshots/{SNAPSHOT_ID}")
 INDEX_FILE = MODEL_DIR / "model.safetensors.index.json"
 
 GROUP_SIZE = 32
@@ -58,8 +59,19 @@ def repack_q4k_interleaved(
 
     return out_blocks.reshape(-1).tobytes()
 
+def permute(weights: torch.Tensor, n_heads: int, head_dim: int) -> torch.Tensor:
+    # Llama style permutation: [Standard HF] -> [Split-half for optimized RoPE]
+    # HF: [head_dim] where pairs (0,1), (2,3) etc are rotated
+    # Llama: [head_dim] where pairs (i, i+head_dim/2) are rotated
+    return (
+        weights.view(n_heads, head_dim // 2, 2, -1)
+        .transpose(1, 2)
+        .reshape(n_heads * head_dim, -1)
+    )
+
 def quantize_and_pack_q4_32(tensor: torch.Tensor) -> np.ndarray:
     """Returns a flattened uint8 numpy array containing the 18-byte packed blocks."""
+    # tensor.float() handles BF16 -> F32 conversion
     tensor_np = tensor.float().numpy()
     rows, cols = tensor_np.shape
     
@@ -78,7 +90,9 @@ def quantize_and_pack_q4_32(tensor: torch.Tensor) -> np.ndarray:
     scales[scales == 0] = 1e-5
     
     # Scale and clip
-    scaled = np.round(reshaped / scales[:, None].astype(np.float32))
+    # Ensure scales are cast to float32 for computation
+    scales_f32 = scales.astype(np.float32)
+    scaled = np.round(reshaped / scales_f32[:, None])
     quantized = np.clip(scaled, -7, 7).astype(np.int8) + 8  # 0 to 15 space
     quantized = quantized.astype(np.uint8)
     
@@ -104,13 +118,19 @@ def main():
     # Get unique shards
     shard_files = sorted(list(set(idx.values())))
     
-    out_bin_path = ROOT / "models" / "phi4_q4_32.bin"
-    out_json_path = ROOT / "models" / "phi4_q4_32_metadata.json"
+    # OUTPUTS
+    out_bin_path = ROOT / "models" / "phi4_14b_q4_32.bin"
+    out_json_path = ROOT / "models" / "phi4_14b_q4_32_metadata.json"
     
     metadata = {}
     current_offset = 0
     
-    print(f"Exporting to {out_bin_path}...")
+    # Phi-4 14B Config for Permutation
+    n_heads = 40
+    n_kv_heads = 10
+    head_dim = 128
+    
+    print(f"Exporting 14B model to {out_bin_path}...")
     
     # Open binary for raw append
     with open(out_bin_path, "wb") as f_out:
@@ -120,20 +140,35 @@ def main():
             
             with safe_open(shard_path, framework="pt", device="cpu") as f:
                 keys = f.keys()
-                # Process in a deterministic order for this shard
                 for key in tqdm(sorted(keys)):
                     tensor = f.get_tensor(key)
                     shape = list(tensor.shape)
                     
-                    # Quantize all 2D layers except embeddings
-                    if len(shape) == 2 and "embed" not in key:
+                    # PERMUTE Q/K HEADS FOR HF-to-ENGINE COMPATIBILITY
+                    if "qkv_proj" in key:
+                        # QKV is 7680 total rows. Q(5120), K(1280), V(1280)
+                        q = tensor[:5120, :]
+                        k = tensor[5120:5120+1280, :]
+                        v = tensor[5120+1280:, :]
+                        
+                        # Permute Q and K
+                        q = permute(q, n_heads, head_dim)
+                        k = permute(k, n_kv_heads, head_dim)
+                        
+                        # Concatenate back
+                        tensor = torch.cat([q, k, v], dim=0)
+                        shape = list(tensor.shape)
+                    
+                    # Quantize all 2D layers except embeddings and LM head
+                    # LM Head is float* in C++ engine
+                    if len(shape) == 2 and "embed" not in key and "lm_head" not in key:
                         dtype = "q4_32"
                         byte_array = quantize_and_pack_q4_32(tensor)
                     else:
                         dtype = "fp16"
                         byte_array = tensor.half().numpy().view(np.uint8).flatten()
                         
-                    # Write immediately to disk, discarding the PyTorch tensor
+                    # Write immediately to disk
                     f_out.write(byte_array.tobytes())
                     
                     size_bytes = len(byte_array)

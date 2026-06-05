@@ -30,8 +30,8 @@ def main():
     output_proj = token_embd  # Tied embedding!
     
     # RoPE tables
-    cos_table = store._cos_table.numpy().astype(np.float32)
-    sin_table = store._sin_table.numpy().astype(np.float32)
+    cos_table = store._cos_table.astype(np.float32) if hasattr(store._cos_table, 'astype') else np.array(store._cos_table, dtype=np.float32)
+    sin_table = store._sin_table.astype(np.float32) if hasattr(store._sin_table, 'astype') else np.array(store._sin_table, dtype=np.float32)
 
     layers_dict = {}
     for l in range(config.num_layers):

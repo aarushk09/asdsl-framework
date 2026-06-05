@@ -49,6 +49,65 @@ from transformers import AutoTokenizer
 from asdsl.engine import run_dual_model_speculative_benchmark
 
 
+class ForwardProfiler:
+    """Section timing for one layer / one decode token (Phase 7)."""
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.target_layer = 1
+        self.target_pos: int | None = None
+        self._layer_idx = -1
+        self._t0 = 0.0
+        self._key = ""
+        self.timings_ms: dict[str, float] = {}
+        self.layer_total_ms: float = 0.0
+
+    def set_pos(self, pos: int) -> None:
+        self._pos = pos
+
+    def active(self) -> bool:
+        return (
+            self.enabled
+            and self._layer_idx == self.target_layer
+            and self.target_pos is not None
+            and getattr(self, "_pos", -1) == self.target_pos
+        )
+
+    def begin(self, key: str) -> None:
+        if not self.active():
+            return
+        self._key = key
+        self._t0 = time.perf_counter()
+
+    def end(self) -> None:
+        if not self.active():
+            return
+        self.timings_ms[self._key] = (
+            self.timings_ms.get(self._key, 0.0)
+            + (time.perf_counter() - self._t0) * 1000.0
+        )
+
+    def print_report(self) -> None:
+        if not self.timings_ms:
+            return
+        total = sum(self.timings_ms.values())
+        print(
+            f"\n[PROFILE] Layer {self.target_layer}, pos={self.target_pos} "
+            f"(sections={total:.1f}ms layer_total={self.layer_total_ms:.1f}ms):"
+        )
+        for key, ms in sorted(self.timings_ms.items(), key=lambda x: -x[1]):
+            pct = (ms / total * 100.0) if total > 0 else 0.0
+            bar = "#" * int(pct / 2)
+            print(f"  {key:22s} {ms:7.2f}ms  {pct:5.1f}%  {bar}")
+        overhead = self.layer_total_ms - total
+        if overhead > 0.5:
+            print(
+                f"  {'unaccounted':22s} {overhead:7.2f}ms  "
+                f"{overhead / max(self.layer_total_ms, 1e-6) * 100:5.1f}%"
+            )
+        print()
+
+
 @dataclass
 class StreamToken:
     text: str = ""
@@ -57,6 +116,7 @@ class StreamToken:
     is_eos: bool = False
     elapsed_s: float = 0.0
     tokens_per_second: float = 0.0
+    step_elapsed_s: float = 0.0
 
 # Phase 17: Native C++ ops for non-GEMV operations
 try:
@@ -78,76 +138,86 @@ def _configure_cpu_torch_runtime() -> None:
 
 _configure_cpu_torch_runtime()
 
+# Raptor Lake hybrid default: 4 P-cores (logical 0-7) + E-cores (logical 8-15) on i7-1360P class CPUs.
+_P_LOGICAL_COUNT = 8
+
+
+def _logical_ids_for_threads(n: int) -> list[int]:
+    """Map requested OpenMP threads to distinct logical CPUs (P first, then E)."""
+    nlog = os.cpu_count() or 16
+    p_end = min(_P_LOGICAL_COUNT, nlog)
+    ids: list[int] = []
+    for i in range(p_end):
+        if len(ids) >= n:
+            break
+        ids.append(i)
+    for i in range(p_end, nlog):
+        if len(ids) >= n:
+            break
+        ids.append(i)
+    while len(ids) < n and len(ids) < nlog:
+        ids.append(len(ids))
+    return ids[:n]
+
 
 def set_thread_count(n: int) -> None:
-    """Set CPU threads for NumPy/BLAS/PyTorch and ASDSL native OpenMP GEMV.
+    """Set CPU threads for NumPy/BLAS/PyTorch and native OpenMP GEMV.
 
-    ``n <= 0`` (auto): use 8 P-cores only. E-cores are skipped because they
-    complete GEMV rows more slowly than P-cores, causing OpenMP barriers to wait.
-    Thread affinity is pinned to logical CPUs 0-7 (8 P-core physical cores on
-    Raptor Lake). Hyperthread siblings (CPUs 8-15) and E-cores (16-19) are excluded.
-    This matches llama.cpp's effective thread affinity.
+    ``n <= 0`` (auto): 8 threads on P-cores only.
+
+    Affinity modes (``ASDSL_AFFINITY``):
+      spread (default): one OpenMP thread per logical CPU in ``_logical_ids_for_threads``;
+      legacy: old ``OMP_PLACES={0-7}`` (12 threads oversubscribe 8 slots);
+      none: only ``OMP_NUM_THREADS``, no OMP binding.
     """
     if n <= 0:
-        n = 8  # P-cores only, matching llama.cpp
+        n = 8
+
+    mode = os.environ.get("ASDSL_AFFINITY", "spread").strip().lower()
+    logical_ids = _logical_ids_for_threads(n)
 
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(n)
 
-    # OpenMP thread binding: pin to logical CPUs 0-7 (P-cores only)
-    # This avoids E-core slowdown and HT contention on the memory controller.
-    os.environ["OMP_PROC_BIND"] = "TRUE"
-    os.environ["OMP_PLACES"] = "{0-7}"
     os.environ["OMP_SCHEDULE"] = "static"
+    if mode == "legacy":
+        os.environ["OMP_PROC_BIND"] = "TRUE"
+        os.environ["OMP_PLACES"] = "{0-7}"
+    elif mode == "spread":
+        os.environ["OMP_PROC_BIND"] = "close"
+        os.environ["OMP_PLACES"] = ",".join(f"{{{i}}}" for i in logical_ids)
+    else:
+        os.environ.pop("OMP_PROC_BIND", None)
+        os.environ.pop("OMP_PLACES", None)
 
     torch.set_num_threads(n)
     _configure_cpu_torch_runtime()
 
-    # P-core affinity pinning on Windows: try multiple methods
+    affinity_mask = sum(1 << i for i in logical_ids)
     if os.name == "nt":
-        pinned = False
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
-            # Method 1: SetProcessAffinityMask with proper handle
             handle = kernel32.GetCurrentProcess()
-            if handle and handle != -1:  # -1 is the pseudo-handle, still valid
-                p_core_mask = 0xFF  # binary 0b11111111 = logical CPUs 0-7
-                result = kernel32.SetProcessAffinityMask(handle, p_core_mask)
-                if result:
-                    print(f"[threads] Pinned to 8 P-cores via SetProcessAffinityMask (mask=0xFF), {n} threads")
-                    pinned = True
+            if handle and handle != -1:
+                if kernel32.SetProcessAffinityMask(handle, affinity_mask):
+                    print(
+                        f"[threads] affinity={mode} omp={n} "
+                        f"cpus={logical_ids} mask=0x{affinity_mask:X}",
+                        flush=True,
+                    )
                 else:
-                    err = kernel32.GetLastError()
-                    print(f"[threads] SetProcessAffinityMask failed (error {err}), trying alternative...")
-        except Exception as e:
-            print(f"[threads] Windows affinity method 1 failed: {e}")
-
-        if not pinned:
-            try:
-                # Method 2: Use STARTUPINFO approach via subprocess for child processes
-                # For the current process, set thread-level affinity
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                # Get current thread handle
-                thread_handle = kernel32.GetCurrentThread()
-                # Set thread affinity to P-cores
-                GROUP_AFFINITY = ctypes.c_uint64(0xFF)  # CPUs 0-7
-                # This is a simplified approach - set OMP_PLACES is the primary method
-                print(f"[threads] Using OMP_PLACES={{0-7}} for P-core binding, {n} threads")
-                pinned = True
-            except Exception:
-                pass
-
-        if not pinned:
-            print(f"[threads] WARNING: Could not pin threads to P-cores. Using {n} threads unbound.")
+                    print(
+                        f"[threads] SetProcessAffinityMask failed err={kernel32.GetLastError()}",
+                        flush=True,
+                    )
+        except Exception as exc:
+            print(f"[threads] affinity pin failed: {exc}", flush=True)
     else:
-        # Unix: use psutil for affinity
         try:
             import psutil
-            p = psutil.Process()
-            p.cpu_affinity(list(range(min(n, 16))))
+            psutil.Process().cpu_affinity(logical_ids)
         except Exception:
             pass
 
@@ -160,7 +230,17 @@ def set_thread_count(n: int) -> None:
 
 
 ROOT = Path(__file__).parent.parent
-MODEL_DIR = ROOT / "models" / "phi4-multimodal-instruct"
+
+
+def resolve_model_dir() -> Path:
+    """Local Phi-4 safetensors tree (override with ASDSL_MODEL_DIR)."""
+    override = os.environ.get("ASDSL_MODEL_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return (ROOT / "models" / "phi4-multimodal-instruct").resolve()
+
+
+MODEL_DIR = resolve_model_dir()
 INDEX_FILE = MODEL_DIR / "model.safetensors.index.json"
 
 # ---------------------------------------------------------------------------
@@ -330,9 +410,18 @@ def try_restore_weight_cache(store: WeightStore, path: Path) -> bool:
             else:
                 return False
             
-            store._quant_packed_np[(i, nm)] = store._quant_packed[(i, nm)].numpy().ravel() if (i, nm) in store._quant_packed else None
-            store._quant_sc_np[(i, nm)] = store._quant_sc[(i, nm)].float().numpy().ravel()
-            store._quant_bi_np[(i, nm)] = store._quant_bi[(i, nm)].float().numpy().ravel()
+            if (i, nm) in store._quant_packed:
+                store._quant_packed_np[(i, nm)] = np.ascontiguousarray(
+                    store._quant_packed[(i, nm)].numpy().ravel(), dtype=np.uint8
+                )
+            else:
+                store._quant_packed_np[(i, nm)] = None
+            store._quant_sc_np[(i, nm)] = np.ascontiguousarray(
+                store._quant_sc[(i, nm)].float().numpy().ravel(), dtype=np.float32
+            )
+            store._quant_bi_np[(i, nm)] = np.ascontiguousarray(
+                store._quant_bi[(i, nm)].float().numpy().ravel(), dtype=np.float32
+            )
 
         if store._enable_qcsd:
             for (i, nm) in shapes.keys():
@@ -356,9 +445,18 @@ def try_restore_weight_cache(store: WeightStore, path: Path) -> bool:
                 else:
                     return False
                 
-                store._draft_quant_packed_np[(i, nm)] = store._draft_quant_packed[(i, nm)].numpy().ravel() if (i, nm) in store._draft_quant_packed else None
-                store._draft_quant_sc_np[(i, nm)] = store._draft_quant_sc[(i, nm)].float().numpy().ravel()
-                store._draft_quant_bi_np[(i, nm)] = store._draft_quant_bi[(i, nm)].float().numpy().ravel()
+                if (i, nm) in store._draft_quant_packed:
+                    store._draft_quant_packed_np[(i, nm)] = np.ascontiguousarray(
+                        store._draft_quant_packed[(i, nm)].numpy().ravel(), dtype=np.uint8
+                    )
+                else:
+                    store._draft_quant_packed_np[(i, nm)] = None
+                store._draft_quant_sc_np[(i, nm)] = np.ascontiguousarray(
+                    store._draft_quant_sc[(i, nm)].float().numpy().ravel(), dtype=np.float32
+                )
+                store._draft_quant_bi_np[(i, nm)] = np.ascontiguousarray(
+                    store._draft_quant_bi[(i, nm)].float().numpy().ravel(), dtype=np.float32
+                )
                 dov_k = f"dov_{i}_{nm}"
                 if dov_k in fk:
                     ov = tensors[dov_k].numpy()
@@ -457,6 +555,236 @@ def save_weight_store_cache(store: WeightStore, path: Path) -> None:
     save_file(tensors, str(path), metadata=meta)
 
 
+# Persistent mmap preq-block cache (safetensors.numpy). Bump when block layout changes.
+PREQ_CACHE_FORMAT = "phi4_preq_blocks_v1"
+PROJ_NAMES = ("qkv_proj", "o_proj", "gate_up_proj", "down_proj")
+
+
+def _preq_cache_enabled() -> bool:
+    v = os.environ.get("PHI4_NO_PREQ_CACHE", "").strip().lower()
+    return v not in ("1", "true", "yes")
+
+
+def _preq_repack_imports(group_size: int):
+    """Return (BLOCK_SIZE, repack_fn, blocks_to_flat) for the store group size."""
+    if group_size == 128:
+        from asdsl.quantization.repack_q4_128 import (
+            BLOCK_SIZE,
+            blocks_to_flat,
+            repack_asymmetric_to_q4_128_blocks,
+        )
+
+        return BLOCK_SIZE, repack_asymmetric_to_q4_128_blocks, blocks_to_flat
+    from asdsl.quantization.repack_q4_32 import (
+        BLOCK_SIZE,
+        blocks_to_flat,
+        repack_asymmetric_to_q4_32_blocks,
+    )
+
+    return BLOCK_SIZE, repack_asymmetric_to_q4_32_blocks, blocks_to_flat
+
+
+def preq_cache_path_for_store(store: WeightStore) -> Path:
+    """Digest from quant config; GGUF loads use a separate preq cache file."""
+    wc = weight_cache_path_for_store(store)
+    digest = wc.stem.replace("phi4_cpu_", "")
+    tag = ""
+    gguf = getattr(store, "_gguf_path", None)
+    if gguf:
+        tag = "_gguf_" + hashlib.sha256(str(gguf).encode()).hexdigest()[:12]
+    fmt = "q4_128" if store.group_size == 128 else "q4_32"
+    return wc.parent / f"phi4_preq_{digest}{tag}_{fmt}.safetensors"
+
+
+def _quantize_config_meta(store: WeightStore) -> dict[str, str]:
+    return {
+        "bits": str(store.bits),
+        "group_size": str(store.group_size),
+        "enable_qcsd": str(store._enable_qcsd),
+        "draft_bits": str(store._draft_bits),
+        "draft_group_size": str(store._draft_group_size),
+        "enable_sparse": str(store._enable_sparse),
+        "sparsity_threshold": json.dumps(store._sparsity_threshold),
+        "symmetric": str(store._symmetric),
+        "optimize_clips": str(store._optimize_clips),
+        "quant_shapes": _shape_map_to_json(store._quant_shapes),
+    }
+
+
+def _quantize_config_matches(store: WeightStore, md: dict[str, str] | None) -> bool:
+    if not md or "quant_shapes" not in md:
+        return False
+    try:
+        shapes = _shape_map_from_json(md["quant_shapes"])
+        if shapes != store._quant_shapes:
+            return False
+        checks = [
+            int(md["bits"]) == store.bits,
+            int(md["group_size"]) == store.group_size,
+            md.get("enable_qcsd", "False") == str(store._enable_qcsd),
+            int(md.get("draft_bits", "2")) == store._draft_bits,
+            int(md.get("draft_group_size", "32")) == store._draft_group_size,
+            md.get("enable_sparse", "False") == str(store._enable_sparse),
+            math.isclose(
+                _meta_sparsity_value(md.get("sparsity_threshold", "0.01")),
+                store._sparsity_threshold,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ),
+            md.get("symmetric", str(store._symmetric)) == str(store._symmetric),
+            md.get("optimize_clips", str(store._optimize_clips))
+            == str(store._optimize_clips),
+        ]
+        return all(checks)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _preq_tensor_key(layer: int, name: str) -> str:
+    return f"L{layer}_{name}"
+
+
+def _parse_preq_tensor_key(key: str) -> tuple[int, str]:
+    if not key.startswith("L"):
+        raise ValueError(f"invalid preq cache key: {key!r}")
+    layer_s, _, name = key[1:].partition("_")
+    return int(layer_s), name
+
+
+def try_restore_preq_cache(store: WeightStore, path: Path) -> bool:
+    """Mmap preq blocks from disk; return True if restored."""
+    if not path.is_file():
+        return False
+    BLOCK_SIZE, _, _ = _preq_repack_imports(store.group_size)
+
+    with safe_open(str(path), framework="pt", device="cpu") as f0:
+        md = f0.metadata()
+        if md.get("format") != PREQ_CACHE_FORMAT:
+            return False
+        if int(md.get("block_size", "0")) != BLOCK_SIZE:
+            return False
+        if not _quantize_config_matches(store, md):
+            return False
+
+    import safetensors.numpy as st_np
+
+    t0 = time.perf_counter()
+    loaded = st_np.load_file(str(path))
+    expected = {
+        (i, nm) for i in range(NUM_LAYERS) for nm in PROJ_NAMES if (i, nm) in store._quant_shapes
+    }
+    if set(_parse_preq_tensor_key(k) for k in loaded.keys()) != expected:
+        return False
+
+    gs = store.group_size
+    for key, blocks in loaded.items():
+        li, nm = _parse_preq_tensor_key(key)
+        rows, cols = store._quant_shapes[(li, nm)]
+        n_groups = cols // gs
+        want = rows * n_groups * BLOCK_SIZE
+        arr = np.ascontiguousarray(blocks, dtype=np.uint8)
+        if arr.nbytes != want:
+            return False
+        store._preq_blocks_np[(li, nm)] = arr
+
+    store._preq_built = True
+    store._preq_block_size = BLOCK_SIZE
+    dt = time.perf_counter() - t0
+    print(
+        f"  Preq cache restored: {len(loaded)} projections "
+        f"({path.name}, mmap, {dt:.2f}s)"
+    )
+    return True
+
+
+def save_preq_cache(store: WeightStore, path: Path) -> None:
+    """Write all preq block arrays to a single safetensors file."""
+    import safetensors.numpy as st_np
+    BLOCK_SIZE, _, _ = _preq_repack_imports(store.group_size)
+
+    preq_dict = {
+        _preq_tensor_key(li, nm): blocks
+        for (li, nm), blocks in store._preq_blocks_np.items()
+    }
+    meta = {"format": PREQ_CACHE_FORMAT, "block_size": str(BLOCK_SIZE)}
+    meta.update(_quantize_config_meta(store))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    st_np.save_file(preq_dict, str(path), metadata=meta)
+    mb = path.stat().st_size / 1e6
+    print(f"  Preq cache saved: {path} ({mb:.0f} MB)")
+
+
+Q4KM_CACHE_FORMAT = "phi4_q4km_blocks_v1"
+
+
+def q4km_cache_path_for_store(store: WeightStore) -> Path:
+    gguf = getattr(store, "_gguf_path", None)
+    if not gguf:
+        raise ValueError("Q4KM cache requires store._gguf_path (load_from_gguf first)")
+    digest = hashlib.sha256(str(gguf).encode()).hexdigest()[:16]
+    wc = weight_cache_path_for_store(store)
+    return wc.parent / f"phi4_q4km_{digest}.safetensors"
+
+
+def _q4km_tensor_key(layer: int, name: str) -> str:
+    return f"KM_L{layer}_{name}"
+
+
+def try_restore_q4km_cache(store: WeightStore, path: Path) -> bool:
+    if not path.is_file():
+        return False
+    import safetensors.numpy as st_np
+
+    with safe_open(str(path), framework="pt", device="cpu") as f0:
+        md = f0.metadata()
+        if md.get("format") != Q4KM_CACHE_FORMAT:
+            return False
+        if md.get("gguf_path") != str(getattr(store, "_gguf_path", "")):
+            return False
+
+    t0 = time.perf_counter()
+    loaded = st_np.load_file(str(path))
+    store._q4km_weights.clear()
+    store._q4km_shapes.clear()
+    for key, arr in loaded.items():
+        if not key.startswith("KM_L"):
+            continue
+        layer_s, _, name = key[2:].partition("_")
+        li, nm = int(layer_s), name
+        store._q4km_weights[(li, nm)] = np.ascontiguousarray(arr, dtype=np.uint8)
+        shp_key = f"shape_{key}"
+        if shp_key in loaded:
+            shp = loaded[shp_key]
+            store._q4km_shapes[(li, nm)] = (int(shp[0]), int(shp[1]))
+    store._use_q4km = len(store._q4km_weights) > 0
+    dt = time.perf_counter() - t0
+    print(
+        f"  Q4KM cache restored: {len(store._q4km_weights)} projections "
+        f"({path.name}, mmap, {dt:.2f}s)"
+    )
+    return store._use_q4km
+
+
+def save_q4km_cache(store: WeightStore, path: Path) -> None:
+    import safetensors.numpy as st_np
+
+    tensors: dict[str, np.ndarray] = {}
+    for (li, nm), blocks in store._q4km_weights.items():
+        k = _q4km_tensor_key(li, nm)
+        tensors[k] = blocks
+        shp = store._q4km_shapes.get((li, nm))
+        if shp:
+            tensors[f"shape_{k}"] = np.array(shp, dtype=np.int32)
+    meta = {
+        "format": Q4KM_CACHE_FORMAT,
+        "gguf_path": str(getattr(store, "_gguf_path", "")),
+        "n_projections": str(len(store._q4km_weights)),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    st_np.save_file(tensors, str(path), metadata=meta)
+    print(f"  Q4KM cache saved: {path.name} ({path.stat().st_size / 1e9:.2f} GB)")
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -550,7 +878,8 @@ class WeightStore:
 
     def __init__(self, bits: int = 4, group_size: int | None = None,
                  enable_qcsd: bool = False, draft_bits: int = 2,
-                 enable_sparse: bool = False, sparsity_threshold: float = 0.01):
+                 enable_sparse: bool = False, sparsity_threshold: float = 0.01,
+                 enable_lut: bool = False, enable_dispatch: bool = False):
         from asdsl.quantization.core import quantize_weights
         self._quantize = quantize_weights
         self.bits = bits
@@ -571,6 +900,7 @@ class WeightStore:
         self.embed: torch.Tensor | None = None
         self.embed_f16: torch.Tensor | None = None
         self.lm_head: torch.Tensor | None = None
+        self._lm_head_u16_np: np.ndarray | None = None
         self.final_norm: torch.Tensor | None = None
         self._weight_cache: dict[tuple, torch.Tensor] = {}
         self._dequant_cache: dict[tuple, torch.Tensor] = {}
@@ -606,8 +936,21 @@ class WeightStore:
 
         # Native LUT/GEMV fast path
         self._use_native_gemv = False
-        # Phase 1: vpshufb LUT kernel (Profile D)
+        # Phase 1: LUT-native GEMV (prebuilt T tables) or legacy vpshufb fallback
+        self._enable_lut = enable_lut
+        self._lut_cache: dict[tuple, object] = {}
         self._use_lut_gemv = False
+        # Phase 3: calibration-based kernel dispatch
+        self._enable_dispatch = enable_dispatch
+        self._dispatch_policy = None
+        self._kernel_tags: dict[tuple[int, str], object] = {}
+        self._dispatch_matvec_fast = False
+        self._sparse_dequant_f16: dict[tuple, np.ndarray] = {}
+        self._dispatch_output_buffers: dict[tuple, np.ndarray] = {}
+        self._matvec_out_bufs: dict[tuple, np.ndarray] = {}
+        self._norm_np: dict[tuple[int, str], np.ndarray] = {}
+        self._forward_profiler = ForwardProfiler()
+        self._lut_tile_groups = 64
         # Phase 2: SliM mixed-precision dispatch (Profile E)
         self._use_slim = False
         self._slim_meta = None          # loaded from phi4_slim_meta.json
@@ -669,18 +1012,41 @@ class WeightStore:
         self._eagle3_hidden_high: "np.ndarray | None" = None  # same as _last_final_hidden
 
         # Phase 16: Q8_0 activation quantization + integer GEMV (Profile F)
-        self._use_q8_gemv = False
+        self._use_q8_gemv = os.environ.get("ASDSL_USE_Q8_GEMV", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self._use_unified = os.environ.get("ASDSL_USE_UNIFIED", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self._unified_engine = None
+        self._preq_blocks_np: dict[tuple, np.ndarray] = {}
+        self._preq_built = False
+        self._preq_block_size: int | None = None
+        self._keep_packed_for_fallback = os.environ.get(
+            "ASDSL_KEEP_PACKED", ""
+        ).strip().lower() in ("1", "true", "yes")
         # Phase 22: Q4_K_M superblock weights loaded from GGUF
         self._use_q4km = False
         self._q4km_weights: dict[tuple[int, str], np.ndarray] = {}
         self._q4km_shapes: dict[tuple[int, str], tuple[int, int]] = {}
+        self._gguf_proj_types: dict[tuple[int, str], str] = {}
         self._gguf_path: str | None = None
+        self._gguf_projections_loaded: bool = False
 
         # Phase 17: Native C++ ops for non-GEMV operations
         self._use_native_ops = HAS_NATIVE_OPS
         # Pre-computed RoPE cos/sin tables as flat float32 numpy arrays
         self._cos_table: "np.ndarray | None" = None
         self._sin_table: "np.ndarray | None" = None
+
+        # Phase 4: per-layer MLP hidden correction (quantization error compensation)
+        self._correction = None
+        self._enable_correction = False
+        self._correction_scale = 1.0
 
     def enter_verify_phase(self) -> None:
         """Enable temporary dequantization caching for the speculative verify phase."""
@@ -693,15 +1059,20 @@ class WeightStore:
 
     # ------------------------------------------------------------------
     def load(self) -> None:
+        import time
+
         self._loaded_from_cache = False
+        t_load0 = time.perf_counter()
         if _weight_cache_enabled():
             cpath = weight_cache_path_for_store(self)
             if try_restore_weight_cache(self, cpath):
+                self._loaded_from_cache = True
                 nproj = NUM_LAYERS * 4
                 print(
                     f"  Restored {nproj} projection weights from cache "
                     f"({cpath.name}, mmap CPU) — skipping shard read/quantize"
                 )
+                print(f"  Weight restore: {time.perf_counter() - t_load0:.1f}s")
                 return
 
         idx = json.loads(INDEX_FILE.read_text())["weight_map"]
@@ -770,12 +1141,17 @@ class WeightStore:
                         self._weight_cache[(layer_idx, friendly)] = tensor.to(torch.float16)
                     else:
                         w_f32 = tensor.to(torch.float32).numpy()
-                        if self.bits <= 3:
+                        use_outliers = self.bits <= 3 or (
+                            self.bits == 4
+                            and os.environ.get("ASDSL_4BIT_OUTLIERS", "").strip().lower()
+                            in ("1", "true", "yes")
+                        )
+                        if use_outliers:
                             from asdsl.quantization.core import quantize_weights_with_outliers
                             # 2-bit: 3.0σ with 0.5% cap balances PPL improvement vs
                             # outlier correction overhead; 3-bit uses milder 3.5σ
                             sigma = 3.0 if self.bits == 2 else 3.5
-                            cap = 0.005
+                            cap = 0.005 if self.bits <= 3 else 0.001
                             qt, ov, oc = quantize_weights_with_outliers(
                                 w_f32, bits=self.bits,
                                 group_size=self.group_size,
@@ -871,12 +1247,15 @@ class WeightStore:
         return merged.reshape(-1), rows_total, cols
 
     def load_from_gguf(self, gguf_path: str) -> None:
-        """Load projection weights from a Q4_K GGUF file into Q4_K_M fast path.
+        """Load projection weights from a Q4_K_M GGUF into ASDSL packed + preq path.
 
-        This method only wires projection matrices (qkv/o/gate_up/down). Existing
-        embedding and norm tensors are kept from the current store state.
+        Dequantizes Q4_K / Q5_K / Q6_K tensors (logical out×in), re-quantizes with
+        ASDSL asymmetric Q4, then builds preq blocks for UnifiedEngine. Skips the
+        long HF calibration quantize when called before warm_cache().
         """
-        from asdsl.io.gguf_loader import read_gguf_tensors
+        from asdsl.io.gguf_loader import dequant_tensor, read_gguf_tensors
+
+        _ALLOWED_K = frozenset({"q4_k", "q5_k", "q6_k"})
 
         tensors = read_gguf_tensors(gguf_path)
         if not tensors:
@@ -887,90 +1266,213 @@ class WeightStore:
                 "load_from_gguf requires existing embeddings/norms; call load() first"
             )
 
+        expected = {
+            "qkv_proj": (QKV_DIM, HIDDEN),
+            "o_proj": (HIDDEN, HIDDEN),
+            "gate_up_proj": (2 * INTER, HIDDEN),
+            "down_proj": (HIDDEN, INTER),
+        }
         loaded = 0
+        t0 = time.perf_counter()
         self._q4km_weights.clear()
         self._q4km_shapes.clear()
+        self._gguf_proj_types.clear()
+        self._use_q4km = False
+        use_q4km_gguf = os.environ.get("ASDSL_USE_Q4KM_GGUF", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         for i in range(NUM_LAYERS):
             qkv_info = tensors.get(f"blk.{i}.attn_qkv.weight")
             if qkv_info is None:
-                q = tensors.get(f"blk.{i}.attn_q.weight")
-                k = tensors.get(f"blk.{i}.attn_k.weight")
-                v = tensors.get(f"blk.{i}.attn_v.weight")
-                if q is not None and k is not None and v is not None:
-                    qkv_raw, qkv_rows, qkv_cols = self._concat_q4k_rows([q, k, v])
-                else:
-                    raise RuntimeError(f"GGUF missing QKV tensors for layer {i}")
-            else:
-                if qkv_info.get("type") != "q4_k":
-                    raise RuntimeError(
-                        f"Layer {i} attn_qkv is {qkv_info.get('type')} (need q4_k)"
-                    )
-                qkv_rows, qkv_cols = [int(x) for x in qkv_info["shape"][:2]]
-                qkv_raw = np.ascontiguousarray(qkv_info["data"], dtype=np.uint8).reshape(-1)
-
+                raise RuntimeError(f"GGUF missing blk.{i}.attn_qkv.weight")
             o_info = tensors.get(f"blk.{i}.attn_output.weight")
-            if o_info is None or o_info.get("type") != "q4_k":
-                raise RuntimeError(f"Layer {i} attn_output.weight must be q4_k")
-            o_rows, o_cols = [int(x) for x in o_info["shape"][:2]]
-            o_raw = np.ascontiguousarray(o_info["data"], dtype=np.uint8).reshape(-1)
-
+            if o_info is None:
+                raise RuntimeError(f"GGUF missing blk.{i}.attn_output.weight")
             gu_info = tensors.get(f"blk.{i}.ffn_gate_up.weight")
+            if gu_info is None:
+                gu_info = tensors.get(f"blk.{i}.ffn_up.weight")
             if gu_info is None:
                 g = tensors.get(f"blk.{i}.ffn_gate.weight")
                 u = tensors.get(f"blk.{i}.ffn_up.weight")
-                if g is not None and u is not None:
-                    gu_raw, gu_rows, gu_cols = self._concat_q4k_rows([g, u])
-                else:
-                    raise RuntimeError(f"GGUF missing FFN gate/up tensors for layer {i}")
+                if g is None or u is None:
+                    raise RuntimeError(f"GGUF missing FFN gate/up for layer {i}")
+                gu_fp = np.concatenate(
+                    [dequant_tensor(g), dequant_tensor(u)], axis=0
+                ).astype(np.float32, copy=False)
+                gu_type = f"{g.get('type')}+{u.get('type')}"
+            elif use_q4km_gguf and str(gu_info.get("type", "")).lower() == "q4_k":
+                gu_fp = None
+                gu_type = gu_info.get("type", "?")
             else:
-                if gu_info.get("type") != "q4_k":
-                    raise RuntimeError(
-                        f"Layer {i} ffn_gate_up is {gu_info.get('type')} (need q4_k)"
-                    )
-                gu_rows, gu_cols = [int(x) for x in gu_info["shape"][:2]]
-                gu_raw = np.ascontiguousarray(gu_info["data"], dtype=np.uint8).reshape(-1)
-
+                gu_fp = dequant_tensor(gu_info)
+                gu_type = gu_info.get("type", "?")
             d_info = tensors.get(f"blk.{i}.ffn_down.weight")
-            if d_info is None or d_info.get("type") != "q4_k":
-                raise RuntimeError(
-                    f"Layer {i} ffn_down.weight is {None if d_info is None else d_info.get('type')} "
-                    "(need q4_k)"
-                )
-            d_rows, d_cols = [int(x) for x in d_info["shape"][:2]]
-            d_raw = np.ascontiguousarray(d_info["data"], dtype=np.uint8).reshape(-1)
+            if d_info is None:
+                raise RuntimeError(f"GGUF missing blk.{i}.ffn_down.weight")
 
-            expected = {
-                "qkv_proj": (QKV_DIM, HIDDEN),
-                "o_proj": (HIDDEN, HIDDEN),
-                "gate_up_proj": (2 * INTER, HIDDEN),
-                "down_proj": (HIDDEN, INTER),
+            proj_infos = {
+                "qkv_proj": qkv_info,
+                "o_proj": o_info,
+                "down_proj": d_info,
             }
-            found = {
-                "qkv_proj": (qkv_rows, qkv_cols),
-                "o_proj": (o_rows, o_cols),
-                "gate_up_proj": (gu_rows, gu_cols),
-                "down_proj": (d_rows, d_cols),
+            o_fp = (
+                None
+                if use_q4km_gguf and str(o_info.get("type", "")).lower() == "q4_k"
+                else dequant_tensor(o_info)
+            )
+            proj_fp = {
+                "qkv_proj": dequant_tensor(qkv_info),
+                "o_proj": o_fp,
+                "gate_up_proj": gu_fp,
+                "down_proj": dequant_tensor(d_info),
             }
-            for nm, shp in found.items():
-                if shp != expected[nm]:
+            proj_types = {
+                "qkv_proj": qkv_info.get("type"),
+                "o_proj": o_info.get("type"),
+                "gate_up_proj": gu_type,
+                "down_proj": d_info.get("type"),
+            }
+            for nm, t in proj_types.items():
+                self._gguf_proj_types[(i, nm)] = str(t).lower().split("+")[0]
+
+            for nm, info in proj_infos.items():
+                t = str(info.get("type", "")).lower()
+                if t not in _ALLOWED_K:
                     raise RuntimeError(
-                        f"GGUF shape mismatch at layer {i} {nm}: got {shp}, expected {expected[nm]}"
+                        f"Layer {i} {nm}: unsupported GGUF type {info.get('type')}"
                     )
 
-            self._q4km_weights[(i, "qkv_proj")] = qkv_raw
-            self._q4km_shapes[(i, "qkv_proj")] = (qkv_rows, qkv_cols)
-            self._q4km_weights[(i, "o_proj")] = o_raw
-            self._q4km_shapes[(i, "o_proj")] = (o_rows, o_cols)
-            self._q4km_weights[(i, "gate_up_proj")] = gu_raw
-            self._q4km_shapes[(i, "gate_up_proj")] = (gu_rows, gu_cols)
-            self._q4km_weights[(i, "down_proj")] = d_raw
-            self._q4km_shapes[(i, "down_proj")] = (d_rows, d_cols)
-            loaded += 4
+            def _logical_shape(nm: str) -> tuple[int, int]:
+                arr = proj_fp[nm]
+                if arr is not None:
+                    return tuple(int(x) for x in arr.shape)
+                if nm == "gate_up_proj":
+                    info = gu_info
+                else:
+                    info = proj_infos[nm]
+                return tuple(int(x) for x in info["logical_shape"])
 
-        self._use_q4km = True
+            for nm, shp in expected.items():
+                got = _logical_shape(nm)
+                if got != shp:
+                    raise RuntimeError(
+                        f"GGUF shape mismatch layer {i} {nm}: got {got}, expected {shp}"
+                    )
+
+            def _gguf_type_for(nm: str) -> str:
+                if nm == "gate_up_proj":
+                    return str(proj_types["gate_up_proj"]).split("+")[0].lower()
+                return str(proj_types.get(nm, "")).lower()
+
+            for nm in expected:
+                if use_q4km_gguf and _gguf_type_for(nm) == "q4_k":
+                    continue
+                key = (i, nm)
+                w_f32 = np.ascontiguousarray(proj_fp[nm], dtype=np.float32)
+                qt = self._quantize(w_f32, bits=4, group_size=self.group_size)
+                rows, cols = qt.shape
+                self._quant_shapes[key] = (rows, cols)
+                packed_np = np.ascontiguousarray(qt.data, dtype=np.uint8).copy()
+                self._quant_packed[key] = torch.from_numpy(packed_np).reshape(
+                    rows, cols // 2
+                )
+                numel = rows * cols
+                n_groups = numel // qt.group_size
+                sc = torch.from_numpy(qt.scales[:n_groups].copy().astype(np.float32))
+                if qt.is_symmetric:
+                    dq = (1 << qt.bits) - 1
+                    half_range = float(dq) / 2.0
+                    bi = (-half_range * sc).to(torch.float32)
+                else:
+                    zr = torch.from_numpy(qt.zeros[:n_groups].copy().astype(np.float32))
+                    bi = (-zr * sc)
+                self._quant_sc[key] = sc
+                self._quant_bi[key] = bi
+                self._quant_packed_np[key] = packed_np.ravel()
+                if i == 0 and nm == "qkv_proj":
+                    print(
+                        f"  GGUF types L0: qkv={proj_types['qkv_proj']} "
+                        f"o={proj_types['o_proj']} gu={proj_types['gate_up_proj']} "
+                        f"down={proj_types['down_proj']}"
+                    )
+                loaded += 1
+
         self._gguf_path = str(gguf_path)
-        print(f"  Loaded {loaded} Q4_K projection tensors from GGUF: {gguf_path}")
+        self._gguf_projections_loaded = True
+        self._preq_built = False
+        self._preq_blocks_np.clear()
+        if getattr(self, "_unified_engine", None) is not None:
+            self._unified_engine = None
+
+        if use_q4km_gguf:
+            from asdsl.io.gguf_loader import q4k_blocks_rowmajor
+
+            self._q4km_weights.clear()
+            self._q4km_shapes.clear()
+            q4km_loaded = 0
+            cache_restored = False
+            if _preq_cache_enabled():
+                try:
+                    km_path = q4km_cache_path_for_store(self)
+                    cache_restored = try_restore_q4km_cache(self, km_path)
+                    q4km_loaded = len(self._q4km_weights)
+                except ValueError:
+                    pass
+            if not cache_restored:
+                for i in range(NUM_LAYERS):
+                    mapping = {
+                        "qkv_proj": f"blk.{i}.attn_qkv.weight",
+                        "o_proj": f"blk.{i}.attn_output.weight",
+                        "down_proj": f"blk.{i}.ffn_down.weight",
+                    }
+                    gu_name = f"blk.{i}.ffn_gate_up.weight"
+                    if gu_name not in tensors:
+                        gu_name = f"blk.{i}.ffn_up.weight"
+                    if gu_name not in tensors:
+                        g_name = f"blk.{i}.ffn_gate.weight"
+                        u_name = f"blk.{i}.ffn_up.weight"
+                        if g_name in tensors and u_name in tensors:
+                            raise RuntimeError(
+                                f"Layer {i}: split ffn_gate+ffn_up Q4_K concat not implemented; "
+                                "use fused ffn_up or ffn_gate_up in GGUF"
+                            )
+                        raise RuntimeError(
+                            f"GGUF missing FFN gate/up for layer {i} "
+                            "(need ffn_gate_up, ffn_up, or gate+up)"
+                        )
+                    mapping["gate_up_proj"] = gu_name
+                    for nm, tname in mapping.items():
+                        info = tensors[tname]
+                        t = str(info.get("type", "")).lower()
+                        if t == "q4_k":
+                            self._q4km_weights[(i, nm)] = q4k_blocks_rowmajor(info)
+                            self._q4km_shapes[(i, nm)] = tuple(info["logical_shape"])
+                            q4km_loaded += 1
+                        elif t in ("q5_k", "q6_k"):
+                            pass
+                        else:
+                            raise RuntimeError(
+                                f"Layer {i} {nm}: Q4KM path unsupported type {info.get('type')}"
+                            )
+                q4km_loaded = len(self._q4km_weights)
+                if _preq_cache_enabled() and q4km_loaded > 0:
+                    try:
+                        save_q4km_cache(self, q4km_cache_path_for_store(self))
+                    except ValueError:
+                        pass
+            self._use_q4km = q4km_loaded > 0
+            print(
+                f"  Q4_K raw blocks for UnifiedEngine: {q4km_loaded} projections "
+                f"(q5_k/q6_k use preq fallback)"
+            )
+
+        dt = time.perf_counter() - t0
+        print(
+            f"  Loaded {loaded} GGUF projections (dequant+ASDSL Q4) in {dt:.1f}s: {gguf_path}"
+        )
 
     # --- float16 path (bits=16) helpers --------------------------------
 
@@ -1053,10 +1555,30 @@ class WeightStore:
         np.copyto(self._x_buf[:cols], x_np)
         x_np = self._x_buf[:cols]
         
-        out_np = gemv_q4_packed(
-            w_np, x_np, sc_np, bi_np, rows, cols, gs,
+        lut_key = (layer_idx, name)
+        lut_cache = None
+        if use_draft and lut_key in self._lut_cache:
+            lut_cache = self._lut_cache.get(("draft",) + lut_key)
+        elif not use_draft:
+            lut_cache = self._lut_cache.get(lut_key)
+        draft_bits = self._draft_bits if use_draft else self.bits
+        out_np = self._matvec_out_bufs.get(key)
+        if out_np is None or out_np.shape[0] != rows:
+            out_np = np.empty(rows, dtype=np.float32)
+            self._matvec_out_bufs[key] = out_np
+        gemv_q4_packed(
+            w_np,
+            x_np,
+            sc_np,
+            bi_np,
+            rows,
+            cols,
+            gs,
+            out=out_np,
             use_lut=self._use_lut_gemv,
-            use_q8=self._use_q8_gemv if not use_draft else False
+            use_q8=self._use_q8_gemv if not use_draft else False,
+            lut_cache=lut_cache,
+            bits=draft_bits if use_draft else self.bits,
         )
         result = torch.from_numpy(out_np).unsqueeze(0)
         outlier_store = (
@@ -1821,6 +2343,375 @@ class WeightStore:
             
         return res
 
+    def _inference_mode_message(self, *, has_gemv: bool) -> str:
+        """Human-readable active GEMV path for warm-cache status."""
+        if self.bits == 16:
+            return "chunked f16 matvec"
+        if self._use_unified:
+            return "UnifiedEngine C++ forward (Q4_32 preq GEMV)"
+        if self._enable_dispatch and self._dispatch_policy is not None:
+            return (
+                f"Phase 3 kernel dispatch (LUT/SPARSE/AVX2); "
+                f"{len(self._lut_cache)} LUT caches, "
+                f"{len(self._sparse_dequant_f16)} sparse dequant caches"
+            )
+        if self._use_q8_gemv and has_gemv:
+            return "native AVX2 GEMV Q4×Q8 (gemv_q4_q8_avx2)"
+        if has_gemv:
+            labels = {4: "Q4 packed (gemv_q4_packed)", 8: "Q8", 3: "Q3", 2: "Q2"}
+            kl = labels.get(self.bits, f"Q{self.bits}")
+            return f"native AVX2 GEMV {kl}"
+        return "chunked uint8 dequant+matvec (in-place, no AVX GEMV)"
+
+    def _finish_dispatch_caches(self) -> None:
+        """Build LUT/sparse caches once dispatch policy and quant arrays exist."""
+        import time
+
+        if not (self._enable_dispatch and self.bits == 4 and self._dispatch_policy is not None):
+            return
+        if not self._quant_packed_np:
+            return
+        t0 = time.perf_counter()
+        self._build_lut_caches()
+        t_lut = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        self._build_sparse_dequant_cache()
+        t_sparse = time.perf_counter() - t1
+        if self._dispatch_policy is not None:
+            self._rebuild_dispatch_matvec_routing()
+        print(
+            f"  Dispatch cache build: LUT {t_lut:.1f}s, sparse {t_sparse:.1f}s "
+            f"({len(self._lut_cache)} LUT, {len(self._sparse_dequant_f16)} sparse)"
+        )
+
+    def load_dispatch_policy(self, path: str | Path) -> None:
+        """Load Phase 3 projection profiles for kernel routing."""
+        from asdsl.dispatch.policy import DispatchPolicy
+
+        self._dispatch_policy = DispatchPolicy.load_json(path)
+        self._enable_dispatch = True
+        if self._quant_shapes:
+            self._rebuild_dispatch_matvec_routing()
+        print(
+            f"  Phase 3 dispatch: {len(self._dispatch_policy.profiles)} profiles "
+            f"from {Path(path).name}"
+        )
+
+    def _rebuild_dispatch_matvec_routing(self) -> None:
+        """Precompute kernel tags; bypass dispatch wrapper when all paths are AVX2."""
+        import os
+
+        from asdsl.dispatch.policy import KernelTag
+
+        self._kernel_tags = {}
+        if self._dispatch_policy is None:
+            self._dispatch_matvec_fast = False
+            return
+
+        sparse_infer = os.environ.get("ASDSL_SPARSE_INFER", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        has_lut = False
+        n_sparse_profile = 0
+        n_sparse_runtime = 0
+        for key in self._quant_shapes:
+            layer_idx, name = key
+            if name not in ("qkv_proj", "o_proj", "gate_up_proj", "down_proj"):
+                continue
+            tag = self._dispatch_policy.get_kernel(layer_idx, name)
+            if tag == KernelTag.SPARSE:
+                n_sparse_profile += 1
+                if not sparse_infer:
+                    tag = KernelTag.AVX2
+                else:
+                    n_sparse_runtime += 1
+            self._kernel_tags[key] = tag
+            if tag == KernelTag.LUT:
+                has_lut = True
+
+        self._dispatch_matvec_fast = not has_lut
+        if n_sparse_profile and not sparse_infer and not getattr(
+            self, "_printed_sparse_avx2_routing", False
+        ):
+            print(
+                f"  Phase 6 dispatch: {n_sparse_profile} SPARSE profiles -> AVX2 at inference "
+                f"(set ASDSL_SPARSE_INFER=1 to enable sparse GEMV)"
+            )
+            self._printed_sparse_avx2_routing = True
+        elif n_sparse_runtime and not getattr(self, "_printed_sparse_infer", False):
+            print(f"  Phase 6 dispatch: {n_sparse_runtime} projections use sparse GEMV")
+            self._printed_sparse_infer = True
+
+    def packed_weight_bytes(self) -> int:
+        """Packed Q4 weight bytes only (projection matrices)."""
+        return sum(int(arr.nbytes) for arr in self._quant_packed_np.values())
+
+    def total_matvec_weight_bytes(self) -> int:
+        """Bytes touched per full forward pass (packed + scales + biases per projection)."""
+        total = self.packed_weight_bytes()
+        total += sum(int(arr.nbytes) for arr in self._quant_sc_np.values())
+        total += sum(int(arr.nbytes) for arr in self._quant_bi_np.values())
+        return total
+
+    def _build_norm_np_cache(self) -> None:
+        """Precompute float32 norm vectors (load-time, not per-token)."""
+        self._norm_np.clear()
+        for layer_idx in range(NUM_LAYERS):
+            for name in ("input_layernorm", "post_attention_layernorm"):
+                t = self.layer_norms[layer_idx][name]
+                self._norm_np[(layer_idx, name)] = (
+                    t.detach().cpu().float().numpy().astype(np.float32, copy=False)
+                )
+        if self.final_norm is not None:
+            self._norm_np[(-1, "final")] = (
+                self.final_norm.detach().cpu().float().numpy().astype(np.float32, copy=False)
+            )
+
+    def _matvec_q4_packed_np(
+        self,
+        layer_idx: int,
+        name: str,
+        x_np: np.ndarray,
+        *,
+        use_draft: bool = False,
+    ) -> np.ndarray:
+        """Fused Q4 GEMV; x_np is float32 contiguous, returns float32 (M,)."""
+        from asdsl.kernels import gemv_q4_packed
+
+        key = (layer_idx, name)
+        if use_draft and key in self._draft_quant_packed_np:
+            w_np = self._draft_quant_packed_np[key]
+            sc_np = self._draft_quant_sc_np[key]
+            bi_np = self._draft_quant_bi_np[key]
+            gs = self._draft_group_size
+        else:
+            w_np = self._quant_packed_np[key]
+            sc_np = self._quant_sc_np[key]
+            bi_np = self._quant_bi_np[key]
+            gs = self.group_size
+        rows, cols = self._quant_shapes[key]
+        if self._x_buf is None or self._x_buf.size < cols:
+            self._x_buf = np.empty(cols, dtype=np.float32)
+        x_flat = np.ascontiguousarray(x_np, dtype=np.float32).ravel()
+        if x_flat.size != cols:
+            raise ValueError(f"x length {x_flat.size} != cols {cols}")
+        np.copyto(self._x_buf[:cols], x_flat)
+        out_np = self._matvec_out_bufs.get(key)
+        if out_np is None or out_np.shape[0] != rows:
+            out_np = np.empty(rows, dtype=np.float32)
+            self._matvec_out_bufs[key] = out_np
+        gemv_q4_packed(
+            w_np,
+            self._x_buf[:cols],
+            sc_np,
+            bi_np,
+            rows,
+            cols,
+            gs,
+            out=out_np,
+            use_lut=self._use_lut_gemv,
+            use_q8=self._use_q8_gemv if not use_draft else False,
+            lut_cache=self._lut_cache.get(key) if not use_draft else None,
+            bits=self._draft_bits if use_draft else self.bits,
+        )
+        return out_np
+
+    def matvec_np(
+        self,
+        layer_idx: int,
+        name: str,
+        x_np: np.ndarray,
+        *,
+        use_draft: bool = False,
+    ) -> np.ndarray:
+        """GEMV with float32 numpy input (avoids torch in Q4 packed path)."""
+        if self.bits == 16:
+            out_t = self.matvec(layer_idx, name, torch.from_numpy(x_np).unsqueeze(0), use_draft=use_draft)
+            return out_t.detach().cpu().float().numpy().ravel()
+        if self._enable_dispatch and self.bits == 4 and not self._use_slim:
+            tag = self._kernel_tags.get((layer_idx, name))
+            from asdsl.dispatch.policy import KernelTag
+
+            if tag in (KernelTag.LUT, KernelTag.SPARSE):
+                out_t = self.matvec(
+                    layer_idx, name, torch.from_numpy(x_np).unsqueeze(0), use_draft=use_draft
+                )
+                return out_t.detach().cpu().float().numpy().ravel()
+            if self._dispatch_matvec_fast and not use_draft:
+                return self._matvec_q4_packed_np(layer_idx, name, x_np, use_draft=False)
+            if tag in (None, KernelTag.AVX2):
+                return self._matvec_q4_packed_np(layer_idx, name, x_np, use_draft=use_draft)
+        if self.bits == 4 and (self._use_native_gemv or use_draft):
+            return self._matvec_q4_packed_np(layer_idx, name, x_np, use_draft=use_draft)
+        out_t = self.matvec(layer_idx, name, torch.from_numpy(x_np).unsqueeze(0), use_draft=use_draft)
+        return out_t.detach().cpu().float().numpy().ravel()
+
+    def _assert_packed_contiguous(self) -> None:
+        """One-time contiguity check after warm_cache (load-time, not per-token)."""
+        bad: list[str] = []
+        for key, arr in self._quant_packed_np.items():
+            if not arr.flags["C_CONTIGUOUS"]:
+                bad.append(f"L{key[0]}:{key[1]}")
+        if bad:
+            raise RuntimeError(
+                f"Non-contiguous packed weights ({len(bad)}): {bad[:4]}..."
+            )
+
+    def load_correction(self, path: str | Path, *, scale: float = 1.0) -> None:
+        """Load Phase 4 per-layer MLP correction bank (models/ + correction_manifest.json)."""
+        from asdsl.correction import load_correction
+
+        model = load_correction(path)
+        if model is None:
+            raise FileNotFoundError(f"correction weights not found: {path}")
+        self._correction = model
+        self._enable_correction = True
+        self._correction_scale = float(scale)
+        val_losses = [
+            float(x.get("val_loss", 0.0))
+            for x in model.manifest.get("layers", [])
+        ]
+        med = float(np.median(val_losses)) if val_losses else 0.0
+        print(
+            f"  Phase 4 correction: {model.num_layers} MLP layers, "
+            f"scale={self._correction_scale}, median val_loss={med:.2e}"
+        )
+
+    def _get_dispatch_output_buffer(self, key: tuple, size: int) -> np.ndarray:
+        """Reuse float32 output buffers across dispatch matvec calls."""
+        buf = self._dispatch_output_buffers.get(key)
+        if buf is None or buf.shape[0] != size:
+            buf = np.empty(size, dtype=np.float32)
+            self._dispatch_output_buffers[key] = buf
+        return buf
+
+    def _build_sparse_dequant_entry(self, key: tuple[int, str]) -> np.ndarray | None:
+        """Lazily dequant one SPARSE-tagged projection to float16."""
+        from asdsl.dispatch.policy import KernelTag
+        from asdsl.quantization.core import dequantize_weights
+
+        if key in self._sparse_dequant_f16:
+            return self._sparse_dequant_f16[key]
+        if self._dispatch_policy is None or key not in self._quant_packed_np:
+            return None
+        layer_idx, name = key
+        if self._dispatch_policy.get_kernel(layer_idx, name) != KernelTag.SPARSE:
+            return None
+        w_np = self._quant_packed_np[key]
+        rows, cols = self._quant_shapes[key]
+        gs = self.group_size
+        numel = rows * cols
+        n_groups = numel // gs
+        qt_stub = type("Q", (), {})()
+        qt_stub.data = w_np
+        qt_stub.scales = self._quant_sc_np[key][:n_groups]
+        qt_stub.zeros = None
+        qt_stub.group_size = gs
+        qt_stub.bits = 4
+        qt_stub.numel = numel
+        qt_stub.is_symmetric = True
+        qt_stub.shape = (rows, cols)
+        deq = dequantize_weights(qt_stub).reshape(rows, cols)
+        deq_clipped = np.clip(deq.astype(np.float32), -65504.0, 65504.0)
+        arr = np.ascontiguousarray(deq_clipped.astype(np.float16))
+        self._sparse_dequant_f16[key] = arr
+        return arr
+
+    def _build_sparse_dequant_cache(self) -> None:
+        """Prepare lazy sparse dequant cache (no eager 32×50MB build at load)."""
+        from asdsl.dispatch.policy import KernelTag
+
+        if self._dispatch_policy is None:
+            return
+        n_sparse = sum(
+            1
+            for key in self._quant_shapes
+            if self._dispatch_policy.get_kernel(key[0], key[1]) == KernelTag.SPARSE
+        )
+        if n_sparse == 0:
+            self._sparse_dequant_f16.clear()
+            return
+        self._sparse_dequant_f16.clear()
+        print(
+            f"  Phase 3 sparse dequant: {n_sparse} SPARSE projections "
+            f"(lazy f16 build on first sparse matvec)"
+        )
+
+    def _matvec_dispatch(
+        self,
+        layer_idx: int,
+        name: str,
+        x: torch.Tensor,
+        *,
+        use_draft: bool = False,
+    ) -> torch.Tensor:
+        """Route matvec by calibrated KernelTag (LUT / SPARSE / AVX2)."""
+        from asdsl.dispatch.policy import KernelTag
+        from asdsl.kernels.sparse_gemv import sparse_gemv_dequant_f16_avx2
+        from asdsl.lut import LUTGEMVKernel
+
+        if self._dispatch_policy is None:
+            return self._matvec_q4_packed(layer_idx, name, x, use_draft=use_draft)
+
+        key = (layer_idx, name)
+        tag = self._kernel_tags.get(
+            key, self._dispatch_policy.get_kernel(layer_idx, name)
+        )
+        lut_key = ("draft",) + key if use_draft else key
+        counts = getattr(self, "_dispatch_route_counts", None)
+        if counts is None:
+            self._dispatch_route_counts = {"LUT": 0, "SPARSE": 0, "AVX2": 0}
+            counts = self._dispatch_route_counts
+
+        if tag == KernelTag.LUT:
+            lut_cache = self._lut_cache.get(lut_key)
+            if lut_cache is not None:
+                counts["LUT"] += 1
+                x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+                cols = self._quant_shapes[key][1]
+                if self._x_buf is None or self._x_buf.size < cols:
+                    self._x_buf = np.empty(cols, dtype=np.float32)
+                np.copyto(self._x_buf[:cols], x_np)
+                y = LUTGEMVKernel(tile_groups=self._lut_tile_groups).gemv(
+                    lut_cache, self._x_buf[:cols], use_avx2=True
+                )
+                return torch.from_numpy(y).unsqueeze(0)
+            if not getattr(self, "_warned_lut_cache_miss", False):
+                print(
+                    f"  WARNING: LUT kernel assigned for {name} L{layer_idx} "
+                    f"but no lut_cache entry; falling back to gemv_q4_packed"
+                )
+                self._warned_lut_cache_miss = True
+            counts["AVX2"] += 1
+            return self._matvec_q4_packed(layer_idx, name, x, use_draft=use_draft)
+
+        if tag == KernelTag.SPARSE:
+            rows, cols = self._quant_shapes[key]
+            x_np = x.detach().cpu().float().contiguous().numpy().ravel()
+            thr = self._sparsity_threshold
+            n_active = int(np.count_nonzero(np.abs(x_np) >= thr))
+            # Dense activation: packed Q4 AVX2 beats f16 sparse gather.
+            if n_active > int(0.45 * cols):
+                counts["AVX2"] += 1
+                return self._matvec_q4_packed(layer_idx, name, x, use_draft=use_draft)
+            w_f16 = self._build_sparse_dequant_entry(key)
+            if w_f16 is None:
+                counts["AVX2"] += 1
+                return self._matvec_q4_packed(layer_idx, name, x, use_draft=use_draft)
+            counts["SPARSE"] += 1
+            buf_key = ("sparse",) + key
+            y = self._get_dispatch_output_buffer(buf_key, rows)
+            np.copyto(
+                y,
+                sparse_gemv_dequant_f16_avx2(w_f16, x_np, threshold=thr),
+            )
+            return torch.from_numpy(y).unsqueeze(0)
+
+        counts["AVX2"] += 1
+        return self._matvec_q4_packed(layer_idx, name, x, use_draft=use_draft)
+
     def matvec(self, layer_idx: int, name: str, x: torch.Tensor,
                use_draft: bool = False) -> torch.Tensor:
         """Bandwidth-efficient matrix-vector product: y = W @ x."""
@@ -1829,9 +2720,17 @@ class WeightStore:
             return self._matvec_q4km(layer_idx, name, x)
         if self.bits == 16:
             return self._matvec_f16(layer_idx, name, x)
+        if self._enable_dispatch and self.bits == 4 and not self._use_slim:
+            if self._dispatch_matvec_fast and not use_draft:
+                return self._matvec_q4_packed(layer_idx, name, x, use_draft=False)
+            return self._matvec_dispatch(layer_idx, name, x, use_draft=use_draft)
         # Phase 2: SliM mixed-precision path
         if self._use_slim and not use_draft and self.bits == 4:
             return self._matvec_slim(layer_idx, name, x)
+        if self._use_lut_gemv and self.bits == 4 and not use_draft:
+            lut_cache = self._lut_cache.get(key)
+            if lut_cache is not None:
+                return self._matvec_dispatch(layer_idx, name, x, use_draft=False)
         if self._use_native_gemv or use_draft:
             return self._matvec_native_gemv(layer_idx, name, x, use_draft=use_draft)
         return self._matvec_quant(layer_idx, name, x)
@@ -1911,6 +2810,13 @@ class WeightStore:
             print(f"[EAGLE-3] Error loading MTP head from {path}: {e}")
             self._use_eagle3 = False
 
+    def _ensure_lm_head_native_cache(self) -> None:
+        if self._lm_head_u16_np is not None or self.lm_head is None:
+            return
+        self._lm_head_u16_np = (
+            self.lm_head.detach().cpu().view(torch.uint16).numpy()
+        )
+
     def lm_head_matvec(self, hidden: torch.Tensor) -> torch.Tensor:
         """Compute logits = hidden @ lm_head.T with chunked f16 reads.
 
@@ -1924,10 +2830,96 @@ class WeightStore:
             hidden = hidden.unsqueeze(0)
         elif hidden.dim() != 2:
             raise ValueError(f"lm_head_matvec expects 1D/2D hidden, got shape {tuple(hidden.shape)}")
+        if hidden.shape[0] == 1 and self.lm_head is not None:
+            if os.environ.get("ASDSL_LM_HEAD_NATIVE", "1") != "0":
+                try:
+                    from asdsl.kernels import _native_gemv
+
+                    if hasattr(_native_gemv, "lm_head_gemv_f16"):
+                        self._ensure_lm_head_native_cache()
+                        w_u16 = self._lm_head_u16_np
+                        if w_u16 is not None:
+                            h_np = hidden.detach().float().squeeze(0).cpu().numpy()
+                            m, k = int(w_u16.shape[0]), int(w_u16.shape[1])
+                            logits_np = _native_gemv.lm_head_gemv_f16(w_u16, h_np, m, k)
+                            return torch.from_numpy(logits_np)
+                except Exception:
+                    pass
+            h = hidden.to(device=self.lm_head.device, dtype=self.lm_head.dtype)
+            return torch.matmul(h, self.lm_head.T).float().squeeze(0)
         out = self.lm_head_matmul_batch(hidden)
         if out.shape[0] == 1:
             return out.squeeze(0)
         return out
+
+    def _build_lut_caches(self) -> None:
+        """Build per-projection LUT tables for Phase 1 LUT-native GEMV."""
+        from asdsl.dispatch.policy import KernelTag, PHI4_PROJECTIONS
+        from asdsl.lut import LUTTableBuilder, should_use_lut
+
+        force_all_lut = os.environ.get("ASDSL_PPL_FORCE_LUT", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+        self._lut_cache.clear()
+        if self._dispatch_policy is not None and not force_all_lut:
+            has_lut = any(
+                self._dispatch_policy.get_kernel(layer_idx, name) == KernelTag.LUT
+                for (layer_idx, name) in self._quant_shapes
+                if name in PHI4_PROJECTIONS
+            )
+            if not has_lut:
+                self._use_lut_gemv = False
+                return
+
+        for key, w_np in self._quant_packed_np.items():
+            if w_np is None:
+                continue
+            layer_idx, name = key
+            if self._dispatch_policy is not None and not force_all_lut:
+                if self._dispatch_policy.get_kernel(layer_idx, name) != KernelTag.LUT:
+                    continue
+            rows, cols = self._quant_shapes[key]
+            gs = self.group_size
+            if not should_use_lut(4, gs, rows, cols):
+                continue
+            self._lut_cache[key] = LUTTableBuilder.build_projection(
+                np.ascontiguousarray(w_np, dtype=np.uint8),
+                np.ascontiguousarray(self._quant_sc_np[key], dtype=np.float32),
+                np.ascontiguousarray(self._quant_bi_np[key], dtype=np.float32),
+                rows,
+                cols,
+                gs,
+                zeros=None,
+                tile_groups=self._lut_tile_groups,
+                build_q_packed=True,
+            )
+        if self._enable_qcsd:
+            for key, w_np in self._draft_quant_packed_np.items():
+                rows, cols = self._quant_shapes[key]
+                gs = self._draft_group_size
+                if self._draft_bits != 4 or not should_use_lut(4, gs, rows, cols):
+                    continue
+                self._lut_cache[("draft",) + key] = LUTTableBuilder.build_projection(
+                    w_np,
+                    self._draft_quant_sc_np[key],
+                    self._draft_quant_bi_np[key],
+                    rows,
+                    cols,
+                    gs,
+                    zeros=None,
+                    tile_groups=self._lut_tile_groups,
+                    build_q_packed=True,
+                )
+        self._use_lut_gemv = len(self._lut_cache) > 0
+        if self._use_lut_gemv:
+            fp = LUTTableBuilder.footprint_bytes()
+            print(
+                f"  Phase 1 LUT cache: {len(self._lut_cache)} projections "
+                f"(K-tile ~{fp / 1024:.0f} KB float16)"
+            )
 
     def warm_cache(self) -> None:
         """Prepare weight cache for streaming inference.
@@ -1959,6 +2951,10 @@ class WeightStore:
 
         self._use_native_gemv = has_gemv
 
+        # LUT-only (no dispatch): build all eligible projections.
+        if self._enable_lut and self.bits == 4 and not self._enable_dispatch:
+            self._build_lut_caches()
+
         # Phase 4 Prerequisite B: build transposed down_proj weights
         if getattr(self, "_use_fatrelu", False):
             self.load_transposed_down_proj()
@@ -1973,21 +2969,33 @@ class WeightStore:
                     self._get_slim_repacked(i, name)
             print(f"  [SliM] Repacking done in {_time.time()-t0:.2f}s")
 
+        if getattr(self, "_gguf_projections_loaded", False):
+            total = NUM_LAYERS * 4
+            print(
+                f"  Warm-cache: skipped projection quantize ({total} tensors from GGUF)"
+            )
+            self._finish_dispatch_caches()
+            if self.bits == 4 and self._quant_packed_np:
+                self._assert_packed_contiguous()
+                self._build_norm_np_cache()
+            if self.bits == 4 and self._use_unified:
+                self.build_preq_blocks()
+            print(f"  Inference: {self._inference_mode_message(has_gemv=has_gemv)}")
+            self._build_rope_native_tables()
+            return
+
         if getattr(self, "_loaded_from_cache", False):
             total = NUM_LAYERS * 4
             print(
                 f"  Warm-cache: skipped (restored {total} projections from safetensors cache)"
             )
-            kernel_labels = {4: "Q4 packed (gemv_q4_packed)", 8: "Q8", 3: "Q3", 2: "Q2"}
-            if self.bits == 16:
-                print("  Inference: chunked f16 matvec")
-            elif has_gemv:
-                kl = kernel_labels.get(self.bits, f"Q{self.bits}")
-                print(f"  Inference: native AVX2 GEMV {kl}")
-            else:
-                print(
-                    "  Inference: chunked uint8 dequant+matvec (in-place, no AVX GEMV)"
-                )
+            self._finish_dispatch_caches()
+            if self.bits == 4 and self._quant_packed_np:
+                self._assert_packed_contiguous()
+                self._build_norm_np_cache()
+            if self.bits == 4 and self._use_unified:
+                self.build_preq_blocks()
+            print(f"  Inference: {self._inference_mode_message(has_gemv=has_gemv)}")
             if self._enable_qcsd and self.bits != 16:
                 d_bytes = sum(t.nbytes for t in self._draft_quant_u8.values())
                 d_bytes += sum(t.nbytes for t in self._draft_quant_packed.values())
@@ -1997,6 +3005,7 @@ class WeightStore:
             n_outliers = sum(len(v) for v in self._outlier_values.values())
             if n_outliers > 0:
                 print(f"  SpQR outliers: {n_outliers:,} values in FP16 sparse format")
+            self._build_rope_native_tables()
             return
 
         total = NUM_LAYERS * 4
@@ -2037,10 +3046,16 @@ class WeightStore:
                         self._quant_sc[key] = sc
                         self._quant_bi[key] = bi
 
-                        # Populate NumPy views for fast native dispatch
-                        self._quant_packed_np[key] = packed_np.ravel()
-                        self._quant_sc_np[key] = sc.numpy().ravel()
-                        self._quant_bi_np[key] = bi.numpy().ravel()
+                        # Populate NumPy views for fast native dispatch (C-contiguous)
+                        self._quant_packed_np[key] = np.ascontiguousarray(
+                            packed_np.ravel(), dtype=np.uint8
+                        )
+                        self._quant_sc_np[key] = np.ascontiguousarray(
+                            sc.numpy().ravel(), dtype=np.float32
+                        )
+                        self._quant_bi_np[key] = np.ascontiguousarray(
+                            bi.numpy().ravel(), dtype=np.float32
+                        )
 
                         if self._enable_qcsd and "_draft_" + name in self.layers.get(i, {}):
                             qt_d = self.layers[i]["_draft_" + name]
@@ -2192,34 +3207,107 @@ class WeightStore:
             if n_outliers > 0:
                 print(f"  SpQR outliers: {n_outliers:,} values in FP16 sparse format")
 
-            kernel_labels = {4: "Q4 packed (gemv_q4_packed)", 8: "Q8", 3: "Q3", 2: "Q2"}
-            if has_gemv:
-                kl = kernel_labels.get(self.bits, f"Q{self.bits}")
-                print(f"  Inference: native AVX2 GEMV {kl}")
-            else:
-                print(f"  Inference: chunked uint8 dequant+matvec (in-place, no AVX GEMV)")
+            self._finish_dispatch_caches()
+            if self.bits == 4 and self._quant_packed_np:
+                self._assert_packed_contiguous()
+                self._build_norm_np_cache()
+            if self.bits == 4 and self._use_unified:
+                self.build_preq_blocks()
+            print(f"  Inference: {self._inference_mode_message(has_gemv=has_gemv)}")
 
-        # Phase 17: Pre-compute RoPE cos/sin tables as flat float32 numpy arrays
-        # for native C++ RoPE dispatch. Tables are [max_seq_len, head_dim/2].
-        if HAS_NATIVE_OPS:
-            max_seq = 2048  # default max sequence length
-            half_head = HEAD_DIM // 2  # 64
-            cos_table = np.zeros((max_seq, half_head), dtype=np.float32)
-            sin_table = np.zeros((max_seq, half_head), dtype=np.float32)
-            for pos in range(max_seq):
-                for i in range(half_head):
-                    freq = 1.0 / (ROPE_THETA ** (2.0 * i / HEAD_DIM))
-                    angle = pos * freq
-                    cos_table[pos, i] = math.cos(angle)
-                    sin_table[pos, i] = math.sin(angle)
-            self._cos_table = np.ascontiguousarray(cos_table)
-            self._sin_table = np.ascontiguousarray(sin_table)
-            print(f"  Pre-computed RoPE tables: {max_seq} x {half_head} (native ops enabled)")
+        self._build_rope_native_tables()
 
         # (Initialization moved up above the early return to fix benchmarking)
 
+    def _build_rope_native_tables(self) -> None:
+        """Pre-compute RoPE cos/sin for native C++ RoPE (matches build_rope_cache)."""
+        half_rotary = ROTARY_DIM // 2
+        cos = getattr(self, "_cos_table", None)
+        if cos is not None:
+            if cos.shape[1] == half_rotary:
+                return
+            self._cos_table = None
+            self._sin_table = None
+        if not HAS_NATIVE_OPS:
+            return
+        max_seq = 2048
+        half_rotary = ROTARY_DIM // 2
+        cos_table = np.zeros((max_seq, half_rotary), dtype=np.float32)
+        sin_table = np.zeros((max_seq, half_rotary), dtype=np.float32)
+        for pos in range(max_seq):
+            for i in range(half_rotary):
+                freq = 1.0 / (ROPE_THETA ** (2.0 * i / ROTARY_DIM))
+                angle = pos * freq
+                cos_table[pos, i] = math.cos(angle)
+                sin_table[pos, i] = math.sin(angle)
+        self._cos_table = np.ascontiguousarray(cos_table)
+        self._sin_table = np.ascontiguousarray(sin_table)
+        print(
+            f"  Pre-computed RoPE tables: {max_seq} x {half_rotary} "
+            f"(partial rotary dim={ROTARY_DIM})"
+        )
+
     def get_norm(self, layer_idx: int, name: str) -> torch.Tensor:
         return self.layer_norms[layer_idx][name]
+
+    def _free_packed_weights_if_unified(self) -> None:
+        """Drop packed Q4 arrays when UnifiedEngine uses preq blocks only."""
+        if self.bits != 4 or not self._use_unified or self._keep_packed_for_fallback:
+            return
+        if not self._preq_built:
+            return
+        freed = sum(int(a.nbytes) for a in self._quant_packed_np.values())
+        self._quant_packed_np.clear()
+        self._quant_packed.clear()
+        gc.collect()
+        print(f"  Freed packed Q4 weights ({freed / 1e6:.0f} MB) for unified-only path")
+
+    def build_preq_blocks(self) -> None:
+        """Repack Q4 weights into preq blocks (Q4_32 or Q4_128) for native GEMV."""
+        BLOCK_SIZE, repack_fn, blocks_to_flat = _preq_repack_imports(self.group_size)
+
+        if getattr(self, "_preq_block_size", None) != BLOCK_SIZE:
+            self._preq_blocks_np.clear()
+            self._preq_built = False
+            self._preq_block_size = BLOCK_SIZE
+        if self._preq_built or self.bits != 4:
+            return
+
+        if _preq_cache_enabled() and not getattr(self, "_gguf_projections_loaded", False):
+            ppath = preq_cache_path_for_store(self)
+            if try_restore_preq_cache(self, ppath):
+                if self._use_unified:
+                    self._build_norm_np_cache()
+                    self._free_packed_weights_if_unified()
+                return
+        elif getattr(self, "_gguf_projections_loaded", False):
+            print("  Preq: rebuilding from GGUF-packed weights (no HF preq cache) ...", flush=True)
+
+        label = "Q4_128" if self.group_size == 128 else "Q4_32"
+        print(f"  Repacking weights to {label} preq blocks (gs={self.group_size}) ... ", end="", flush=True)
+        t0 = time.perf_counter()
+        for key, w_np in self._quant_packed_np.items():
+            rows, cols = self._quant_shapes[key]
+            blocks = repack_fn(
+                w_np,
+                self._quant_sc_np[key],
+                self._quant_bi_np[key],
+                rows,
+                cols,
+                self.group_size,
+                bits=self.bits,
+            )
+            self._preq_blocks_np[key] = blocks_to_flat(blocks)
+        self._preq_built = True
+        dt = time.perf_counter() - t0
+        print(f"done ({len(self._preq_blocks_np)} tensors, {dt:.1f}s)")
+
+        if _preq_cache_enabled():
+            save_preq_cache(self, preq_cache_path_for_store(self))
+
+        if self._use_unified:
+            self._build_norm_np_cache()
+            self._free_packed_weights_if_unified()
 
 
 # ---------------------------------------------------------------------------
@@ -2252,6 +3340,19 @@ class KVHistory:
         """Return views into the pre-allocated buffers (zero-copy)."""
         n = self._len[layer]
         return self.k_buf[layer][:n], self.v_buf[layer][:n]
+
+    def get_flat_kv_np(self, layer: int) -> tuple[np.ndarray, np.ndarray]:
+        """Contiguous float32 K/V cache flats for native attention (no .cpu().float())."""
+        n = self._len[layer]
+        k_view = self.k_buf[layer][:n]
+        v_view = self.v_buf[layer][:n]
+        k_np = k_view.numpy()
+        v_np = v_view.numpy()
+        if not k_np.flags["C_CONTIGUOUS"]:
+            k_np = np.ascontiguousarray(k_np)
+        if not v_np.flags["C_CONTIGUOUS"]:
+            v_np = np.ascontiguousarray(v_np)
+        return k_np.ravel(), v_np.ravel()
 
     def get_last_np(self, layer: int) -> tuple[np.ndarray, np.ndarray]:
         """Return the most recently appended K/V as numpy (zero-copy view)."""
@@ -2322,6 +3423,146 @@ class ASDSLKVTracker:
 # Transformer forward pass
 # ---------------------------------------------------------------------------
 
+def _use_forward_numpy_path(store: WeightStore) -> bool:
+    if os.environ.get("ASDSL_FORWARD_NUMPY", "1").strip().lower() in ("0", "false", "no"):
+        return False
+    return bool(store._use_native_ops and HAS_NATIVE_OPS and _native_ops is not None)
+
+
+def _forward_layer_numpy_fast_np(
+    residual: np.ndarray,
+    layer_idx: int,
+    store: WeightStore,
+    kv_hist: KVHistory,
+    pos: int,
+    prof: ForwardProfiler,
+) -> np.ndarray:
+    """Numpy-native layer; mutates/returns residual (HIDDEN,) float32."""
+    if os.environ.get("ASDSL_FORWARD_NOOP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return residual
+
+    t_layer = time.perf_counter()
+    prof._layer_idx = layer_idx
+    if residual.size != HIDDEN:
+        residual = np.ascontiguousarray(residual, dtype=np.float32).ravel()
+
+    prof.begin("rms_norm_attn")
+    rms_att_w = store._norm_np.get(
+        (layer_idx, "input_layernorm"),
+        store.get_norm(layer_idx, "input_layernorm").detach().cpu().float().numpy(),
+    )
+    h = np.empty(HIDDEN, dtype=np.float32)
+    _native_ops.rmsnorm_f32(residual, h, rms_att_w, HIDDEN, RMS_EPS)
+    prof.end()
+
+    prof.begin("qkv_proj")
+    qkv_np = store.matvec_np(layer_idx, "qkv_proj", h)
+    prof.end()
+
+    prof.begin("qkv_split_rope")
+    q = qkv_np[:Q_DIM].reshape(NUM_HEADS, HEAD_DIM)
+    k = qkv_np[Q_DIM : Q_DIM + KV_DIM].reshape(NUM_KV_HEADS, HEAD_DIM)
+    v = qkv_np[Q_DIM + KV_DIM :].reshape(NUM_KV_HEADS, HEAD_DIM)
+    _native_ops.rope_apply_inplace(
+        q.ravel(),
+        k.ravel(),
+        store._cos_table,
+        store._sin_table,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        pos,
+        2048,
+    )
+    prof.end()
+
+    prof.begin("kv_write")
+    kv_hist.append(
+        layer_idx,
+        torch.from_numpy(k.astype(np.float32, copy=False)),
+        torch.from_numpy(v.astype(np.float32, copy=False)),
+    )
+    prof.end()
+
+    prof.begin("attention")
+    k_cache_flat, v_cache_flat = kv_hist.get_flat_kv_np(layer_idx)
+    seq_len = kv_hist._len[layer_idx]
+    attn_out = np.empty(NUM_HEADS * HEAD_DIM, dtype=np.float32)
+    _native_ops.gqa_decode_attention(
+        q.ravel(),
+        k_cache_flat,
+        v_cache_flat,
+        attn_out,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        seq_len,
+        1.0 / math.sqrt(HEAD_DIM),
+    )
+    prof.end()
+
+    prof.begin("o_proj")
+    o_proj_np = store.matvec_np(layer_idx, "o_proj", attn_out)
+    prof.end()
+
+    prof.begin("residual_attn")
+    _native_ops.vec_add_inplace(residual, o_proj_np, HIDDEN)
+    prof.end()
+
+    prof.begin("rms_norm_ffn")
+    rms_ffn_w = store._norm_np.get(
+        (layer_idx, "post_attention_layernorm"),
+        store.get_norm(layer_idx, "post_attention_layernorm").detach().cpu().float().numpy(),
+    )
+    h = np.empty(HIDDEN, dtype=np.float32)
+    _native_ops.rmsnorm_f32(residual, h, rms_ffn_w, HIDDEN, RMS_EPS)
+    prof.end()
+
+    prof.begin("gate_up_proj")
+    gu_np = store.matvec_np(layer_idx, "gate_up_proj", h)
+    prof.end()
+
+    prof.begin("silu")
+    gate = gu_np[:INTER]
+    up = gu_np[INTER:]
+    _native_ops.swiglu_inplace(gate, up, INTER)
+    prof.end()
+
+    prof.begin("down_proj")
+    down_np = store.matvec_np(layer_idx, "down_proj", gate)
+    prof.end()
+
+    prof.begin("residual_ffn")
+    _native_ops.vec_add_inplace(residual, down_np, HIDDEN)
+    prof.end()
+
+    if prof.active():
+        prof.layer_total_ms = (time.perf_counter() - t_layer) * 1000.0
+
+    return residual
+
+
+def _forward_layer_numpy_fast(
+    hidden: torch.Tensor,
+    layer_idx: int,
+    store: WeightStore,
+    kv_hist: KVHistory,
+    pos: int,
+    prof: ForwardProfiler,
+) -> torch.Tensor:
+    residual = (
+        hidden.detach().cpu().float().numpy().ravel()
+        if isinstance(hidden, torch.Tensor)
+        else np.ascontiguousarray(hidden, dtype=np.float32).ravel()
+    )
+    out = _forward_layer_numpy_fast_np(residual, layer_idx, store, kv_hist, pos, prof)
+    return torch.from_numpy(out).unsqueeze(0)
+
+
 def forward_layer(
     hidden: torch.Tensor,          # (1, hidden)
     layer_idx: int,
@@ -2342,6 +3583,21 @@ def forward_layer(
         use_draft: If True, use the draft (2-bit) weight bank for QCSD.
     """
     use_native = store._use_native_ops and HAS_NATIVE_OPS
+    prof = store._forward_profiler
+    prof._layer_idx = layer_idx
+
+    if (
+        _use_forward_numpy_path(store)
+        and not use_draft
+        and not store._enable_correction
+        and not store._use_fatrelu
+        and not store._enable_sparse
+    ):
+        out = _forward_layer_numpy_fast(hidden, layer_idx, store, kv_hist, pos, prof)
+        if prof.active() and layer_idx == prof.target_layer:
+            prof.print_report()
+            prof.timings_ms.clear()
+        return out
 
     # - Self-attention -
     residual = hidden.detach().cpu().float().numpy().ravel()
@@ -2388,10 +3644,7 @@ def forward_layer(
 
     # GQA attention
     if use_native:
-        # Flatten KV cache for native attention kernel
-        # k_hist: [seq_len, n_kv_heads, head_dim] → [seq_len * n_kv_heads * head_dim]
-        k_cache_flat = k_hist.detach().cpu().float().numpy().ravel()
-        v_cache_flat = v_hist.detach().cpu().float().numpy().ravel()
+        k_cache_flat, v_cache_flat = kv_hist.get_flat_kv_np(layer_idx)
         attn_out = np.empty(NUM_HEADS * HEAD_DIM, dtype=np.float32)
         _native_ops.gqa_decode_attention(
             q.ravel(), k_cache_flat, v_cache_flat, attn_out,
@@ -2569,6 +3822,19 @@ def forward_layer(
         elif layer_idx == 31:
             store._eagle3_hidden_high = h_np.copy()
 
+    # Phase 4: per-layer MLP residual correction (after FFN residual add)
+    if store._enable_correction and store._correction is not None:
+        from asdsl.correction import apply_layer_correction
+
+        orig_shape = hidden.shape
+        h_np = hidden.detach().cpu().float().numpy()
+        h_np = apply_layer_correction(
+            h_np, layer_idx, store._correction, scale=store._correction_scale
+        )
+        hidden = torch.from_numpy(np.asarray(h_np, dtype=np.float32)).view(
+            orig_shape
+        ).to(dtype=hidden.dtype, device=hidden.device)
+
     return hidden
 
 
@@ -2686,6 +3952,59 @@ def forward_layer_batch(
 
 
 # ---------------------------------------------------------------------------
+# Sparse kernel diagnostic (Phase 5)
+# ---------------------------------------------------------------------------
+
+def _test_sparse_kernel_on_layer0(
+    store: WeightStore,
+    x_test: np.ndarray,
+    *,
+    threshold: float = 0.01,
+) -> bool:
+    """Compare Python vs native sparse GEMV on layer-0 down_proj."""
+    from asdsl.kernels.sparse_gemv import (
+        sparse_gemv_dequant_f16,
+        sparse_gemv_dequant_f16_avx2,
+        has_sparse_dequant_kernel,
+    )
+    from asdsl.quantization.core import dequantize_weights
+
+    key = (0, "down_proj")
+    w_f16 = store._sparse_dequant_f16.get(key)
+    if w_f16 is None:
+        w_np = store._quant_packed_np[key]
+        rows, cols = store._quant_shapes[key]
+        gs = store.group_size
+        numel = rows * cols
+        n_groups = numel // gs
+        qt_stub = type("Q", (), {})()
+        qt_stub.data = w_np
+        qt_stub.scales = store._quant_sc_np[key][:n_groups]
+        qt_stub.zeros = None
+        qt_stub.group_size = gs
+        qt_stub.bits = 4
+        qt_stub.numel = numel
+        qt_stub.is_symmetric = True
+        qt_stub.shape = (rows, cols)
+        deq = dequantize_weights(qt_stub).reshape(rows, cols)
+        w_f16 = np.clip(deq.astype(np.float32), -65504.0, 65504.0).astype(np.float16)
+
+    x_test = np.ascontiguousarray(x_test, dtype=np.float32).ravel()
+    py_out = sparse_gemv_dequant_f16(w_f16, x_test, threshold=threshold)
+    cpp_out = sparse_gemv_dequant_f16_avx2(w_f16, x_test, threshold=threshold)
+    has_nan = bool(np.any(np.isnan(cpp_out)))
+    has_inf = bool(np.any(np.isinf(cpp_out)))
+    max_diff = float(np.max(np.abs(py_out - cpp_out))) if not has_nan else float("inf")
+    print(
+        f"[SPARSE DIAG] native={has_sparse_dequant_kernel()} "
+        f"nan={has_nan} inf={has_inf} max_diff={max_diff:.4f}"
+    )
+    print(f"[SPARSE DIAG] cpp_out[:5]={cpp_out[:5]}")
+    print(f"[SPARSE DIAG] py_out[:5]={py_out[:5]}")
+    return (not has_nan) and max_diff < 0.1
+
+
+# ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
 
@@ -2724,21 +4043,110 @@ def generate_stream(
     # Per-layer KV history (pre-allocated torch tensors)
     kv_hist = KVHistory(max_seq=max_seq)
 
+    if getattr(store, "_use_unified", False) and store.bits == 4:
+        from asdsl.inference.unified_bridge import reset_unified_session
+
+        reset_unified_session(store)
+
     # ASDSL tracker - updated once per generated token for block-sparse analytics
     asdsl_tracker = ASDSLKVTracker()
+
+    skip_kv_tracker = os.environ.get("ASDSL_SKIP_KV_TRACKER", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    forward_noop = os.environ.get("ASDSL_FORWARD_NOOP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    noop_diag = os.environ.get("ASDSL_NOOP_DIAG", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    noop_skip_lmhead = forward_noop and os.environ.get(
+        "ASDSL_NOOP_SKIP_LMHEAD", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    noop_diag_acc = {"gemv": 0.0, "lmhead": 0.0, "embed": 0.0, "tokens": 0}
 
     def run_forward(token_id: int, pos: int, need_logits: bool = True) -> torch.Tensor | None:
         """Full 32-layer forward pass for a single token at position pos.
         When need_logits=False (prefill body), skips the expensive LM-head matmul."""
+        store._forward_profiler.set_pos(pos)
         tid = int(token_id)
+
+        if forward_noop:
+            if not need_logits:
+                return None
+            if logits is not None and noop_skip_lmhead:
+                return logits
+
+        if getattr(store, "_use_unified", False) and store.bits == 4:
+            from asdsl.inference.unified_bridge import unified_forward_token
+
+            if not need_logits:
+                return None
+            logits_np = unified_forward_token(store, tid, pos)
+            return torch.from_numpy(logits_np)
+
+        use_np_stack = (
+            _use_forward_numpy_path(store)
+            and not store._enable_correction
+            and not store._use_fatrelu
+            and not store._enable_sparse
+        )
+        prof = store._forward_profiler
+
+        if use_np_stack:
+            t_embed = time.perf_counter()
+            hidden_np = store.embed_f16[tid].float().numpy().ravel().astype(
+                np.float32, copy=False
+            )
+            t_embed_done = time.perf_counter()
+            t_layers = time.perf_counter()
+            for i in range(NUM_LAYERS):
+                hidden_np = _forward_layer_numpy_fast_np(
+                    hidden_np, i, store, kv_hist, pos, prof
+                )
+                if prof.active() and i == prof.target_layer:
+                    prof.print_report()
+                    prof.timings_ms.clear()
+            t_layers_done = time.perf_counter()
+            if noop_diag and need_logits:
+                noop_diag_acc["embed"] += t_embed_done - t_embed
+                noop_diag_acc["gemv"] += t_layers_done - t_layers
+                noop_diag_acc["tokens"] += 1
+            if not need_logits:
+                return None
+            if noop_skip_lmhead and logits is not None:
+                return logits
+            t_lm = time.perf_counter()
+            final_w = store._norm_np.get(
+                (-1, "final"),
+                store.final_norm.detach().cpu().float().numpy(),
+            )
+            normed = np.empty(HIDDEN, dtype=np.float32)
+            _native_ops.rmsnorm_f32(
+                hidden_np, normed, final_w, HIDDEN, RMS_EPS
+            )
+            out_logits = store.lm_head_matvec(torch.from_numpy(normed).unsqueeze(0))
+            if noop_diag:
+                noop_diag_acc["lmhead"] += time.perf_counter() - t_lm
+            return out_logits
+
         hidden = store.embed_f16[tid].float().unsqueeze(0)
         k_new, v_new = [], []
         for i in range(NUM_LAYERS):
             hidden = forward_layer(hidden, i, store, kv_hist, rope_cos, rope_sin, pos)
-            k_np, v_np = kv_hist.get_last_np(i)
-            k_new.append(k_np)
-            v_new.append(v_np)
-        asdsl_tracker.record_token(k_new, v_new)
+            if not skip_kv_tracker:
+                k_np, v_np = kv_hist.get_last_np(i)
+                k_new.append(k_np)
+                v_new.append(v_np)
+        if not skip_kv_tracker and k_new:
+            asdsl_tracker.record_token(k_new, v_new)
         if not need_logits:
             return None
         hidden = rms_norm(hidden, store.final_norm)
@@ -2754,16 +4162,43 @@ def generate_stream(
     # Decode — yield each token as it's produced
     pos = len(input_ids)
     t_decode_start = time.perf_counter()
+    token_times: list[float] = []
 
     with torch.inference_mode():
         for step in range(max_new_tokens):
+            t_step = time.perf_counter()
             next_token = int(logits.argmax())
             tok_text = tokenizer.convert_tokens_to_string(
                 tokenizer.convert_ids_to_tokens([next_token])
             )
             elapsed = time.perf_counter() - t_decode_start
             tps = (step + 1) / elapsed if elapsed > 0 else 0.0
-            is_eos = next_token in EOS_TOKEN_IDS
+            ignore_eos = os.environ.get("ASDSL_IGNORE_EOS", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            is_eos = (not ignore_eos) and next_token in EOS_TOKEN_IDS
+
+            if is_eos:
+                token_times.append(time.perf_counter() - t_step)
+                yield StreamToken(
+                    text=tok_text,
+                    token_id=next_token,
+                    step=step,
+                    is_eos=is_eos,
+                    elapsed_s=elapsed,
+                    tokens_per_second=tps,
+                    step_elapsed_s=token_times[-1],
+                )
+                return
+
+            if store._forward_profiler.enabled and step == 1:
+                store._forward_profiler.target_pos = pos
+            logits = run_forward(next_token, pos)
+            pos += 1
+            step_elapsed = time.perf_counter() - t_step
+            token_times.append(step_elapsed)
 
             yield StreamToken(
                 text=tok_text,
@@ -2772,13 +4207,31 @@ def generate_stream(
                 is_eos=is_eos,
                 elapsed_s=elapsed,
                 tokens_per_second=tps,
+                step_elapsed_s=step_elapsed,
             )
 
-            if is_eos:
-                return
-
-            logits = run_forward(next_token, pos)
-            pos += 1
+    if len(token_times) >= 2:
+        times = np.array(token_times, dtype=np.float64)
+        print(
+            f"Token timing: first={times[0]*1000:.1f}ms  "
+            f"median={np.median(times)*1000:.1f}ms  "
+            f"p90={np.percentile(times, 90)*1000:.1f}ms  "
+            f"last={times[-1]*1000:.1f}ms"
+        )
+    if noop_diag and noop_diag_acc["tokens"] > 0:
+        n = noop_diag_acc["tokens"]
+        gemv_ms = noop_diag_acc["gemv"] * 1000.0 / n
+        lm_ms = noop_diag_acc["lmhead"] * 1000.0 / n
+        emb_ms = noop_diag_acc["embed"] * 1000.0 / n
+        med_ms = float(np.median(token_times)) * 1000.0 if token_times else 0.0
+        other_ms = max(0.0, med_ms - gemv_ms - lm_ms - emb_ms)
+        print(
+            f"[NOOP DIAG] per-token ms (n={n}): "
+            f"layers={gemv_ms:.1f} lmhead={lm_ms:.1f} embed={emb_ms:.1f} "
+            f"other~={other_ms:.1f} (median step {med_ms:.1f}ms)"
+        )
+        if noop_skip_lmhead:
+            print("[NOOP DIAG] lm_head skipped on decode (ASDSL_NOOP_SKIP_LMHEAD=1)")
 
 
 def generate(
@@ -2793,7 +4246,15 @@ def generate(
     """Eager generation wrapper over ``generate_stream`` for benchmark callers."""
     print("\nAssistant: ", end="", flush=True)
 
+    def _safe_print_token(text: str) -> None:
+        try:
+            print(text, end="", flush=True)
+        except UnicodeEncodeError:
+            enc = sys.stdout.encoding or "utf-8"
+            print(text.encode(enc, errors="replace").decode(enc, errors="replace"), end="", flush=True)
+
     token_ids: list[int] = []
+    step_times: list[float] = []
     last_elapsed = 0.0
     last_tps = 0.0
     for tok in generate_stream(
@@ -2805,13 +4266,19 @@ def generate(
         bench_metrics_out=None,
         logits_hook=logits_hook,
     ):
-        print(tok.text, end="", flush=True)
+        _safe_print_token(tok.text)
         token_ids.append(int(tok.token_id))
+        if tok.step_elapsed_s > 0:
+            step_times.append(float(tok.step_elapsed_s))
         last_elapsed = float(tok.elapsed_s)
         last_tps = float(tok.tokens_per_second)
 
     n_tokens = len(token_ids)
-    tps = (n_tokens / last_elapsed) if last_elapsed > 0 else 0.0
+    if len(step_times) >= 2:
+        decode_s = float(sum(step_times[1:]))
+        tps = (len(step_times) - 1) / decode_s if decode_s > 0 else 0.0
+    else:
+        tps = (n_tokens / last_elapsed) if last_elapsed > 0 else 0.0
     if tps <= 0.0:
         tps = last_tps
 
@@ -2820,6 +4287,8 @@ def generate(
     )
 
     print(f"\n\nGenerated : {n_tokens} tokens  |  {tps:.2f} tok/s  |  decode {last_elapsed:.1f}s")
+    if len(step_times) >= 2:
+        print(f"decode {tps:.2f} tok/s (tokens 2-{n_tokens})", flush=True)
     print("=" * 66)
 
     if bench_metrics_out is not None:
@@ -3883,6 +5352,11 @@ def main() -> None:
         default=_default_benchmark_prompt(),
         help="Single-turn prompt (default from benchmark_config.json when present)",
     )
+    parser.add_argument(
+        "--system-prompt",
+        default="You are a helpful AI assistant.",
+        help='Chat system turn (use "" to match compare_llama_cpp / llama-cli -no-cnv)',
+    )
     parser.add_argument("--chat", action="store_true",
                         help="Start an interactive multi-turn chat session")
     parser.add_argument("--max-new-tokens", type=int, default=80)
@@ -3913,10 +5387,75 @@ def main() -> None:
                         help="Bit-width for the QCSD draft model (default: 2)")
     parser.add_argument("--draft-k", type=int, default=7,
                         help="Number of draft tokens per QCSD cycle (default: 7)")
+    parser.add_argument(
+        "--lut",
+        action="store_true",
+        help="Enable Phase 1 LUT-native GEMV (prebuilt dequant tables, 4-bit gs=32)",
+    )
+    parser.add_argument(
+        "--dispatch",
+        action="store_true",
+        help="Enable Phase 3 calibrated kernel dispatch (LUT/AVX2/SPARSE)",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Run calibration, write projection_profiles.json, and exit",
+    )
+    parser.add_argument(
+        "--test-sparse-kernel",
+        action="store_true",
+        help="Run sparse GEMV diagnostic on layer-0 down_proj and exit",
+    )
+    parser.add_argument(
+        "--profile-forward",
+        action="store_true",
+        help="Print per-section forward_layer timing (layer 1, decode token 2)",
+    )
+    parser.add_argument(
+        "--dispatch-profiles",
+        type=str,
+        default=None,
+        help="Path to projection_profiles.json (default: asdsl/dispatch/projection_profiles.json)",
+    )
+    parser.add_argument(
+        "--correction",
+        type=str,
+        default=None,
+        help="Path to Phase 4 correction models/ directory (MLP manifest + layer_*.pt)",
+    )
+    parser.add_argument(
+        "--correction-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to loaded correction biases (default: 1.0)",
+    )
+    parser.add_argument(
+        "--collect-correction",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Collect correction samples into DIR and exit",
+    )
+    parser.add_argument(
+        "--train-correction",
+        nargs=2,
+        metavar=("SAMPLES_DIR", "OUTPUT"),
+        default=None,
+        help="Train correction from samples dir, write OUTPUT.npz, and exit",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Cap tokens for inference / correction collect (alias for short runs)",
+    )
     parser.add_argument("--sparse", action="store_true",
                         help="Enable activation-sparse GEMV (Tier 3)")
-    parser.add_argument("--sparse-threshold", type=float, default=0.01,
-                        help="Activation sparsity threshold (default: 0.01)")
+    parser.add_argument("--sparsity-threshold", type=float, default=0.01,
+                        help="Activation magnitude threshold for sparse dispatch (default: 0.01)")
+    parser.add_argument("--sparse-threshold", type=float, default=None,
+                        help="Alias for --sparsity-threshold")
     parser.add_argument("--slim-meta", type=str, default=None,
                         help="Path to phi4_slim_meta.json for Phase 2 mixed-precision (Profile E)")
     parser.add_argument("--fatrelu-thresholds", type=str, default=None,
@@ -3948,13 +5487,37 @@ def main() -> None:
         action="store_true",
         help="Disable persistent safetensors weight cache (env PHI4_NO_WEIGHT_CACHE=1)",
     )
+    parser.add_argument(
+        "--no-preq-cache",
+        action="store_true",
+        help="Disable persistent preq block cache (env PHI4_NO_PREQ_CACHE=1)",
+    )
+    parser.add_argument(
+        "--keep-packed",
+        action="store_true",
+        help="Keep packed Q4 weights in RAM when using ASDSL_USE_UNIFIED=1 (default: free after preq cache)",
+    )
     args = parser.parse_args()
+    gs_env = os.environ.get("ASDSL_GROUP_SIZE", "").strip()
+    if gs_env:
+        args.group_size = int(gs_env)
+        print(f"  ASDSL_GROUP_SIZE={args.group_size}", flush=True)
+    os.environ.setdefault("ASDSL_FUSED_GEMV", "1")
+    os.environ.setdefault("ASDSL_PREQ_G4FUSED", "0")
     if args.no_weight_cache:
         os.environ["PHI4_NO_WEIGHT_CACHE"] = "1"
+    if args.no_preq_cache:
+        os.environ["PHI4_NO_PREQ_CACHE"] = "1"
 
     set_thread_count(args.threads if args.threads > 0 else 0)
     if args.threads == 0:
         args.threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
+    print(
+        f"  OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '?')}  "
+        f"OMP_PLACES={os.environ.get('OMP_PLACES', '?')}  "
+        f"configured_threads={args.threads}",
+        flush=True,
+    )
 
     if args.qcsd_benchmark:
         print("=" * 66)
@@ -4028,15 +5591,24 @@ def main() -> None:
         print(f"\nLoading weights (ASDSL {args.bits}-bit quantization){feat_str} ...")
 
     t0 = time.perf_counter()
+    sparse_thr = args.sparsity_threshold
+    if args.sparse_threshold is not None:
+        sparse_thr = args.sparse_threshold
+
+    use_lut = args.lut or args.dispatch
     store = WeightStore(
         bits=args.bits,
         group_size=args.group_size if args.group_size > 0 else None,
         enable_qcsd=args.qcsd,
         draft_bits=args.draft_bits,
         enable_sparse=args.sparse,
-        sparsity_threshold=args.sparse_threshold,
+        sparsity_threshold=sparse_thr,
+        enable_lut=use_lut,
+        enable_dispatch=args.dispatch,
     )
     store.load()
+    if args.keep_packed:
+        store._keep_packed_for_fallback = True
     # Phase 2: load SliM metadata if provided
     if getattr(args, "slim_meta", None):
         store.load_slim(args.slim_meta)
@@ -4052,9 +5624,106 @@ def main() -> None:
     if args.bits != 16:
         print(f"  Layers ready: {len(store.layers)}/32  "
               f"| Norms ready: {len(store.layer_norms)}/32")
-    store.warm_cache()
+    if args.dispatch:
+        prof_path = args.dispatch_profiles
+        if prof_path is None:
+            prof_path = str(
+                Path(__file__).resolve().parent.parent
+                / "asdsl" / "dispatch" / "projection_profiles.json"
+            )
+        if not Path(prof_path).exists():
+            print(f"ERROR: dispatch profiles not found: {prof_path}")
+            print("  Run with --calibrate first.")
+            sys.exit(1)
+        store.load_dispatch_policy(prof_path)
+
     if args.gguf_path:
         store.load_from_gguf(args.gguf_path)
+    store.warm_cache()
+    if args.gguf_path:
+        store._use_q8_gemv = True
+        store._use_native_gemv = True
+
+    if args.test_sparse_kernel:
+        if args.bits != 4:
+            print("ERROR: --test-sparse-kernel requires --bits 4")
+            sys.exit(1)
+        rows, cols = store._quant_shapes[(0, "down_proj")]
+        x_zero = np.zeros(cols, dtype=np.float32)
+        x_rand = (np.random.randn(cols).astype(np.float32) * 0.1)
+        print("[SPARSE DIAG] zero input")
+        ok0 = _test_sparse_kernel_on_layer0(store, x_zero)
+        print("[SPARSE DIAG] random input")
+        ok1 = _test_sparse_kernel_on_layer0(store, x_rand)
+        sys.exit(0 if (ok0 and ok1) else 1)
+
+    if args.calibrate:
+        if args.bits != 4:
+            print("ERROR: --calibrate requires --bits 4")
+            sys.exit(1)
+        from asdsl.dispatch.calibrate import calibrate as run_calibrate
+
+        prof_path = args.dispatch_profiles
+        if prof_path is None:
+            prof_path = str(
+                Path(__file__).resolve().parent.parent
+                / "asdsl" / "dispatch" / "projection_profiles.json"
+            )
+        tokens = tokenizer.encode(args.prompt)[:32]
+        run_calibrate(
+            store, tokens,
+            output_path=prof_path,
+            sparsity_threshold=sparse_thr,
+        )
+        print(f"  Wrote calibration profiles: {prof_path}")
+        del store, tokenizer
+        gc.collect()
+        return
+
+    if args.collect_correction:
+        from asdsl.correction import collect_training_data
+
+        n_tok = args.max_tokens if args.max_tokens is not None else 512
+        tokens = tokenizer.encode(args.prompt)
+        try:
+            from datasets import load_dataset
+            ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+            wikitext = "\n\n".join(ds["text"])
+            tokens = tokenizer.encode(wikitext)[:n_tok]
+        except Exception:
+            tokens = tokens[:n_tok]
+
+        ref_store = WeightStore(bits=16)
+        ref_store.load()
+        ref_store.warm_cache()
+        if args.dispatch:
+            ref_store.load_dispatch_policy(
+                args.dispatch_profiles
+                or str(Path(__file__).resolve().parent.parent / "asdsl" / "dispatch" / "projection_profiles.json")
+            )
+        out_dir = collect_training_data(
+            ref_store, store, tokens, args.collect_correction, max_tokens=n_tok
+        )
+        print(f"  Wrote correction training data: {out_dir}")
+        del store, ref_store, tokenizer
+        gc.collect()
+        return
+
+    if args.train_correction:
+        from asdsl.correction import train_corrections
+
+        samples_dir, out_path = args.train_correction
+        models_dir = train_corrections(samples_dir, out_path)
+        print(f"  Trained correction MLPs -> {models_dir}")
+        del store, tokenizer
+        gc.collect()
+        return
+
+    if args.correction:
+        store.load_correction(args.correction, scale=args.correction_scale)
+
+    if args.max_tokens is not None:
+        args.max_new_tokens = min(args.max_new_tokens, args.max_tokens)
 
     if args.profile == "G":
         if args.bits != 4:
@@ -4180,11 +5849,14 @@ def main() -> None:
             print(tok.text, end="", flush=True)
         print(f"\n  [{tok.step + 1} tokens | {tok.tokens_per_second:.2f} tok/s]")
     else:
+        if args.profile_forward:
+            store._forward_profiler.enabled = True
         generate(
             prompt=args.prompt,
             store=store,
             tokenizer=tokenizer,
             max_new_tokens=args.max_new_tokens,
+            system_prompt=args.system_prompt,
         )
 
 

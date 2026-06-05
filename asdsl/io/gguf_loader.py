@@ -1,262 +1,218 @@
-"""Minimal GGUF tensor reader and Q4_K block helpers.
-
-This module provides a lightweight API for reading tensor metadata and payloads
-from GGUF files, with explicit support for Q4_K tensors used by llama.cpp
-Q4_K_M models.
-"""
+"""GGUF tensor reader with stable GGML type IDs and ASDSL name mapping."""
 
 from __future__ import annotations
 
-import os
-import struct
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-GGUF_MAGIC = 0x46554747  # b"GGUF"
-GGML_TYPE_F32 = 0
-GGML_TYPE_F16 = 1
-GGML_TYPE_Q4_K = 12
-GGML_TYPE_BF16 = 30
+# GGML type IDs (ggml.h) — extend when gguf-py lags behind llama.cpp.
+GGML_TYPE_NAMES: dict[int, str] = {
+    0: "f32",
+    1: "f16",
+    2: "q4_0",
+    3: "q4_1",
+    6: "q5_0",
+    7: "q5_1",
+    8: "q8_0",
+    9: "q8_1",
+    10: "q2_k",
+    11: "q3_k",
+    12: "q4_k",
+    13: "q5_k",
+    14: "q6_k",
+    15: "q8_k",
+    16: "iq2_xxs",
+    17: "iq2_xs",
+    18: "iq3_xxs",
+    19: "iq1_s",
+    20: "iq4_nl",
+    21: "iq3_s",
+    22: "iq2_s",
+    23: "iq4_xs",
+    24: "iq1_m",
+    25: "bf16",
+}
 
-Q4_K_BLOCK_SIZE = 144
-Q4_K_N_PER_BLOCK = 256
+# K-quant block sizes (bytes per 256 weights along the K / input axis).
+_K_BLOCK_BYTES: dict[str, int] = {
+    "q2_k": 84,
+    "q3_k": 110,
+    "q4_k": 144,
+    "q5_k": 176,
+    "q6_k": 210,
+    "q8_k": 256,
+}
+
+# GGUF tensor suffix → (asdsl_projection, module).
+GGUF_TO_ASDSL: dict[str, tuple[str, str]] = {
+    "attn_qkv.weight": ("qkv_proj", "attn"),
+    "attn_output.weight": ("o_proj", "attn"),
+    "ffn_gate_up.weight": ("gate_up_proj", "ffn"),
+    "ffn_gate.weight": ("gate_proj", "ffn"),
+    "ffn_up.weight": ("up_proj", "ffn"),
+    "ffn_down.weight": ("down_proj", "ffn"),
+    "attn_norm.weight": ("attn_norm", "norm"),
+    "ffn_norm.weight": ("ffn_norm", "norm"),
+    "token_embd.weight": ("token_embd", "embed"),
+    "output_norm.weight": ("output_norm", "norm"),
+    "output.weight": ("lm_head", "output"),
+}
+
+_QUANT_TYPES = frozenset(_K_BLOCK_BYTES.keys()) | frozenset(
+    {"q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q8_1"}
+)
 
 
-def read_gguf_tensors(gguf_path: str) -> dict[str, dict[str, Any]]:
-    """Read GGUF tensor payloads into a metadata dictionary.
+def ggml_type_name(type_id: int) -> str:
+    if type_id in GGML_TYPE_NAMES:
+        return GGML_TYPE_NAMES[type_id]
+    return f"unknown_{type_id}"
 
-    Returns:
-        Dict mapping tensor name to:
-        - type: canonical string (q4_k, f16, f32, bf16, unknown_<id>)
-        - ggml_type: integer GGML tensor type id
-        - shape: logical tensor shape tuple (rows, cols, ...)
-        - data: numpy array (contiguous copy)
-        - row_bytes: bytes per row for block-quantized tensors (when available)
+
+def row_bytes_for_type(type_name: str, in_features: int) -> int:
+    """Bytes per GGUF storage row (K axis = in_features for logical W @ x)."""
+    t = type_name.lower()
+    if t in _K_BLOCK_BYTES:
+        return (in_features // 256) * _K_BLOCK_BYTES[t]
+    raise ValueError(f"row_bytes_for_type: unsupported type {type_name}")
+
+
+def logical_shape(file_shape: tuple[int, ...], type_name: str) -> tuple[int, int]:
+    """Map on-disk GGUF 2-D shape to logical (out_features, in_features)."""
+    if len(file_shape) != 2:
+        raise ValueError(f"Expected rank-2 weight, got {file_shape}")
+    n0, n1 = int(file_shape[0]), int(file_shape[1])
+    t = type_name.lower()
+    if t in _K_BLOCK_BYTES:
+        # K-quants: file is [in_features, out_features]; dequant yields (out, in).
+        return n1, n0
+    # Dense: same transpose convention as llama.cpp GGUF export.
+    return n1, n0
+
+
+def _tensor_payload(reader_tensor: Any) -> np.ndarray:
+    data = reader_tensor.data
+    if hasattr(data, "numpy"):
+        return np.asarray(data.numpy(), dtype=np.uint8)
+    return np.ascontiguousarray(np.asarray(data), dtype=np.uint8)
+
+
+def read_gguf_tensors(
+    path: str | Path,
+    *,
+    name_filter: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read all tensors from a GGUF file.
+
+    Returns dict[name] → {type, type_id, shape, file_shape, logical_shape,
+    data, row_bytes, n_bytes}.
     """
-    if not os.path.exists(gguf_path):
-        raise FileNotFoundError(f"GGUF not found: {gguf_path}")
+    import gguf
 
-    try:
-        from gguf import GGUFReader  # type: ignore
-
-        reader = GGUFReader(gguf_path)
-        out: dict[str, dict[str, Any]] = {}
-        for t in reader.tensors:
-            ggml_type = int(t.tensor_type)
-            # gguf-py stores GGML dims in reverse order for display; reverse to row-major.
-            logical_shape = tuple(int(x) for x in reversed(t.shape.tolist()))
-            arr = np.asarray(t.data)
-
-            if ggml_type == GGML_TYPE_Q4_K:
-                out[t.name] = {
-                    "type": "q4_k",
-                    "ggml_type": ggml_type,
-                    "shape": logical_shape,
-                    "row_bytes": int(arr.shape[1]) if arr.ndim >= 2 else int(arr.size),
-                    "data": np.ascontiguousarray(arr, dtype=np.uint8).reshape(-1),
-                }
-            elif ggml_type == GGML_TYPE_F16:
-                out[t.name] = {
-                    "type": "f16",
-                    "ggml_type": ggml_type,
-                    "shape": logical_shape,
-                    "data": np.ascontiguousarray(arr, dtype=np.float16).reshape(-1),
-                }
-            elif ggml_type == GGML_TYPE_BF16:
-                # gguf-py exposes bf16 tensors as uint16 bit patterns.
-                raw_u16 = np.ascontiguousarray(arr, dtype=np.uint16).reshape(-1)
-                f32 = (raw_u16.astype(np.uint32) << 16).view(np.float32)
-                out[t.name] = {
-                    "type": "bf16",
-                    "ggml_type": ggml_type,
-                    "shape": logical_shape,
-                    "data": f32,
-                }
-            elif ggml_type == GGML_TYPE_F32:
-                out[t.name] = {
-                    "type": "f32",
-                    "ggml_type": ggml_type,
-                    "shape": logical_shape,
-                    "data": np.ascontiguousarray(arr, dtype=np.float32).reshape(-1),
-                }
-            else:
-                out[t.name] = {
-                    "type": f"unknown_{ggml_type}",
-                    "ggml_type": ggml_type,
-                    "shape": logical_shape,
-                    "data": None,
-                }
-        return out
-    except ImportError:
-        # Fallback parser for environments where gguf package is unavailable.
-        return _read_gguf_tensors_fallback(gguf_path)
+    reader = gguf.GGUFReader(str(path))
+    out: dict[str, dict[str, Any]] = {}
+    for t in reader.tensors:
+        name = t.name
+        if name_filter and name_filter not in name:
+            continue
+        type_id = int(t.tensor_type)
+        type_name = ggml_type_name(type_id)
+        file_shape = tuple(int(x) for x in t.shape)
+        payload = _tensor_payload(t)
+        info: dict[str, Any] = {
+            "type": type_name,
+            "type_id": type_id,
+            "shape": file_shape,
+            "file_shape": file_shape,
+            "data": payload,
+            "n_bytes": int(payload.nbytes),
+        }
+        if len(file_shape) == 2:
+            log = logical_shape(file_shape, type_name)
+            info["logical_shape"] = log
+            if type_name.lower() in _K_BLOCK_BYTES:
+                info["row_bytes"] = row_bytes_for_type(type_name, log[1])
+        out[name] = info
+    return out
 
 
-def _read_gguf_tensors_fallback(gguf_path: str) -> dict[str, dict[str, Any]]:
-    """Minimal binary GGUF parser used only if gguf-py is unavailable."""
-    tensors: dict[str, dict[str, Any]] = {}
-    with open(gguf_path, "rb") as f:
-        magic = struct.unpack("<I", f.read(4))[0]
-        if magic != GGUF_MAGIC:
-            raise ValueError(f"Not a GGUF file: magic={magic:#x}")
+def dequant_tensor(info: dict[str, Any]) -> np.ndarray:
+    """Dequantize one tensor to float32 with shape (out_features, in_features)."""
+    from gguf import quants
 
-        version = struct.unpack("<I", f.read(4))[0]
-        if version not in (2, 3):
-            raise ValueError(f"Unsupported GGUF version: {version}")
+    tname = info["type"].lower()
+    if tname in ("f32",):
+        arr = np.asarray(info["data"], dtype=np.float32)
+        if arr.ndim == 1:
+            return arr
+        return np.ascontiguousarray(arr.reshape(logical_shape(info["shape"], tname)), dtype=np.float32)
+    if tname in ("f16", "bf16"):
+        from gguf import GGMLQuantizationType
 
-        n_tensors = struct.unpack("<Q", f.read(8))[0]
-        n_kv = struct.unpack("<Q", f.read(8))[0]
+        qt = GGMLQuantizationType.F16 if tname == "f16" else GGMLQuantizationType.BF16
+        arr = quants.dequantize(info["data"], qt)
+        return np.ascontiguousarray(arr, dtype=np.float32)
+    if tname in _K_BLOCK_BYTES or tname in _QUANT_TYPES:
+        import gguf
 
-        for _ in range(n_kv):
-            key_len = struct.unpack("<Q", f.read(8))[0]
-            f.read(key_len)
-            value_type = struct.unpack("<I", f.read(4))[0]
-            _skip_gguf_value(f, value_type)
-
-        tensor_infos: list[tuple[str, tuple[int, ...], int, int]] = []
-        for _ in range(n_tensors):
-            name_len = struct.unpack("<Q", f.read(8))[0]
-            name = f.read(name_len).decode("utf-8")
-            n_dims = struct.unpack("<I", f.read(4))[0]
-            dims = struct.unpack(f"<{n_dims}Q", f.read(8 * n_dims))
-            ggml_type = struct.unpack("<I", f.read(4))[0]
-            offset = struct.unpack("<Q", f.read(8))[0]
-            # GGUF stores dims in reverse order relative to row-major usage.
-            shape = tuple(int(x) for x in reversed(dims))
-            tensor_infos.append((name, shape, ggml_type, int(offset)))
-
-        alignment = 32
-        data_start = (f.tell() + alignment - 1) // alignment * alignment
-
-        for name, shape, ggml_type, offset in tensor_infos:
-            f.seek(data_start + offset)
-            n_elements = int(np.prod(shape, dtype=np.int64))
-
-            if ggml_type == GGML_TYPE_Q4_K:
-                cols = int(shape[-1]) if len(shape) >= 2 else int(shape[0])
-                if cols % Q4_K_N_PER_BLOCK != 0:
-                    raise ValueError(f"Q4_K tensor {name} has non-divisible cols={cols}")
-                row_blocks = cols // Q4_K_N_PER_BLOCK
-                row_bytes = row_blocks * Q4_K_BLOCK_SIZE
-                rows = int(np.prod(shape[:-1], dtype=np.int64)) if len(shape) > 1 else 1
-                byte_count = rows * row_bytes
-                raw = np.frombuffer(f.read(byte_count), dtype=np.uint8).copy()
-                tensors[name] = {
-                    "type": "q4_k",
-                    "ggml_type": ggml_type,
-                    "shape": shape,
-                    "row_bytes": row_bytes,
-                    "data": raw,
-                }
-            elif ggml_type == GGML_TYPE_F16:
-                raw = np.frombuffer(f.read(n_elements * 2), dtype=np.float16).copy()
-                tensors[name] = {
-                    "type": "f16",
-                    "ggml_type": ggml_type,
-                    "shape": shape,
-                    "data": raw,
-                }
-            elif ggml_type == GGML_TYPE_BF16:
-                raw_u16 = np.frombuffer(f.read(n_elements * 2), dtype=np.uint16).copy()
-                f32 = (raw_u16.astype(np.uint32) << 16).view(np.float32)
-                tensors[name] = {
-                    "type": "bf16",
-                    "ggml_type": ggml_type,
-                    "shape": shape,
-                    "data": f32,
-                }
-            elif ggml_type == GGML_TYPE_F32:
-                raw = np.frombuffer(f.read(n_elements * 4), dtype=np.float32).copy()
-                tensors[name] = {
-                    "type": "f32",
-                    "ggml_type": ggml_type,
-                    "shape": shape,
-                    "data": raw,
-                }
-            else:
-                tensors[name] = {
-                    "type": f"unknown_{ggml_type}",
-                    "ggml_type": ggml_type,
-                    "shape": shape,
-                    "data": None,
-                }
-
-    return tensors
+        type_id = info.get("type_id")
+        if type_id is None:
+            rev = {v: k for k, v in GGML_TYPE_NAMES.items()}
+            type_id = rev.get(tname, info["type_id"])
+        qt = gguf.GGMLQuantizationType(type_id)
+        arr = quants.dequantize(info["data"], qt)
+        return np.ascontiguousarray(arr, dtype=np.float32)
+    raise ValueError(f"dequant_tensor: unsupported type {info.get('type')}")
 
 
-def _skip_gguf_value(fobj, val_type: int) -> None:
-    """Skip one GGUF KV value by type id."""
-    type_sizes = {
-        0: 1,   # uint8
-        1: 1,   # int8
-        2: 2,   # uint16
-        3: 2,   # int16
-        4: 4,   # uint32
-        5: 4,   # int32
-        6: 8,   # float32 (stored as 4 in gguf spec variants, guarded below)
-        7: 8,   # uint64
-        10: 4,  # float32
-        11: 8,  # float64
-    }
-    if val_type in type_sizes:
-        fobj.read(type_sizes[val_type])
-        return
-    if val_type == 8:  # string
-        slen = struct.unpack("<Q", fobj.read(8))[0]
-        fobj.read(slen)
-        return
-    if val_type == 9:  # array
-        arr_type = struct.unpack("<I", fobj.read(4))[0]
-        arr_len = struct.unpack("<Q", fobj.read(8))[0]
-        for _ in range(arr_len):
-            _skip_gguf_value(fobj, arr_type)
-        return
-    raise ValueError(f"Unknown GGUF value type: {val_type}")
+def k_blocks_rowmajor(info: dict[str, Any], type_name: str | None = None) -> np.ndarray:
+    """Flatten GGUF K-quant tensor to row-major bytes for native GEMV kernels."""
+    tname = (type_name or str(info.get("type", ""))).lower()
+    if tname not in _K_BLOCK_BYTES:
+        raise ValueError(f"k_blocks_rowmajor: unsupported type {tname}")
+    data = np.ascontiguousarray(info["data"], dtype=np.uint8)
+    out, inn = info["logical_shape"]
+    bsz = _K_BLOCK_BYTES[tname]
+    expected = out * (inn // 256) * bsz
+    flat = data.reshape(-1)
+    if flat.size != expected:
+        raise ValueError(
+            f"k_blocks_rowmajor({tname}): byte count {flat.size} != expected {expected} "
+            f"for logical {out}x{inn}"
+        )
+    return flat
 
 
-def q4k_unpack_6bit(packed12: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Unpack 8 sub-scales and 8 sub-mins from a 12-byte Q4_K field."""
-    if packed12.size != 12:
-        raise ValueError("q4k_unpack_6bit expects exactly 12 bytes")
-    out = np.zeros(16, dtype=np.uint8)
-    for idx in range(16):
-        bit_pos = idx * 6
-        byte_idx = bit_pos // 8
-        bit_off = bit_pos % 8
-        if bit_off <= 2:
-            val = (int(packed12[byte_idx]) >> bit_off) & 0x3F
-        else:
-            lo = int(packed12[byte_idx]) >> bit_off
-            hi = int(packed12[byte_idx + 1]) << (8 - bit_off)
-            val = (lo | hi) & 0x3F
-        out[idx] = val
-    return out[:8], out[8:]
+def q4k_blocks_rowmajor(info: dict[str, Any]) -> np.ndarray:
+    """Flatten GGUF Q4_K tensor to row-major [out_rows × (in/256 × 144)] bytes for gemv_q4km."""
+    return k_blocks_rowmajor(info, "q4_k")
 
 
-def q4k_dequantize_to_fp32(raw_blocks: np.ndarray, n_elements: int) -> np.ndarray:
-    """Dequantize Q4_K packed blocks to a flat float32 vector."""
-    raw = np.ascontiguousarray(raw_blocks, dtype=np.uint8).reshape(-1, Q4_K_BLOCK_SIZE)
-    n_blocks = raw.shape[0]
-    out = np.zeros(n_blocks * Q4_K_N_PER_BLOCK, dtype=np.float32)
+def q5k_blocks_rowmajor(info: dict[str, Any]) -> np.ndarray:
+    return k_blocks_rowmajor(info, "q5_k")
 
-    for b in range(n_blocks):
-        block = raw[b]
-        d = np.frombuffer(block[0:2].tobytes(), dtype=np.float16)[0].astype(np.float32)
-        dmin = np.frombuffer(block[2:4].tobytes(), dtype=np.float16)[0].astype(np.float32)
-        sub_scales_u6, sub_mins_u6 = q4k_unpack_6bit(block[4:16])
-        sub_scales = d * sub_scales_u6.astype(np.float32)
-        sub_mins = dmin * sub_mins_u6.astype(np.float32)
 
-        qs = block[16:144]
-        base = b * Q4_K_N_PER_BLOCK
-        for sb in range(8):
-            q16 = qs[sb * 16 : (sb + 1) * 16]
-            lo = (q16 & 0x0F).astype(np.float32)
-            hi = (q16 >> 4).astype(np.float32)
-            vals = np.empty(32, dtype=np.float32)
-            vals[0::2] = lo
-            vals[1::2] = hi
-            out[base + sb * 32 : base + (sb + 1) * 32] = sub_scales[sb] * vals - sub_mins[sb]
+def q6k_blocks_rowmajor(info: dict[str, Any]) -> np.ndarray:
+    return k_blocks_rowmajor(info, "q6_k")
 
-    return out[:n_elements]
+
+def summarize_tensors(path: str | Path, limit: int = 10) -> list[dict[str, Any]]:
+    """Return a JSON-serializable summary of tensors (for phase results)."""
+    tensors = read_gguf_tensors(path)
+    rows: list[dict[str, Any]] = []
+    for name in sorted(tensors.keys()):
+        info = tensors[name]
+        row = {
+            "name": name,
+            "type": info["type"],
+            "type_id": info.get("type_id"),
+            "shape": list(info["shape"]),
+        }
+        if "logical_shape" in info:
+            row["logical_shape"] = list(info["logical_shape"])
+        rows.append(row)
+        if len(rows) >= limit:
+            break
+    return rows

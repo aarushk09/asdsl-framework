@@ -43,6 +43,17 @@ from asdsl.kernels.gemv_sparse import (
     has_native_sparse_kernel,
 )
 
+
+def has_avx2_lut() -> bool:
+    """Return True if Phase 2 LUT GEMV (F16C gather) extension is available."""
+    try:
+        from asdsl.kernels import asdsl_lut_avx2 as _lut_avx2
+
+        return _lut_avx2.check_avx2() and _lut_avx2.check_f16c()
+    except ImportError:
+        return False
+
+
 __all__ = [
     "KERNEL_TIER",
     "gemv_q4",
@@ -61,4 +72,5 @@ __all__ = [
     "gemv_sparse_unpacked",
     "gemv_sparse_with_indices",
     "has_native_sparse_kernel",
+    "has_avx2_lut",
 ]

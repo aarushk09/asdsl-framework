@@ -10,6 +10,13 @@ class MmapBinStore:
             self.metadata = json.load(f)
         self.mmap = np.memmap(bin_path, dtype=np.uint8, mode='r')
 
+
+    def get_fp32(self, key):
+        info = self.metadata[key]
+        off = info['offset']
+        sz = info['size_bytes']
+        return self.mmap[off:off+sz].view(np.float32).copy().reshape(info['shape'])
+
     def get_fp16(self, key):
         info = self.metadata[key]
         off = info['offset']
@@ -28,21 +35,21 @@ def main():
     print("Prepared memory map.")
 
     config = EngineConfig()
-    config.num_layers = 32
-    config.hidden_size = 3072
-    config.num_heads = 24
-    config.num_kv_heads = 8
+    config.num_layers = 40
+    config.hidden_size = 5120
+    config.num_heads = 40
+    config.num_kv_heads = 10
     config.head_dim = 128
-    config.rotary_dim = 96
-    config.intermediate_size = 8192
-    config.vocab_size = 200064
+    config.rotary_dim = 128
+    config.intermediate_size = 17920
+    config.vocab_size = 100352
     config.rms_norm_eps = 1e-5
     config.group_size = 32 # Set correctly for out_bin_path
     config.max_seq_len = 2048
 
-    token_embd = store.get_fp16("model.embed_tokens.weight")
-    output_norm = store.get_fp16("model.norm.weight")
-    output_proj = token_embd  # Tied embedding!
+    token_embd = store.get_fp32("embed")
+    output_norm = store.get_fp32("final_rms")
+    output_proj = store.get_fp32("lm_head")  # Using separate lm_head if available, otherwise token_embd
     
     # RoPE tables - Generate manually
     pos = np.arange(config.max_seq_len, dtype=np.float32)
@@ -54,14 +61,14 @@ def main():
 
     layers_dict = {}
     for l in range(config.num_layers):
-        qkv_p = store.get_q4(f"model.layers.{l}.self_attn.qkv_proj.base_layer.weight")
-        o_p = store.get_q4(f"model.layers.{l}.self_attn.o_proj.base_layer.weight")
-        gu_p = store.get_q4(f"model.layers.{l}.mlp.gate_up_proj.base_layer.weight")
-        dw_p = store.get_q4(f"model.layers.{l}.mlp.down_proj.base_layer.weight")
+        qkv_p = store.get_q4(f"l{l}_qkv")
+        o_p = store.get_q4(f"l{l}_o")
+        gu_p = store.get_q4(f"l{l}_gate_up")
+        dw_p = store.get_q4(f"l{l}_down")
 
         layers_dict[l] = {
-            'rms_att': store.get_fp16(f"model.layers.{l}.input_layernorm.weight"),
-            'rms_ffn': store.get_fp16(f"model.layers.{l}.post_attention_layernorm.weight"),
+            'rms_att': store.get_fp32(f"l{l}_rms1"),
+            'rms_ffn': store.get_fp32(f"l{l}_rms2"),
             'qkv_proj': qkv_p,
             'o_proj': o_p,
             'gate_up_proj': gu_p,

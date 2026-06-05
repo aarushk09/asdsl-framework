@@ -98,9 +98,9 @@ void rope_apply_inplace(
     const int rotary_dim = 96;  // Phi-4 partial_rotary_factor=0.75 * 128
     const int half_rotary = rotary_dim / 2;  // 48
     const int half_head = head_dim / 2;      // 64
-    
-    const float* cos = cos_table + pos * half_head;
-    const float* sin = sin_table + pos * half_head;
+
+    const float* cos = cos_table + static_cast<size_t>(pos) * half_rotary;
+    const float* sin = sin_table + static_cast<size_t>(pos) * half_rotary;
     
     // Apply to each Q head
     for (int h = 0; h < n_q_heads; h++) {

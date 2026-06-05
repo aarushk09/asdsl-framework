@@ -1,0 +1,121 @@
+{
+  "date": "2026-05-24",
+  "phase": 19,
+  "hardware": "Intel Raptor Lake i7, 12P+4E cores, DDR4-3200, ~16 GB RAM, Windows 10",
+  "model": "Phi-4-multimodal-instruct 14B",
+
+  "methodology": {
+    "prompt": "<|user|>The<|end|><|assistant|>",
+    "user_prompt": "The",
+    "system_prompt": "",
+    "n_tokens": 128,
+    "metric": "decode tok/s = sum(step_times[1:]) / (N-1) for ASDSL; llama.cpp CLI footer Generation t/s or eval line",
+    "greedy": true,
+    "ignore_eos": true,
+    "asdsl_stack": "HF safetensors + UnifiedEngine preq (ASDSL_USE_UNIFIED=1)",
+    "llama_stack": "Q4_K_M GGUF community conversion",
+    "note": "Each stack run standalone (separate processes). No concurrent llama-cli during ASDSL."
+  },
+
+  "phase18_discrepancy": {
+    "source_a_tok_s": 11.753,
+    "source_a_origin": "compare_llama_cpp.py @ 12 threads, 128 tokens, warm cache (valid)",
+    "source_b_tok_s": 8.24,
+    "source_b_origin": "compare_llama_cpp.py rerun at OMP_NUM_THREADS=13 (see phase18_results e2e_hf_preq_13t); 128-token median ~121ms/token matches 8.24. Overwrote llama_cpp_comparison.json while methodology still listed threads=12 in some fields.",
+    "reconciled_asdsl_12t": 11.68,
+    "reconciled_compare_12t": 11.288,
+    "explanation": [
+      "11.75 and 11.68/11.29 are the same measurement family (12-thread HF preq, 128 tokens).",
+      "8.24 is not a 12-thread result; it matches 13-thread compare and ~97ms engine profile per token.",
+      "106% vs llama claim used ASDSL@12t vs llama.cpp CLI@8t (11.1 in stale JSON), not same thread count.",
+      "Standalone llama@12t = 13.9 tok/s; ASDSL@12t does not beat llama at equal threads."
+    ]
+  },
+
+  "results": {
+    "asdsl_8t": {
+      "tok_s": 8.33,
+      "ram_gb": 2.4,
+      "ppl_64t": 84.34,
+      "source": "benchmarks/phase19_measurements.json"
+    },
+    "asdsl_12t": {
+      "tok_s": 11.68,
+      "ram_gb": 2.4,
+      "ppl_64t": 84.34,
+      "source": "benchmarks/phase19_measurements.json"
+    },
+    "llama_8t": {
+      "tok_s": 12.8,
+      "ram_gb": 2.4,
+      "ppl_64t": null,
+      "source": "benchmarks/phase19_measurements.json (CLI footer Generation t/s)"
+    },
+    "llama_12t": {
+      "tok_s": 13.9,
+      "ram_gb": 2.4,
+      "ppl_64t": null,
+      "source": "benchmarks/phase19_measurements.json (CLI footer Generation t/s)"
+    },
+    "llama_bench_tg128_12t": {
+      "tok_s": 11.4,
+      "note": "llama-bench synthetic tg128, 12 threads — not identical to chat-template CLI"
+    }
+  },
+
+  "comparisons": {
+    "same_thread_8t": {
+      "asdsl": 8.33,
+      "llama": 12.8,
+      "asdsl_pct_of_llama": 65.1,
+      "winner": "llama"
+    },
+    "same_thread_12t": {
+      "asdsl": 11.68,
+      "llama": 13.9,
+      "asdsl_pct_of_llama": 84.0,
+      "winner": "llama"
+    },
+    "default_configs_stale_json": {
+      "asdsl_config": "compare default 12 threads",
+      "asdsl_tok_s": 11.288,
+      "llama_config": "compare llama_cpp_cli default 8 threads (historical)",
+      "llama_tok_s": 11.1,
+      "asdsl_pct_of_llama": 101.7,
+      "winner": "misleading — different thread counts",
+      "note": "Do not use for parity claims"
+    },
+    "best_config_each": {
+      "asdsl_config": "12t UnifiedEngine preq, HF weights",
+      "asdsl_tok_s": 11.68,
+      "llama_config": "12t Q4_K_M CLI",
+      "llama_tok_s": 13.9,
+      "asdsl_pct_of_llama": 84.0,
+      "winner": "llama"
+    }
+  },
+
+  "quality": {
+    "asdsl_ppl_64t": 84.34,
+    "asdsl_ppl_ratio_4bit_fp16": 1.44,
+    "llama_ppl_64t": "not measured",
+    "llama_ppl_ratio_literature": "~1.05 for Q4_K_M",
+    "quality_winner": "llama.cpp",
+    "quality_note": "ASDSL HF asymmetric Q4 preq; GGUF Q4_K_M calibrated weights would narrow quality gap"
+  },
+
+  "thread_affinity_note": "set_thread_count() sets OMP_PLACES={0-7} (8 logical P-cores) even when threads=12; 12 OpenMP threads share 8 places. compare_llama_cpp and phi4_cpu_run both use set_thread_count.",
+
+  "project_summary": {
+    "start_tok_s": 2.36,
+    "final_tok_s": 11.68,
+    "improvement_factor": 4.95,
+    "ram_start_gb": 7.5,
+    "ram_final_gb": 2.4,
+    "load_time_start_sec": 602,
+    "load_time_final_sec": 2.7,
+    "vs_llama_cpp_same_12t_pct": 84.0,
+    "vs_llama_cpp_same_8t_pct": 65.1,
+    "honest_assessment": "ASDSL matches or beats llama.cpp only when comparing 12-thread ASDSL to 8-thread llama (stale 11.1 figure). At equal threads, llama.cpp is faster (13.9 vs 11.7 tok/s at 12t). ASDSL wins on RAM (~2.4 GB vs ~2.4 GB GGUF) and load time after cache; loses on decode speed and PPL ratio."
+  }
+}

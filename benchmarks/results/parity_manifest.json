@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "description": "Frozen parity protocol for ASDSL vs llama.cpp (do not edit mid-run; copy to run output)",
+  "hardware": {
+    "cpu": "Intel Core i7-1360P (Raptor Lake, 4P+8E)",
+    "ram_gb": 16,
+    "ddr": "DDR4-3200",
+    "os": "Windows 10",
+    "power_plan": "High performance (recommended)"
+  },
+  "stacks": {
+    "asdsl": {
+      "entry": "experiments/phi4_cpu_run.py",
+      "build": "python setup.py build_ext --inplace",
+      "env_required": {
+        "OMP_NUM_THREADS": "12",
+        "MKL_NUM_THREADS": "12",
+        "OPENBLAS_NUM_THREADS": "12",
+        "ASDSL_USE_UNIFIED": "1",
+        "ASDSL_FUSED_GEMV": "1",
+        "ASDSL_IGNORE_EOS": "1",
+        "ASDSL_AFFINITY": "legacy",
+        "ASDSL_PREQ_G4FUSED": "0",
+        "ASDSL_PREQ_PREFETCH_GROUPS": "0"
+      },
+      "threads_cli": 12
+    },
+    "llama": {
+      "binary": "tools/llama.cpp/llama-cli.exe",
+      "bench_binary": "tools/llama.cpp/llama-bench.exe",
+      "version_note": "b0df4c0cf (build 9297) per phase26",
+      "threads_cli": 12
+    }
+  },
+  "model": {
+    "gguf_path": "models/llama_cpp/phi4-mm-Q4_K_M.gguf",
+    "sha256": null,
+    "hf_checkpoint": "microsoft/Phi-4-multimodal-instruct"
+  },
+  "prompt": {
+    "chat_template": "<|user|>The<|end|><|assistant|>",
+    "asdsl_user_prompt": "The",
+    "asdsl_system_prompt": ""
+  },
+  "decode": {
+    "n_tokens": 128,
+    "temperature": 0,
+    "ignore_eos": true,
+    "ngl": 0,
+    "no_cnv": true
+  },
+  "thermal": {
+    "idle_before_session_min": 10,
+    "cooldown_between_runs_s": 30,
+    "cooldown_between_sessions_min": 5,
+    "max_temp_c": 65,
+    "thermal_utils": "benchmarks/thermal_utils.py"
+  },
+  "session_protocol": [
+    "Session A: ASDSL configs only (no llama-cli between runs)",
+    "Idle >= 5 min",
+    "Session B: llama L0 only"
+  ],
+  "metrics": {
+    "asdsl_decode_2_N": "sum(step_times[1:]) / (N-1) from phi4_cpu_run decode line",
+    "asdsl_full_1_N": "all generated tokens / wall decode",
+    "llama_cli_footer": "Generation: X t/s",
+    "llama_bench_tg128": "llama-bench tg128 steady decode",
+    "high_variance_warning": {
+      "asdsl_std_gt": 0.2,
+      "llama_std_gt": 0.3
+    }
+  },
+  "configs": {
+    "C0": {
+      "label": "HF preq gs=32 (quality default)",
+      "weight_source": "HF safetensors cache",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32"
+      },
+      "gguf_path": false,
+      "asdsl_use_q4km_gguf": false
+    },
+    "C1": {
+      "label": "GGUF Q4_K native on q4_k layers + preq for q5_k/q6_k",
+      "weight_source": "Same GGUF tensors via load_from_gguf",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_USE_Q4KM_GGUF": "1"
+      },
+      "gguf_path": true,
+      "asdsl_use_q4km_gguf": true
+    },
+    "C2": {
+      "label": "DISABLED — Phase 30 native Q5/Q6 reverted (was ~0.18 tok/s)",
+      "note": "Use C0 for canonical speed. C1 = Q4_K native + preq fallback only.",
+      "disabled": true,
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_USE_Q4KM_GGUF": "1"
+      },
+      "gguf_path": true,
+      "asdsl_use_q4km_gguf": true
+    },
+    "C3": {
+      "label": "Exploratory gs=128 HF preq only",
+      "weight_source": "HF",
+      "env": {
+        "ASDSL_GROUP_SIZE": "128"
+      },
+      "gguf_path": false,
+      "exploratory": true
+    },
+    "L0": {
+      "label": "llama.cpp reference on GGUF",
+      "stack": "llama"
+    }
+  },
+  "success_gate": {
+    "asdsl_std_lt": 0.15,
+    "llama_std_lt": 0.25,
+    "ratio_reproducible_within_pct": 2,
+    "speed_parity_C1_vs_L0": "C1 >= 0.95 * L0 at 12t"
+  }
+}

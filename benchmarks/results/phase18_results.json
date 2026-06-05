@@ -1,0 +1,75 @@
+{
+  "phase": 18,
+  "load_hang_cause": "models/phi4_weight_cache was empty; every benchmark called store.load() without mmap cache and re-quantized 128 HF projections (~12 min) plus preq repack (~28 min). Processes were killed before completion, appearing hung.",
+  "load_hang_fix": "Run benchmarks/build_caches.py once (or first compare_llama_cpp.py now saves weight cache). Unset PHI4_NO_WEIGHT_CACHE / PHI4_NO_PREQ_CACHE.",
+  "load_time_after_fix_sec": 2.74,
+  "caches_built": {
+    "weight": "phi4_cpu_93be19dc6067ee9e3cc123def61d586f.safetensors",
+    "weight_gb": 3.65,
+    "preq": "phi4_preq_93be19dc6067ee9e3cc123def61d586f_q4_32.safetensors",
+    "preq_gb": 2.01,
+    "first_build_minutes": 37.0
+  },
+  "diagnose_load_sec": 20.0,
+  "thread_sweep": {
+    "8t": 8.37,
+    "9t": 9.22,
+    "10t": 8.9,
+    "11t": 10.83,
+    "12t": 11.49,
+    "13t": 11.66,
+    "optimal_short_bench": 13,
+    "note": "single_tok_bench 24 tokens; full 128-token compare peaks at 12t"
+  },
+  "e2e_hf_preq_12t": {
+    "decode_tok_s": 11.753,
+    "load_time_sec": 2.74,
+    "first_token_ms": 98.0,
+    "path": "HF safetensors + UnifiedEngine preq (Q4K kernel not used)",
+    "source": "benchmarks/results/llama_cpp_comparison.json"
+  },
+  "e2e_hf_preq_13t": {
+    "decode_tok_s": 8.24,
+    "note": "128-token compare; 13t worse than 12t on this machine — use 12 for production"
+  },
+  "e2e_gguf_native_12t": null,
+  "e2e_gguf_note": "Q4K fix does not change HF-preq path. GGUF native needs ASDSL_USE_Q4KM_GGUF=1 + --gguf-path; no gguf preq cache on disk yet.",
+  "ppl_gguf_preq_64t": null,
+  "ppl_hf_preq_64t": 84.34,
+  "ppl_note": "GGUF preq cache not built (would need ~30 min repack + disk). HF WikiText-64 ratio ~1.44 unchanged.",
+  "engine_profile_12t_ms": {
+    "source": "compare_llama_cpp decode token 3",
+    "gate_up_gemv": 33.43,
+    "down_gemv": 16.39,
+    "qkv_gemv": 11.2,
+    "o_gemv": 6.46,
+    "activation_q8": 13.18,
+    "lm_head": 12.37,
+    "total": 81.82
+  },
+  "engine_profile_13t_ms": {
+    "gate_up_gemv": 38.71,
+    "down_gemv": 20.07,
+    "qkv_gemv": 13.59,
+    "o_gemv": 8.37,
+    "lm_head": 13.53,
+    "total": 97.17
+  },
+  "q4km_microbench_gb_s": {
+    "o_proj": 21.23,
+    "ffn_up": 21.75,
+    "phase17": true
+  },
+  "final": {
+    "decode_tok_s": 11.753,
+    "optimal_threads": 12,
+    "llama_cpp_tok_s": 11.1,
+    "vs_llama_cpp_pct": 105.9,
+    "load_time_sec": 2.74,
+    "ppl_64t_hf_preq": 84.34,
+    "ram_peak_mb": 9121,
+    "bandwidth_asdsl_gb_s": 28.4,
+    "bandwidth_llama_gb_s": 25.8,
+    "bandwidth_note": "~2.42 GB weights × decode tok/s"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "methodology": "separate_sessions_cold_12t_5runs",
+  "status": "phase30_reverted_c0_measured",
+  "note": "Phase 30 native Q5/Q6 reverted. C0 without GGUF: user run 2026-06-03 mean 9.05 tok/s. Phase 19 peak 11.68 was warm/single-session; Phase 27 cold committed baseline was 8.84-8.92.",
+  "canonical_config": "C0",
+  "C0": {
+    "mean_tok_s": 9.054,
+    "std": 0.654,
+    "runs": [9.14, 9.57, 8.76, 7.97, 9.83],
+    "config": "HF preq gs32, ASDSL_USE_UNIFIED=1, no ASDSL_USE_Q4KM_GGUF",
+    "source": "benchmarks/results/parity_run_latest.json (2026-06-03)"
+  },
+  "C0_phase19_peak": {
+    "mean_tok_s": 11.68,
+    "std": null,
+    "config": "same stack, single warm standalone run",
+    "source": "benchmarks/results/final_honest_comparison.json",
+    "reproducibility": "not reproduced on 2026-06 cold parity (see phase27_results cold_e2e 8.84)"
+  },
+  "C1": {
+    "mean_tok_s": null,
+    "config": "disabled until Q4_K mixed path re-validated",
+    "warning": "Phase 30 full native hit 0.18 tok/s"
+  },
+  "C2": {
+    "mean_tok_s": null,
+    "config": "disabled",
+    "warning": "Phase 30 reverted"
+  },
+  "L0": {
+    "mean_tok_s": 13.9,
+    "std": 0.15,
+    "config": "llama Q4_K_M 12t",
+    "source": "benchmarks/results/final_honest_comparison.json"
+  },
+  "C0_vs_L0_pct": 65.1,
+  "C0_phase19_vs_L0_pct": 84.0,
+  "verdict": "llama_wins",
+  "committed": false,
+  "git_commit": null
+}
