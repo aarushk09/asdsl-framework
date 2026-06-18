@@ -19,9 +19,14 @@
         "ASDSL_USE_UNIFIED": "1",
         "ASDSL_FUSED_GEMV": "1",
         "ASDSL_IGNORE_EOS": "1",
-        "ASDSL_AFFINITY": "legacy",
+        "ASDSL_AFFINITY": "physical",
+        "ASDSL_CHUNKED_GEMV": "1",
+        "ASDSL_PREQ2": "1",
         "ASDSL_PREQ_G4FUSED": "0",
-        "ASDSL_PREQ_PREFETCH_GROUPS": "0"
+        "ASDSL_PREQ_PREFETCH_GROUPS": "0",
+        "ASDSL_GEMV_UNROLL": "4",
+        "ASDSL_USE_PLD": "0",
+        "ASDSL_LARGE_PAGES": "0"
       },
       "threads_cli": 12
     },
@@ -54,7 +59,10 @@
     "cooldown_between_runs_s": 30,
     "cooldown_between_sessions_min": 5,
     "max_temp_c": 65,
-    "thermal_utils": "benchmarks/thermal_utils.py"
+    "thermal_utils": "benchmarks/thermal_utils.py",
+    "temp_sensor_null_fallback": "When WMI MSAcpi_ThermalZoneTemperature is unavailable, temp_c=null is expected on Windows without admin. Parity proceeds when matmul throttle baseline (baseline_dot_ms) is not exceeded.",
+    "kernel_preflight": "benchmarks/kernel_preflight.py",
+    "kernel_preflight_reference": "benchmarks/results/kernel_bench_reference.json"
   },
   "session_protocol": [
     "Session A: ASDSL configs only (no llama-cli between runs)",
@@ -110,6 +118,96 @@
       },
       "gguf_path": false,
       "exploratory": true
+    },
+    "C0.3": {
+      "label": "preq2 + g128 all projections + lm_head (byte diet Phase 3)",
+      "weight_source": "HF safetensors cache",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_C01": "1",
+        "ASDSL_C03": "1",
+        "ASDSL_GATEUP_GS": "128",
+        "ASDSL_DOWN_GS": "128",
+        "ASDSL_LMHEAD_GS": "128",
+        "ASDSL_PERSISTENT_POOL": "1",
+        "ASDSL_CPP_GENERATE": "1"
+      },
+      "gguf_path": false,
+      "exploratory": true
+    },
+    "C0.1": {
+      "label": "preq2 + g128 gate_up/down/lm_head (imatrix-lite)",
+      "weight_source": "HF safetensors cache",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_C01": "1",
+        "ASDSL_GATEUP_GS": "128",
+        "ASDSL_DOWN_GS": "128",
+        "ASDSL_LMHEAD_GS": "128"
+      },
+      "gguf_path": false,
+      "exploratory": true
+    },
+    "C5": {
+      "label": "C0 + Prompt Lookup Decoding (lossless greedy verify)",
+      "weight_source": "HF safetensors cache",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_USE_PLD": "1"
+      },
+      "gguf_path": false,
+      "speculative": true,
+      "note": "Phase 5 PLD (manifest C5). Plan Section F EAGLE/LayerSkip was not implemented — see PHASE_WALKTHROUGH.md"
+    },
+    "C6": {
+      "label": "Phase 6 stretch: large pages + autotuned chunk div",
+      "weight_source": "HF safetensors cache",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_LARGE_PAGES": "1",
+        "ASDSL_GEMV_CHUNK_DIV": "6"
+      },
+      "gguf_path": false,
+      "exploratory": true,
+      "note": "chunk_div from phase6_chunk_cache.json best_div=6"
+    },
+    "C6-smt": {
+      "label": "Phase 6: chunk_div=6 + SMT affinity, 16 threads",
+      "weight_source": "HF safetensors cache",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_GEMV_CHUNK_DIV": "6",
+        "ASDSL_AFFINITY": "smt"
+      },
+      "threads_cli": 16,
+      "gguf_path": false,
+      "exploratory": true
+    },
+    "C0-fast": {
+      "label": "Best E2E exploratory: smt + chunk_div=6, 16 threads (no large pages)",
+      "weight_source": "HF safetensors cache",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_GEMV_CHUNK_DIV": "6",
+        "ASDSL_AFFINITY": "smt"
+      },
+      "threads_cli": 16,
+      "gguf_path": false,
+      "exploratory": true,
+      "note": "Parity mean ~10.42 tok/s (2026-06-13); canonical quality default remains C0"
+    },
+    "C4": {
+      "label": "AHSD speculative (K=3, static skip layers 10-21)",
+      "weight_source": "HF safetensors cache",
+      "env": {
+        "ASDSL_GROUP_SIZE": "32",
+        "ASDSL_USE_AHSD": "1",
+        "ASDSL_AHSD_DRAFT_K": "3",
+        "ASDSL_SPECULATIVE_PROFILE": "1"
+      },
+      "gguf_path": false,
+      "asdsl_use_q4km_gguf": false,
+      "speculative": true
     },
     "L0": {
       "label": "llama.cpp reference on GGUF",

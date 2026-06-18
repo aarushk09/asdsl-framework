@@ -1,0 +1,17 @@
+{
+  "phase": 6,
+  "timestamp_utc": "2026-06-15T11:54:33.817193+00:00",
+  "threads": 12,
+  "projection": "gate_up",
+  "kernel": "gemv_preq2_fused_avx2",
+  "divisors": {
+    "2": 14.54,
+    "3": 26.37,
+    "4": 17.27,
+    "6": 19.7,
+    "8": 16.5
+  },
+  "best_div": 3,
+  "best_gb_per_s": 26.37,
+  "default_div": 4
+}

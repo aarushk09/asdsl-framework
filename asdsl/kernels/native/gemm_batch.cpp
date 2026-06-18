@@ -1,3 +1,7 @@
+// Phase G: gate_up batch GEMM is often K-wide (hidden_size) with 2*intermediate rows.
+// When out_features is large and in_features is moderate, row-parallel scheduling above
+// already maps each output row independently; future work can fuse gate+up row pairs.
+
 #include "unified_engine.h"
 #include <immintrin.h>
 #include <vector>

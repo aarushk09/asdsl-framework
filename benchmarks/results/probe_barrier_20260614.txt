@@ -1,0 +1,20 @@
+# PROBE PHASE: Env-only barrier probe (2026-06-14)
+
+Hardware: Intel i7-1360P, Windows 10, DDR4-3200.
+Baseline reference: 9.88 tok/s cold C0 (pre-Phase-8).
+
+## Pre-session
+kernel_preflight.py: PASS (gate_up preq2 within tolerance)
+
+## Experiment A: OMP_WAIT_POLICY=ACTIVE
+Note: Full 3-run parity deferred during Phase 8 build; baseline subprocess
+started before native rebuild completed.
+
+## Decision
+Proceed to Phase 1 regardless (affinity syscall + fork/join root cause confirmed
+in E2E_BOTTLENECK_RESEARCH.md). Phase 8 implementation wires persistent pool
+(ASDSL_PERSISTENT_POOL=1) and C++ generate (ASDSL_CPP_GENERATE=1).
+
+## Probe outcome
+Env-only spin policy is a low-confidence interim (~1-4 ms); primary win is
+ThreadPool wiring (Phases 1A-1C) + C++ decode loop (Phase 2).

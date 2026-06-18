@@ -1,0 +1,533 @@
+{
+  "timestamp_utc": "2026-06-15T16:29:46.042149+00:00",
+  "hardware_note": {
+    "cpu": "Intel Core i7-1360P (Raptor Lake, 4P+8E)",
+    "ram_gb": 16,
+    "ddr": "DDR4-3200",
+    "os": "Windows 10",
+    "power_plan": "High performance (recommended)"
+  },
+  "fairness_protocol": {
+    "fair_mode": true,
+    "weight_parity": false,
+    "asdsl_config": "C0",
+    "asdsl_threads": 12,
+    "llama_threads": 12,
+    "same_gguf_weights": false,
+    "decode": "greedy, temperature=0, ignore-eos",
+    "notes": [
+      "threads: ASDSL and llama both use 12",
+      "decode: greedy, temperature=0, ignore-eos on both stacks",
+      "metric: ASDSL decode_2_N (tokens 2-N) vs llama cli footer (all tokens)",
+      "weight_caveat: C0 uses HF asymmetric preq; llama uses Q4_K_M GGUF \u2014 speed comparison is canonical stacks, not identical bytes. Use --weight-parity for same tensors."
+    ]
+  },
+  "asdsl_config": "C0",
+  "asdsl_effective_env": {
+    "ASDSL_AFFINITY": "physical",
+    "ASDSL_CHUNKED_GEMV": "1",
+    "ASDSL_CPP_GENERATE": "1",
+    "ASDSL_FUSED_GEMV": "1",
+    "ASDSL_GEMV_CHUNK_DIV": "4",
+    "ASDSL_GEMV_UNROLL": "4",
+    "ASDSL_GROUP_SIZE": "32",
+    "ASDSL_IGNORE_EOS": "1",
+    "ASDSL_LARGE_PAGES": "0",
+    "ASDSL_PERSISTENT_POOL": "1",
+    "ASDSL_PREQ2": "1",
+    "ASDSL_PREQ_G4FUSED": "0",
+    "ASDSL_PREQ_PREFETCH_GROUPS": "0",
+    "ASDSL_USE_PLD": "0",
+    "ASDSL_USE_UNIFIED": "1",
+    "MKL_NUM_THREADS": "12",
+    "NUMEXPR_NUM_THREADS": "12",
+    "OMP_NUM_THREADS": "12",
+    "OPENBLAS_NUM_THREADS": "12"
+  },
+  "llama_threads": 12,
+  "n_runs_per_prompt": 5,
+  "max_new_tokens": 100,
+  "prompts": [
+    {
+      "id": "gravity",
+      "user": "Explain gravity in simple terms.",
+      "system": "You are a helpful assistant."
+    },
+    {
+      "id": "quantization_typos",
+      "user": "Explain quantizatssion in llmss in simple terms.",
+      "system": "You are a helpful assistant."
+    },
+    {
+      "id": "gravity_one_sentence",
+      "user": "Explain gravity in one sentence.",
+      "system": "You are a helpful assistant."
+    }
+  ],
+  "native_extensions": {
+    "ok": true,
+    "asdsl.kernels._native_unified": true,
+    "asdsl.kernels._native_gemv": true
+  },
+  "kernel_preflight": {
+    "ok": true,
+    "threads": 12,
+    "reference_ms": 3.389,
+    "measured_ms": 1.02,
+    "measured_gb_s": 30.92,
+    "tolerance_pct": 15.0,
+    "allowed_ms_max": 3.897,
+    "faster_than_reference": true
+  },
+  "session_asdsl": {
+    "thermal": {
+      "initial_sleep_s": 60,
+      "max_temp_c": 65,
+      "temp_c": null,
+      "throttled": false,
+      "waited_s": 0,
+      "baseline_dot_ms": 9.542300016619265,
+      "proceeded": true
+    },
+    "prompts": {
+      "gravity": {
+        "prompt": {
+          "id": "gravity",
+          "user": "Explain gravity in simple terms.",
+          "system": "You are a helpful assistant."
+        },
+        "decode_2_N": {
+          "runs": [
+            11.27,
+            11.19,
+            11.2,
+            11.42,
+            11.11
+          ],
+          "mean": 11.238,
+          "std": 0.104,
+          "min": 11.11,
+          "max": 11.42,
+          "trimmed_mean": 11.22
+        },
+        "full_1_N": {
+          "runs": [
+            11.27,
+            11.19,
+            11.2,
+            11.42,
+            11.11
+          ],
+          "mean": 11.238,
+          "std": 0.104,
+          "min": 11.11,
+          "max": 11.42,
+          "trimmed_mean": 11.22
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "decode_2_N": 11.27,
+            "full_1_N": 11.27,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.40s) Computer Key Key Key Key Key Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 11.19,
+            "full_1_N": 11.19,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.44s) Computer Key Key Key Key Key Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 11.2,
+            "full_1_N": 11.2,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.38s) Computer Key Key Key Key Key Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 11.42,
+            "full_1_N": 11.42,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.46s) Computer Key Key Key Key Key Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 11.11,
+            "full_1_N": 11.11,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.44s) Computer Key Key Key Key Key Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          }
+        ]
+      },
+      "quantization_typos": {
+        "prompt": {
+          "id": "quantization_typos",
+          "user": "Explain quantizatssion in llmss in simple terms.",
+          "system": "You are a helpful assistant."
+        },
+        "decode_2_N": {
+          "runs": [
+            10.82,
+            10.79,
+            10.2,
+            9.87,
+            10.02
+          ],
+          "mean": 10.34,
+          "std": 0.394,
+          "min": 9.87,
+          "max": 10.82,
+          "trimmed_mean": 10.337
+        },
+        "full_1_N": {
+          "runs": [
+            10.82,
+            10.79,
+            10.2,
+            9.87,
+            10.02
+          ],
+          "mean": 10.34,
+          "std": 0.394,
+          "min": 9.87,
+          "max": 10.82,
+          "trimmed_mean": 10.337
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "decode_2_N": 10.82,
+            "full_1_N": 10.82,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.48s) Arc Key Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Key"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 10.79,
+            "full_1_N": 10.79,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.39s) Arc Key Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Key"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 10.2,
+            "full_1_N": 10.2,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.43s) Arc Key Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Key"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 9.87,
+            "full_1_N": 9.87,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.47s) Arc Key Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Key"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 10.02,
+            "full_1_N": 10.02,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.49s) Arc Key Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Ac Key"
+          }
+        ]
+      },
+      "gravity_one_sentence": {
+        "prompt": {
+          "id": "gravity_one_sentence",
+          "user": "Explain gravity in one sentence.",
+          "system": "You are a helpful assistant."
+        },
+        "decode_2_N": {
+          "runs": [
+            11.05,
+            11.16,
+            10.92,
+            11.24,
+            10.96
+          ],
+          "mean": 11.066,
+          "std": 0.12,
+          "min": 10.92,
+          "max": 11.24,
+          "trimmed_mean": 11.057
+        },
+        "full_1_N": {
+          "runs": [
+            11.05,
+            11.16,
+            10.92,
+            11.24,
+            10.96
+          ],
+          "mean": 11.066,
+          "std": 0.12,
+          "min": 10.92,
+          "max": 11.24,
+          "trimmed_mean": 11.057
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "decode_2_N": 11.05,
+            "full_1_N": 11.05,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.39s) Computer Key Ac Ac Ac Ac Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 11.16,
+            "full_1_N": 11.16,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.38s) Computer Key Ac Ac Ac Ac Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 10.92,
+            "full_1_N": 10.92,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.41s) Computer Key Ac Ac Ac Ac Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 11.24,
+            "full_1_N": 11.24,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.52s) Computer Key Ac Ac Ac Ac Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 10.96,
+            "full_1_N": 10.96,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path lm_head preq2 cache restored: meta 75024KB quant 293MB (0.52s) Computer Key Ac Ac Ac Ac Ac Key Key Key Key Key Key Key Key Key Key Key Key Key Key Ke"
+          }
+        ]
+      }
+    }
+  },
+  "session_llama": {
+    "thermal": {
+      "initial_sleep_s": 30,
+      "max_temp_c": 65,
+      "temp_c": null,
+      "throttled": false,
+      "waited_s": 30,
+      "proceeded": true
+    },
+    "prompts": {
+      "gravity": {
+        "prompt": {
+          "id": "gravity",
+          "user": "Explain gravity in simple terms.",
+          "system": "You are a helpful assistant."
+        },
+        "cli_footer": {
+          "runs": [
+            13.8,
+            14.0,
+            13.8,
+            13.7,
+            13.7
+          ],
+          "mean": 13.8,
+          "std": 0.11,
+          "min": 13.7,
+          "max": 14.0,
+          "trimmed_mean": 13.767
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.8,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 6.9 t/s | Generation: 13.8 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.0,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 8.8 t/s | Generation: 14.0 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.8,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 3.7 t/s | Generation: 13.8 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.7,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 14.0 t/s | Generation: 13.7 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.7,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 7.8 t/s | Generation: 13.7 t/s ] Exiting..."
+          }
+        ]
+      },
+      "quantization_typos": {
+        "prompt": {
+          "id": "quantization_typos",
+          "user": "Explain quantizatssion in llmss in simple terms.",
+          "system": "You are a helpful assistant."
+        },
+        "cli_footer": {
+          "runs": [
+            13.6,
+            13.9,
+            13.9,
+            13.8,
+            13.8
+          ],
+          "mean": 13.8,
+          "std": 0.11,
+          "min": 13.6,
+          "max": 13.9,
+          "trimmed_mean": 13.833
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.6,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 7.1 t/s | Generation: 13.6 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.9,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "grees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 10.6 t/s | Generation: 13.9 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.9,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 7.0 t/s | Generation: 13.9 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.8,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 4.4 t/s | Generation: 13.8 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.8,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 8.3 t/s | Generation: 13.8 t/s ] Exiting..."
+          }
+        ]
+      },
+      "gravity_one_sentence": {
+        "prompt": {
+          "id": "gravity_one_sentence",
+          "user": "Explain gravity in one sentence.",
+          "system": "You are a helpful assistant."
+        },
+        "cli_footer": {
+          "runs": [
+            13.8,
+            14.7,
+            14.6,
+            14.7,
+            14.6
+          ],
+          "mean": 14.48,
+          "std": 0.343,
+          "min": 13.8,
+          "max": 14.7,
+          "trimmed_mean": 14.633
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.8,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 6.8 t/s | Generation: 13.8 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.7,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 4.9 t/s | Generation: 14.7 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.6,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 8.5 t/s | Generation: 14.6 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.7,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 6.9 t/s | Generation: 14.7 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.6,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 8.8 t/s | Generation: 14.6 t/s ] Exiting..."
+          }
+        ]
+      }
+    },
+    "llama_bench_tg128": {
+      "ok": true,
+      "tg128_tok_s": null,
+      "raw_tail": "         35.18 \u00c2\u00b1 0.56 |\n| phi3 3B Q4_K - Medium          |   2.31 GiB |     3.84 B | CPU        |      12 |             tg1 |         11.39 \u00c2\u00b1 0.45 |\n\nbuild: b0df4c0cf (9297)\nload_backend: loaded RPC backend from C:\\Users\\aarus\\projects\\asdsl-framework\\tools\\llama.cpp\\ggml-rpc.dll\nload_backend: loaded CPU backend from C:\\Users\\aarus\\projects\\asdsl-framework\\tools\\llama.cpp\\ggml-cpu-alderlake.dll\n"
+    },
+    "thread_mismatch_runs": 0
+  },
+  "llama_bench_tg128": {
+    "ok": true,
+    "tg128_tok_s": null,
+    "raw_tail": "         35.18 \u00c2\u00b1 0.56 |\n| phi3 3B Q4_K - Medium          |   2.31 GiB |     3.84 B | CPU        |      12 |             tg1 |         11.39 \u00c2\u00b1 0.45 |\n\nbuild: b0df4c0cf (9297)\nload_backend: loaded RPC backend from C:\\Users\\aarus\\projects\\asdsl-framework\\tools\\llama.cpp\\ggml-rpc.dll\nload_backend: loaded CPU backend from C:\\Users\\aarus\\projects\\asdsl-framework\\tools\\llama.cpp\\ggml-cpu-alderlake.dll\n"
+  },
+  "comparison": {
+    "per_prompt": [
+      {
+        "prompt_id": "gravity",
+        "asdsl_decode_2_N_trimmed_mean": 11.22,
+        "llama_footer_trimmed_mean": 13.767,
+        "asdsl_pct_of_llama": 81.5
+      },
+      {
+        "prompt_id": "quantization_typos",
+        "asdsl_decode_2_N_trimmed_mean": 10.337,
+        "llama_footer_trimmed_mean": 13.833,
+        "asdsl_pct_of_llama": 74.7
+      },
+      {
+        "prompt_id": "gravity_one_sentence",
+        "asdsl_decode_2_N_trimmed_mean": 11.057,
+        "llama_footer_trimmed_mean": 14.633,
+        "asdsl_pct_of_llama": 75.6
+      }
+    ],
+    "asdsl_grand_mean_decode_2_N": 10.871,
+    "llama_grand_mean_footer": 14.078,
+    "asdsl_pct_of_llama_grand_mean": 77.2
+  }
+}

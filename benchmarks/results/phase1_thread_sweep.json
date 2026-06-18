@@ -1,0 +1,47 @@
+{
+  "timestamp_utc": "2026-06-13T23:48:37.064606+00:00",
+  "phase": 1,
+  "quick_mode": true,
+  "best_gate_up_preq2": {
+    "threads": 12,
+    "affinity": "physical",
+    "chunked": true,
+    "returncode": 0,
+    "gate_up_preq2": {
+      "ms": 0.784,
+      "gb_s": 40.24
+    }
+  },
+  "results": [
+    {
+      "threads": 8,
+      "affinity": "physical",
+      "chunked": true,
+      "returncode": 0,
+      "gate_up_preq2": {
+        "ms": 0.853,
+        "gb_s": 36.96
+      }
+    },
+    {
+      "threads": 12,
+      "affinity": "physical",
+      "chunked": true,
+      "returncode": 0,
+      "gate_up_preq2": {
+        "ms": 0.784,
+        "gb_s": 40.24
+      }
+    },
+    {
+      "threads": 16,
+      "affinity": "physical",
+      "chunked": true,
+      "returncode": 0,
+      "gate_up_preq2": {
+        "ms": 9.281,
+        "gb_s": 3.4
+      }
+    }
+  ]
+}

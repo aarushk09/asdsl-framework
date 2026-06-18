@@ -1,0 +1,39 @@
+{
+  "timestamp_utc": "2026-06-05T18:00:00+00:00",
+  "phase": "A",
+  "gates": {
+    "A1_q2_vs_q4": {
+      "status": "pending",
+      "note": "Run comprehensive_bench.py --bits 2 after Q2 cache build",
+      "q2_correctness_unpacked": "pass"
+    },
+    "A2_dual_stream": {
+      "combined_bandwidth_gb_s": 12.01,
+      "retention_a_pct": 24.8,
+      "retention_b_pct": 20.9,
+      "gate_pass": false,
+      "criteria": "combined >= 35 GB/s, retention >= 80% each",
+      "source": "benchmarks/measure_dual_stream.py --size-a-mb 256 --size-b-mb 256",
+      "decision": "SDQS Phase F cancelled; pivot to Phase G (AHSD + batched GEMM verify)"
+    },
+    "A3_qcsd_acceptance": {
+      "status": "pending",
+      "note": "Run phi4_cpu_run.py --qcsd with ASDSL_SPECULATIVE_PROFILE=1"
+    },
+    "A4_verify_overhead": {
+      "status": "pending",
+      "note": "Parse verify_ms/draft_ms from QCSD telemetry line"
+    }
+  },
+  "chosen_config": {
+    "draft_k": 3,
+    "draft_bits": 2,
+    "skip_layers": "10-21 static (Phase C); adaptive via ASDSL_AHSD_CALIBRATE (Phase D)"
+  },
+  "sdqs_blocked": true,
+  "sdqs_block_reason": "Gate A2 failed: dual-stream retention <80%, combined BW 12 GB/s << 35 GB/s target"
+  "q2_correctness": {
+    "unpacked": "pass",
+    "packed": "pending_review"
+  }
+}

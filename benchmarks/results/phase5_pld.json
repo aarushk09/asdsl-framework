@@ -1,0 +1,73 @@
+{
+  "phase": 5,
+  "timestamp_utc": "2026-06-13T15:24:50.944073+00:00",
+  "config": "C0",
+  "threads": 12,
+  "max_new_tokens": 128,
+  "workloads": {
+    "canonical_the": {
+      "prompt": "The",
+      "greedy": {
+        "tokens_per_second": 8.684,
+        "decode_tokens": 26,
+        "decode_s": 2.994,
+        "mode": "greedy"
+      },
+      "pld": {
+        "tokens_per_second": 9.142,
+        "decode_tokens": 26,
+        "decode_s": 2.844,
+        "mode": "pld"
+      },
+      "speedup": 1.053
+    },
+    "repeat_paragraph": {
+      "prompt_chars": 1091,
+      "greedy": {
+        "tokens_per_second": 0.979,
+        "decode_tokens": 28,
+        "decode_s": 28.591,
+        "mode": "greedy"
+      },
+      "pld": {
+        "tokens_per_second": 0.946,
+        "decode_tokens": 28,
+        "decode_s": 29.603,
+        "mode": "pld"
+      },
+      "speedup": 0.966
+    },
+    "code_continuation": {
+      "prompt_chars": 158,
+      "greedy": {
+        "tokens_per_second": 3.085,
+        "decode_tokens": 29,
+        "decode_s": 9.401,
+        "mode": "greedy"
+      },
+      "pld": {
+        "tokens_per_second": 1.743,
+        "decode_tokens": 29,
+        "decode_s": 16.64,
+        "mode": "pld"
+      },
+      "speedup": 0.565
+    }
+  },
+  "verify_overhead": {
+    "t_single_ms": 77.486,
+    "t_verify_k2_ms": 142.107,
+    "ratio_k2": 1.834,
+    "t_verify_k4_ms": 375.32,
+    "ratio_k4": 4.844,
+    "t_verify_k6_ms": 1186.423,
+    "ratio_k6": 15.311,
+    "vocab": 200064.0
+  },
+  "gates": {
+    "canonical_regression_pct": 5.27,
+    "copy_heavy_min_speedup": 0.565,
+    "copy_heavy_mean_speedup": 0.766,
+    "verify_ratio_k4": 4.844
+  }
+}

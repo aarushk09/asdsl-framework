@@ -1,4 +1,12 @@
-"""CPU thermal / throttle helpers for reproducible benchmarks on Windows."""
+"""CPU thermal / throttle helpers for reproducible benchmarks on Windows.
+
+Protocol (parity manifest ``thermal`` section):
+- ``temp_c=null`` is normal when WMI ``MSAcpi_ThermalZoneTemperature`` is unavailable
+  (common on Windows without elevated privileges). Cooling still uses matmul throttle
+  detection via ``baseline_dot_ms`` after the initial sleep.
+- When a sensor is present, wait until ``temp_c < max_temp_c`` (default 65°C).
+- Kernel preflight (``benchmarks/kernel_preflight.py``) runs separately before ASDSL parity.
+"""
 
 from __future__ import annotations
 

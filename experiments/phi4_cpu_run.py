@@ -160,21 +160,77 @@ def _logical_ids_for_threads(n: int) -> list[int]:
     return ids[:n]
 
 
+def _physical_logical_ids_for_threads(n: int) -> list[int]:
+    """One logical CPU per physical core (P-cores first, then E-cores)."""
+    try:
+        from asdsl.kernels import _native_gemv as _ng
+
+        if hasattr(_ng, "get_cpu_topology"):
+            topo = _ng.get_cpu_topology()
+            raw = list(topo.get("physical_logical_ids", []))
+            if raw:
+                return raw[:n]
+    except Exception:
+        pass
+    # Raptor Lake i7-1360P fallback: P 0-3 + E 8-15 (skip HT siblings 4-7)
+    fallback = [0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15]
+    nlog = os.cpu_count() or 16
+    ids = [i for i in fallback if i < nlog]
+    while len(ids) < n and len(ids) < nlog:
+        for i in range(nlog):
+            if i not in ids:
+                ids.append(i)
+            if len(ids) >= n:
+                break
+    return ids[:n]
+
+
+def _smt_logical_ids_for_threads(n: int) -> list[int]:
+    """P-cores with HT siblings first, then E-cores (Phase 6 SMT experiment)."""
+    try:
+        from asdsl.kernels import _native_unified as nu
+
+        p_all = list(nu.get_all_pcore_logical_ids())
+    except Exception:
+        p_all = [0, 1, 2, 3, 4, 5, 6, 7]
+    nlog = os.cpu_count() or 16
+    ids = [i for i in p_all if i < nlog]
+    for i in range(8, nlog):
+        if i not in ids:
+            ids.append(i)
+        if len(ids) >= n:
+            break
+    while len(ids) < n and len(ids) < nlog:
+        for i in range(nlog):
+            if i not in ids:
+                ids.append(i)
+            if len(ids) >= n:
+                break
+    return ids[:n]
+
+
 def set_thread_count(n: int) -> None:
     """Set CPU threads for NumPy/BLAS/PyTorch and native OpenMP GEMV.
 
     ``n <= 0`` (auto): 8 threads on P-cores only.
 
     Affinity modes (``ASDSL_AFFINITY``):
-      spread (default): one OpenMP thread per logical CPU in ``_logical_ids_for_threads``;
+      physical (recommended): one thread per physical core (4P+8E on i7-1360P);
+      spread: one OpenMP thread per logical CPU in ``_logical_ids_for_threads``;
+      smt: P-core HT siblings + E-cores (Phase 6, typically 16 threads);
       legacy: old ``OMP_PLACES={0-7}`` (12 threads oversubscribe 8 slots);
       none: only ``OMP_NUM_THREADS``, no OMP binding.
     """
     if n <= 0:
         n = 8
 
-    mode = os.environ.get("ASDSL_AFFINITY", "spread").strip().lower()
-    logical_ids = _logical_ids_for_threads(n)
+    mode = os.environ.get("ASDSL_AFFINITY", "physical").strip().lower()
+    if mode == "physical":
+        logical_ids = _physical_logical_ids_for_threads(n)
+    elif mode == "smt":
+        logical_ids = _smt_logical_ids_for_threads(n)
+    else:
+        logical_ids = _logical_ids_for_threads(n)
 
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -184,7 +240,7 @@ def set_thread_count(n: int) -> None:
     if mode == "legacy":
         os.environ["OMP_PROC_BIND"] = "TRUE"
         os.environ["OMP_PLACES"] = "{0-7}"
-    elif mode == "spread":
+    elif mode in ("spread", "physical", "smt"):
         os.environ["OMP_PROC_BIND"] = "close"
         os.environ["OMP_PLACES"] = ",".join(f"{{{i}}}" for i in logical_ids)
     else:
@@ -242,6 +298,17 @@ def resolve_model_dir() -> Path:
 
 MODEL_DIR = resolve_model_dir()
 INDEX_FILE = MODEL_DIR / "model.safetensors.index.json"
+
+
+def load_tokenizer():
+    """Load Phi-4 tokenizer (local model dir when present, else HuggingFace hub)."""
+    if (MODEL_DIR / "tokenizer_config.json").is_file():
+        return AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(
+        "microsoft/Phi-4-multimodal-instruct",
+        trust_remote_code=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Architecture constants (from microsoft/Phi-4-multimodal-instruct config)
@@ -476,6 +543,7 @@ def try_restore_weight_cache(store: WeightStore, path: Path) -> bool:
 
     store._pool = torch.empty(_TARGET_CHUNK_BYTES // 4, dtype=torch.float32)
     store._loaded_from_cache = True
+    store._weight_cache_path = path
     return True
 
 
@@ -1067,6 +1135,7 @@ class WeightStore:
             cpath = weight_cache_path_for_store(self)
             if try_restore_weight_cache(self, cpath):
                 self._loaded_from_cache = True
+                self._weight_cache_path = cpath
                 nproj = NUM_LAYERS * 4
                 print(
                     f"  Restored {nproj} projection weights from cache "
@@ -2348,7 +2417,24 @@ class WeightStore:
         if self.bits == 16:
             return "chunked f16 matvec"
         if self._use_unified:
-            return "UnifiedEngine C++ forward (Q4_32 preq GEMV)"
+            preq2_on = os.environ.get("ASDSL_PREQ2", "0").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+            )
+            preq2_built = getattr(self, "_preq2_built", False)
+            gemv = "preq2+VNNI" if (preq2_on and preq2_built) else "Q4_32 preq"
+            if _env_flag("ASDSL_C01"):
+                gemv += "+C0.1-g128(gate_up/down)"
+            lm_gs = os.environ.get("ASDSL_LMHEAD_GS", str(self.group_size))
+            if lm_gs != str(self.group_size):
+                gemv += f", lm_head_gs={lm_gs}"
+            aff = os.environ.get("ASDSL_AFFINITY", "physical")
+            chunked = os.environ.get("ASDSL_CHUNKED_GEMV", "0")
+            return (
+                f"UnifiedEngine C++ forward ({gemv}, affinity={aff}, "
+                f"chunked={chunked})"
+            )
         if self._enable_dispatch and self._dispatch_policy is not None:
             return (
                 f"Phase 3 kernel dispatch (LUT/SPARSE/AVX2); "
@@ -2980,6 +3066,9 @@ class WeightStore:
                 self._build_norm_np_cache()
             if self.bits == 4 and self._use_unified:
                 self.build_preq_blocks()
+                self.build_preq2_blocks()
+                self.build_c01_gs128_blocks()
+                self._free_packed_after_unified_repack()
             print(f"  Inference: {self._inference_mode_message(has_gemv=has_gemv)}")
             self._build_rope_native_tables()
             return
@@ -2995,6 +3084,9 @@ class WeightStore:
                 self._build_norm_np_cache()
             if self.bits == 4 and self._use_unified:
                 self.build_preq_blocks()
+                self.build_preq2_blocks()
+                self.build_c01_gs128_blocks()
+                self._free_packed_after_unified_repack()
             print(f"  Inference: {self._inference_mode_message(has_gemv=has_gemv)}")
             if self._enable_qcsd and self.bits != 16:
                 d_bytes = sum(t.nbytes for t in self._draft_quant_u8.values())
@@ -3213,9 +3305,13 @@ class WeightStore:
                 self._build_norm_np_cache()
             if self.bits == 4 and self._use_unified:
                 self.build_preq_blocks()
+                self.build_preq2_blocks()
+                self.build_c01_gs128_blocks()
+                self._free_packed_after_unified_repack()
             print(f"  Inference: {self._inference_mode_message(has_gemv=has_gemv)}")
 
         self._build_rope_native_tables()
+        _maybe_calibrate_ahsd_skip_mask(self)
 
         # (Initialization moved up above the early return to fix benchmarking)
 
@@ -3278,7 +3374,6 @@ class WeightStore:
             if try_restore_preq_cache(self, ppath):
                 if self._use_unified:
                     self._build_norm_np_cache()
-                    self._free_packed_weights_if_unified()
                 return
         elif getattr(self, "_gguf_projections_loaded", False):
             print("  Preq: rebuilding from GGUF-packed weights (no HF preq cache) ...", flush=True)
@@ -3307,7 +3402,119 @@ class WeightStore:
 
         if self._use_unified:
             self._build_norm_np_cache()
-            self._free_packed_weights_if_unified()
+
+    def build_preq2_blocks(self) -> None:
+        """Repack preq Q4_32 blocks into preq2 meta+quant layout for VNNI kernel."""
+        if self.bits != 4 or self.group_size != 32:
+            return
+        if not self._preq_built:
+            self.build_preq_blocks()
+        use_preq2 = os.environ.get("ASDSL_PREQ2", "0").strip().lower() not in ("0", "false", "no")
+        if not use_preq2:
+            return
+        if getattr(self, "_preq2_built", False):
+            return
+
+        from asdsl.quantization.repack_preq2 import meta_to_flat, quant_to_flat, repack_preq_blocks_to_preq2
+
+        self._preq2_meta_np: dict[tuple, np.ndarray] = {}
+        self._preq2_quant_np: dict[tuple, np.ndarray] = {}
+        t0 = time.perf_counter()
+        for key, flat in self._preq_blocks_np.items():
+            rows, cols = self._quant_shapes[key]
+            meta, quant = repack_preq_blocks_to_preq2(flat, rows, cols, self.group_size)
+            self._preq2_meta_np[key] = meta_to_flat(meta)
+            self._preq2_quant_np[key] = quant_to_flat(quant)
+        self._preq2_built = True
+        dt = time.perf_counter() - t0
+        print(f"  preq2 repack: {len(self._preq2_meta_np)} tensors ({dt:.1f}s)", flush=True)
+
+    def _dequant_packed_projection(self, key: tuple) -> np.ndarray:
+        """Reconstruct float32 weights from packed Q4 arrays."""
+        w_np = self._quant_packed_np[key]
+        sc_np = self._quant_sc_np[key]
+        bi_np = self._quant_bi_np[key]
+        rows, cols = self._quant_shapes[key]
+        gs = self.group_size
+        n_groups = cols // gs
+        packed = w_np.reshape(rows, cols // 2)
+        lo = (packed & 0x0F).astype(np.float32)
+        hi = (packed >> 4).astype(np.float32)
+        w_q = np.empty((rows, cols), dtype=np.float32)
+        w_q[:, 0::2] = lo
+        w_q[:, 1::2] = hi
+        sc = np.repeat(sc_np.reshape(rows, n_groups), gs, axis=1)
+        bi = np.repeat(bi_np.reshape(rows, n_groups), gs, axis=1)
+        return w_q * sc + bi
+
+    def _dequant_from_preq_blocks(self, key: tuple) -> np.ndarray:
+        """Reconstruct float32 weights from preq Q4_32 blocks (asymmetric nibble layout)."""
+        rows, cols = self._quant_shapes[key]
+        flat = self._preq_blocks_np[key]
+        gs = self.group_size
+        n_groups = cols // gs
+        block_size = getattr(self, "_preq_block_size", 20)
+        blocks = flat.reshape(rows, n_groups, block_size)
+        scales = blocks[:, :, 0:2].view(np.float16).astype(np.float32).reshape(rows, n_groups, 1)
+        zeros = blocks[:, :, 2:4].view(np.float16).astype(np.float32).reshape(rows, n_groups, 1)
+        nibbles = blocks[:, :, 4:20].astype(np.uint8)
+        lows = (nibbles & 0x0F).astype(np.float32)
+        highs = (nibbles >> 4).astype(np.float32)
+        q = np.empty((rows, n_groups, gs), dtype=np.float32)
+        q[:, :, 0::2] = lows
+        q[:, :, 1::2] = highs
+        w = (q - zeros) * scales
+        return w.reshape(rows, cols)
+
+    def _dequant_c01_source_f32(self, key: tuple) -> np.ndarray:
+        """Best float32 source for C0.1 g128 requant (packed preferred, else preq blocks)."""
+        w_packed = self._quant_packed_np.get(key)
+        if w_packed is not None:
+            return self._dequant_packed_projection(key)
+        if key in self._preq_blocks_np:
+            return self._dequant_from_preq_blocks(key)
+        raise KeyError(f"missing projection weights for {key}")
+
+    def _free_packed_after_unified_repack(self) -> None:
+        """Drop packed Q4 arrays once preq / preq2 / C0.1 layouts are ready."""
+        self._free_packed_weights_if_unified()
+
+    def build_c01_gs128_blocks(self) -> None:
+        """C0.1: requant gate_up/down at g128; C0.3 adds qkv/o when ASDSL_C03=1."""
+        if not _env_flag("ASDSL_C01") and not _env_flag("ASDSL_C03"):
+            return
+        if self.bits != 4 or self.group_size != 32:
+            return
+        if getattr(self, "_c01_gs128_built", False):
+            return
+        if not self._preq_built:
+            self.build_preq_blocks()
+
+        from asdsl.quantization.repack_q4_128 import blocks_to_flat, repack_fp32_to_q4_128_blocks
+
+        gs128 = int(os.environ.get("ASDSL_GATEUP_GS", "128"))
+        if gs128 != 128:
+            return
+
+        self._preq_gs128_np: dict[tuple, np.ndarray] = {}
+        proj_names = ("gate_up_proj", "down_proj")
+        if _env_flag("ASDSL_C03"):
+            proj_names = ("gate_up_proj", "down_proj", "qkv_proj", "o_proj")
+        targets = [(i, name) for i in range(NUM_LAYERS) for name in proj_names]
+        t0 = time.perf_counter()
+        for key in targets:
+            if key not in self._quant_shapes:
+                continue
+            try:
+                w_f32 = self._dequant_c01_source_f32(key)
+            except KeyError:
+                continue
+            rows, cols = self._quant_shapes[key]
+            blocks = repack_fp32_to_q4_128_blocks(w_f32, rows, cols, gs128)
+            self._preq_gs128_np[key] = blocks_to_flat(blocks)
+        self._c01_gs128_built = True
+        dt = time.perf_counter() - t0
+        print(f"  C0.1 g128 repack: {len(self._preq_gs128_np)} tensors ({dt:.1f}s)", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4008,6 +4215,182 @@ def _test_sparse_kernel_on_layer0(
 # Generation
 # ---------------------------------------------------------------------------
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
+
+
+def _ahsd_draft_k() -> int:
+    return int(os.environ.get("ASDSL_AHSD_DRAFT_K", "1"))
+
+
+def _use_ahsd_path() -> bool:
+    return _env_flag("ASDSL_USE_AHSD") or _env_flag("ASDSL_USE_SDQS")
+
+
+def _use_pld_path() -> bool:
+    return _env_flag("ASDSL_USE_PLD")
+
+
+def _maybe_calibrate_ahsd_skip_mask(store: WeightStore) -> None:
+    """Phase D: adaptive skip mask calibration after warm_cache."""
+    if not _env_flag("ASDSL_AHSD_CALIBRATE", "0"):
+        return
+    if not getattr(store, "_use_unified", False) or store.bits != 4:
+        return
+    if getattr(store, "_ahsd_skip_mask", None) is not None:
+        return
+    try:
+        from asdsl.speculative.ahsd import calibrate_and_store_skip_mask
+
+        calibrate_and_store_skip_mask(store)
+    except Exception as exc:
+        print(f"  AHSD calibration skipped: {exc}", flush=True)
+
+
+def generate_stream_ahsd(
+    prompt: str,
+    store: WeightStore,
+    tokenizer,
+    max_new_tokens: int = 50,
+    system_prompt: str = "You are a helpful AI assistant.",
+    bench_metrics_out: list | None = None,
+) -> str:
+    """AHSD/SDQS generation via UnifiedEngine (yields StreamToken)."""
+    from asdsl.inference.unified_bridge import ahsd_generate
+
+    print("\n" + "=" * 66)
+    mode = "SDQS" if _env_flag("ASDSL_USE_SDQS") else "AHSD"
+    print(f"ASDSL x Phi-4 - {mode} Speculative Decoding (UnifiedEngine)")
+    print("=" * 66)
+    print(f"Prompt : {prompt!r}")
+    print(f"Draft K: {_ahsd_draft_k()}")
+    print("-" * 66)
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+    input_ids = _normalize_input_ids(input_ids)
+
+    _maybe_calibrate_ahsd_skip_mask(store)
+
+    os.environ.setdefault("ASDSL_SPECULATIVE_PROFILE", "1")
+    result = ahsd_generate(
+        store,
+        input_ids,
+        max_new_tokens=max_new_tokens,
+        draft_k=_ahsd_draft_k(),
+        skip_mask=getattr(store, "_ahsd_skip_mask", None),
+        use_sdqs=_env_flag("ASDSL_USE_SDQS"),
+    )
+
+    gen_ids = result.token_ids[len(input_ids) :]
+    for step, tid in enumerate(gen_ids):
+        tok_text = tokenizer.convert_tokens_to_string(
+            tokenizer.convert_ids_to_tokens([int(tid)])
+        )
+        yield StreamToken(
+            text=tok_text,
+            token_id=int(tid),
+            step=step,
+            is_eos=False,
+            elapsed_s=result.decode_s,
+            tokens_per_second=result.tokens_per_second,
+            step_elapsed_s=result.decode_s / max(len(gen_ids), 1),
+        )
+
+    print(
+        f"\n\nGenerated : {result.decode_tokens} tokens  |  "
+        f"{result.tokens_per_second:.2f} tok/s  |  decode {result.decode_s:.1f}s"
+    )
+    print(
+        f"acceptance_rate={result.acceptance_rate:.4f} "
+        f"draft_tokens={result.draft_tokens} "
+        f"verify_ms={result.verify_ms:.2f} "
+        f"draft_ms={result.draft_ms:.2f} "
+        f"speculative_cycles={result.speculative_cycles}",
+        flush=True,
+    )
+    print("=" * 66)
+
+    if bench_metrics_out is not None:
+        bench_metrics_out.append(
+            {
+                "decode_tokens": result.decode_tokens,
+                "decode_s": result.decode_s,
+                "tokens_per_second": result.tokens_per_second,
+                "acceptance_rate": result.acceptance_rate,
+                "draft_tokens": result.draft_tokens,
+                "verify_ms": result.verify_ms,
+                "draft_ms": result.draft_ms,
+                "speculative_cycles": result.speculative_cycles,
+            }
+        )
+
+
+def generate_stream_pld(
+    prompt: str,
+    store: WeightStore,
+    tokenizer,
+    max_new_tokens: int = 50,
+    system_prompt: str = "You are a helpful AI assistant.",
+    bench_metrics_out: list | None = None,
+) -> str:
+    """Prompt Lookup Decoding via UnifiedEngine (lossless greedy verify)."""
+    from asdsl.inference.unified_bridge import pld_generate
+
+    print("\n" + "=" * 66)
+    print("ASDSL x Phi-4 - Prompt Lookup Decoding (UnifiedEngine)")
+    print("=" * 66)
+    print(f"Prompt : {prompt!r}")
+    print("-" * 66)
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+    input_ids = _normalize_input_ids(input_ids)
+
+    t0 = time.perf_counter()
+    out_ids = pld_generate(store, input_ids, max_new_tokens=max_new_tokens)
+    decode_s = time.perf_counter() - t0
+    gen_ids = out_ids[len(input_ids) :]
+    decode_tokens = len(gen_ids)
+    tps = decode_tokens / decode_s if decode_s > 0 else 0.0
+
+    for step, tid in enumerate(gen_ids):
+        tok_text = tokenizer.convert_tokens_to_string(
+            tokenizer.convert_ids_to_tokens([int(tid)])
+        )
+        yield StreamToken(
+            text=tok_text,
+            token_id=int(tid),
+            step=step,
+            is_eos=int(tid) in EOS_TOKEN_IDS,
+            elapsed_s=decode_s,
+            tokens_per_second=tps,
+            step_elapsed_s=decode_s / max(decode_tokens, 1),
+        )
+
+    print(f"\n\nGenerated : {decode_tokens} tokens  |  {tps:.2f} tok/s  |  decode {decode_s:.1f}s")
+    print("=" * 66)
+
+    if bench_metrics_out is not None:
+        bench_metrics_out.append(
+            {
+                "decode_tokens": decode_tokens,
+                "decode_s": decode_s,
+                "tokens_per_second": tps,
+            }
+        )
+
+
 def generate_stream(
     prompt: str,
     store: WeightStore,
@@ -4017,6 +4400,71 @@ def generate_stream(
     bench_metrics_out: list | None = None,
     logits_hook: Optional[Callable[[np.ndarray], None]] = None,
 ) -> str:
+    if _use_pld_path() and getattr(store, "_use_unified", False) and store.bits == 4:
+        yield from generate_stream_pld(
+            prompt=prompt,
+            store=store,
+            tokenizer=tokenizer,
+            max_new_tokens=max_new_tokens,
+            system_prompt=system_prompt,
+            bench_metrics_out=bench_metrics_out,
+        )
+        return
+    if _use_ahsd_path() and getattr(store, "_use_unified", False) and store.bits == 4:
+        yield from generate_stream_ahsd(
+            prompt=prompt,
+            store=store,
+            tokenizer=tokenizer,
+            max_new_tokens=max_new_tokens,
+            system_prompt=system_prompt,
+            bench_metrics_out=bench_metrics_out,
+        )
+        return
+
+    # C++ decode loop (ASDSL_CPP_GENERATE=1): single GIL-free generate() call.
+    if os.environ.get("ASDSL_CPP_GENERATE", "").strip() == "1":
+        if getattr(store, "_use_unified", False) and store.bits == 4:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            input_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True
+            )
+            input_ids = _normalize_input_ids(input_ids)
+            from asdsl.inference.unified_bridge import cpp_generate, reset_unified_session
+
+            reset_unified_session(store)
+            t_decode_start = time.perf_counter()
+            new_tokens = cpp_generate(store, input_ids, max_new_tokens)
+            decode_s = time.perf_counter() - t_decode_start
+            n_new = len(new_tokens)
+            avg_step = decode_s / max(n_new, 1)
+            for step, tid in enumerate(new_tokens):
+                tok_text = tokenizer.convert_tokens_to_string(
+                    tokenizer.convert_ids_to_tokens([tid])
+                )
+                elapsed = t_decode_start + (step + 1) * avg_step
+                tps = (step + 1) / elapsed if elapsed > t_decode_start else 0.0
+                ignore_eos = os.environ.get("ASDSL_IGNORE_EOS", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                is_eos = (not ignore_eos) and tid in EOS_TOKEN_IDS
+                yield StreamToken(
+                    text=tok_text,
+                    token_id=tid,
+                    step=step,
+                    is_eos=is_eos,
+                    elapsed_s=elapsed - t_decode_start,
+                    tokens_per_second=tps,
+                    step_elapsed_s=avg_step,
+                )
+                if is_eos:
+                    return
+            return
+
     print("\n" + "=" * 66)
     print("ASDSL x Phi-4 - CPU Inference")
     print("=" * 66)
@@ -4087,9 +4535,9 @@ def generate_stream(
         if getattr(store, "_use_unified", False) and store.bits == 4:
             from asdsl.inference.unified_bridge import unified_forward_token
 
-            if not need_logits:
+            logits_np = unified_forward_token(store, tid, pos, need_logits=need_logits)
+            if logits_np is None:
                 return None
-            logits_np = unified_forward_token(store, tid, pos)
             return torch.from_numpy(logits_np)
 
         use_np_stack = (
@@ -4315,6 +4763,7 @@ def generate_qcsd(
     system_prompt: str = "You are a helpful AI assistant.",
     draft_k: int = 7,
     bench_metrics_out: list | None = None,
+    generated_ids_out: list | None = None,
 ) -> str:
     """Generate tokens using Quantization Cascade Speculative Decoding.
 
@@ -4378,6 +4827,8 @@ def generate_qcsd(
     generated: list[int] = []
     total_draft = 0
     total_accepted = 0
+    total_draft_ms = 0.0
+    total_verify_ms = 0.0
     t_decode_start = time.perf_counter()
     # Target verify: one batched stack (all draft positions at once) should give
     # _verify_calls == speculative_cycles. If _verify_calls ~= draft_k * cycles, a
@@ -4406,6 +4857,7 @@ def generate_qcsd(
                 draft_start_pos = pos
                 draft_tokens: list[int] = []
                 draft_tok = current_token
+                t_draft0 = time.perf_counter()
 
                 for k_step in range(draft_k):
                     draft_logits = run_forward(
@@ -4420,8 +4872,10 @@ def generate_qcsd(
 
                 total_draft += len(draft_tokens)
                 kv_hist.restore_len(draft_start_pos)
+                total_draft_ms += (time.perf_counter() - t_draft0) * 1000.0
 
                 # ── VERIFY PHASE (BATCHED TARGET) ──────────────────
+                t_verify0 = time.perf_counter()
                 L = len(draft_tokens)
                 if L == 0:
                     verify_tokens = [current_token]
@@ -4452,6 +4906,7 @@ def generate_qcsd(
                         k_new_list.append(kv_hist.k_buf[layer][cache_idx].numpy())
                         v_new_list.append(kv_hist.v_buf[layer][cache_idx].numpy())
                     asdsl_tracker.record_token(k_new_list, v_new_list)
+                total_verify_ms += (time.perf_counter() - t_verify0) * 1000.0
 
                 # Emit greedy next token (matches standard AR).
                 generated.append(current_token)
@@ -4546,6 +5001,12 @@ def generate_qcsd(
     print(f"\n\nGenerated : {n_tokens} tokens  |  {tps:.2f} tok/s  |  decode {t_decode:.1f}s")
     print(f"QCSD      : acceptance rate {accept_rate:.1%}  |  "
           f"drafted {total_draft} / accepted {total_accepted}")
+    print(
+        f"acceptance_rate={accept_rate:.4f} draft_tokens={total_draft} "
+        f"verify_ms={total_verify_ms:.2f} draft_ms={total_draft_ms:.2f} "
+        f"speculative_cycles={speculative_cycles}",
+        flush=True,
+    )
     _avg_v = _verify_calls / max(speculative_cycles, 1)
     print(
         f"QCSD verify telemetry: _verify_calls (batched target stacks)={_verify_calls} "
@@ -4564,12 +5025,20 @@ def generate_qcsd(
                 "decode_s": t_decode,
                 "tokens_per_second": tps,
                 "acceptance_rate": accept_rate,
+                "draft_tokens": total_draft,
+                "verify_ms": total_verify_ms,
+                "draft_ms": total_draft_ms,
+                "speculative_cycles": speculative_cycles,
                 "_verify_calls": _verify_calls,
                 "qcsd_verify_batched_passes": _verify_calls,
                 "qcsd_speculative_cycles": speculative_cycles,
                 "qcsd_verify_extra_run_forward": _verify_extra_run_forward,
             }
         )
+
+    if generated_ids_out is not None:
+        generated_ids_out.clear()
+        generated_ids_out.extend(generated)
 
     return response_text
 
@@ -5504,6 +5973,10 @@ def main() -> None:
         print(f"  ASDSL_GROUP_SIZE={args.group_size}", flush=True)
     os.environ.setdefault("ASDSL_FUSED_GEMV", "1")
     os.environ.setdefault("ASDSL_PREQ_G4FUSED", "0")
+    os.environ.setdefault("ASDSL_PREQ_PREFETCH_GROUPS", "0")
+    os.environ.setdefault("ASDSL_GEMV_UNROLL", "4")
+    os.environ.setdefault("ASDSL_CHUNKED_GEMV", "1")
+    os.environ.setdefault("ASDSL_PREQ2", "1")
     if args.no_weight_cache:
         os.environ["PHI4_NO_WEIGHT_CACHE"] = "1"
     if args.no_preq_cache:
@@ -5845,6 +6318,7 @@ def main() -> None:
             store=store,
             tokenizer=tokenizer,
             max_new_tokens=args.max_new_tokens,
+            system_prompt=args.system_prompt,
         ):
             print(tok.text, end="", flush=True)
         print(f"\n  [{tok.step + 1} tokens | {tok.tokens_per_second:.2f} tok/s]")

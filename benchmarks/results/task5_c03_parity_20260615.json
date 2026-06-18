@@ -1,0 +1,8 @@
+{
+  "date": "2026-06-15",
+  "runs": [14.64, 17.07, 14.91, 16.25, 17.49],
+  "mean_tok_s": 16.072,
+  "std": 1.135,
+  "pass_criterion_vs_config_D_8pct": true,
+  "note": "3-run mean was 15.33; 5-run official exceeds 13.9 victory bar on exploratory C0.3 stack"
+}

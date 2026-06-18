@@ -1,0 +1,126 @@
+{
+  "timestamp_utc": "2026-06-05T22:45:00+00:00",
+  "hardware": "Intel Core i7-1360P, 12 threads, Windows",
+  "model": "Phi-4-multimodal-instruct Q4_32 preq UnifiedEngine",
+  "prompt": "The",
+  "system_prompt": "",
+  "decode_tokens_target": 128,
+
+  "layer_similarity": {
+    "source": "benchmarks/profile_layer_similarity.py",
+    "metric": "logit_cosine_full_vs_single_layer_skip",
+    "prefix_len": 30,
+    "threshold": 0.97,
+    "layers_above_threshold": 29,
+    "middle_band_skip_candidates": 16,
+    "low_sim_layers": [0, 30, 31],
+    "static_mask_combined_probe": {
+      "layers_skipped": "10-21 inclusive (12 layers)",
+      "logit_cosine": 0.971,
+      "full_argmax_token": 200020,
+      "draft_argmax_token": 382,
+      "greedy_match": false
+    },
+    "summary_table": [
+      {"layer": 8, "cosine_sim": 0.9999, "skip_candidate": true},
+      {"layer": 10, "cosine_sim": 0.9993, "skip_candidate": true},
+      {"layer": 17, "cosine_sim": 0.9968, "skip_candidate": true},
+      {"layer": 20, "cosine_sim": 0.9867, "skip_candidate": true},
+      {"layer": 21, "cosine_sim": 0.9943, "skip_candidate": true},
+      {"layer": 30, "cosine_sim": 0.4872, "skip_candidate": false},
+      {"layer": 31, "cosine_sim": 0.6190, "skip_candidate": false}
+    ],
+    "full_profile_path": "benchmarks/results/layer_similarity_profile.json"
+  },
+
+  "ahsd_benchmark": {
+    "env": {
+      "ASDSL_USE_UNIFIED": "1",
+      "ASDSL_FUSED_GEMV": "1",
+      "ASDSL_AFFINITY": "legacy",
+      "ASDSL_PREQ_PREFETCH_GROUPS": "0",
+      "OMP_NUM_THREADS": "12",
+      "ASDSL_USE_AHSD": "1",
+      "ASDSL_AHSD_DRAFT_K": "1",
+      "ASDSL_AHSD_CALIBRATE": "0",
+      "ASDSL_SPECULATIVE_PROFILE": "1",
+      "ASDSL_IGNORE_EOS": "1"
+    },
+    "acceptance_rate": 0.1538,
+    "draft_tokens": 13,
+    "verify_ms_total": 1435.39,
+    "draft_ms_total": 1018.59,
+    "speculative_cycles": 13,
+    "draft_ms_per_cycle": 78.35,
+    "verify_ms_per_cycle": 110.41,
+    "decode_tokens": 26,
+    "decode_tok_s": 6.03,
+    "output_snippet": "It looks like your input got cut off. Could you please provide more information or clarify your request so I can better assist you?",
+    "note": "Run stopped at EOS after 26 tokens despite IGNORE_EOS=1 (AHSD native loop still breaks on Phi EOS ids)."
+  },
+
+  "c0_baseline": {
+    "decode_tokens": 128,
+    "decode_tok_s": 8.41,
+    "median_ms_per_token": 113.2,
+    "first_ms_per_token": 111.3
+  },
+
+  "skip_mask_verification": {
+    "draft_ms_per_cycle_observed": 78.35,
+    "verify_ms_per_cycle_observed": 110.41,
+    "microbench_full_forward_ms": 160.28,
+    "microbench_draft_skip_10_21_ms": 88.78,
+    "draft_to_full_ratio": 0.554,
+    "skip_mask_honored": true,
+    "rationale": "Draft path is ~55% of full forward latency (12/32 layers skipped). Per-cycle draft ~78ms vs verify ~110ms matches expected geometry; total draft_ms>1000ms is cumulative over 13 cycles, not per-step regression."
+  },
+
+  "break_even": {
+    "k": 1,
+    "alpha_required": 0.62,
+    "alpha_observed": 0.1538,
+    "draft_ms_assumption_ms": 69,
+    "verify_ms_assumption_ms": 111,
+    "c0_tok_s_target": 9.0,
+    "formula": "alpha > draft_ms / (verify_ms - draft_ms) => alpha > 69/111 ≈ 0.62 for K=1",
+    "ahsd_beats_c0": false
+  },
+
+  "decision_tree": {
+    "case": 2,
+    "label": "High per-layer similarity, low combined acceptance",
+    "criteria": {
+      "case_1_viable": "alpha >= 0.62 AND decode_tok_s > c0_tok_s",
+      "case_2_wrong_geometry": "layers_above_threshold >= 6 AND combined_mask_greedy_mismatch AND alpha < 0.62",
+      "case_3_pivot_phase_g": "draft_ms_per_cycle >= verify_ms_per_cycle OR layers_above_threshold < 6"
+    },
+    "matched": "case_2",
+    "evidence": [
+      "29/32 layers exceed 0.97 cosine on single-layer skip probes",
+      "Static mask 10-21 combined cosine 0.971 with greedy argmax mismatch (200020 vs 382)",
+      "Acceptance 15.4% << 62% break-even",
+      "AHSD 6.03 tok/s < C0 8.41 tok/s"
+    ]
+  },
+
+  "recommendation": {
+    "ahsd_viable": false,
+    "primary_action": "pivot_to_phase_g_c0_ipc",
+    "secondary_experiments": [
+      "Run ASDSL_AHSD_CALIBRATE=1 with logits .copy() fix to pick sparse non-contiguous skip set (avoid stacking 12 correlated skips)",
+      "Probe smaller skip bundles (e.g. layers 12-15 only) and re-measure combined logit cosine + acceptance",
+      "Exclude layers 20-21 from static mask (combined cosine borderline at 0.97)"
+    ],
+    "phase_g_notes": {
+      "goal": "Raise C0 autoregressive IPC without speculative acceptance risk",
+      "verify_bottleneck": "forward_verify_serial runs K serial full forward_token calls; batched forward_batch exists but is not used in AHSD verify path",
+      "gemm_batch_cpp": "Phase G batched preq GEMM (gemm_batch.cpp) already supports batch_size>1 for gate_up/qkv; wire forward_batch all_logits into generate_ahsd verify to amortize projection GEMMs across K+1 positions",
+      "expected_win": "If verify_ms drops from ~110ms to ~80ms at K=1, C0-style path gains ~25-30% before any speculative draft work"
+    }
+  },
+
+  "bugs_fixed_during_diagnostic": [
+    "ahsd.py and profile_layer_similarity.py now .copy() UnifiedEngine logits buffer before cosine compare (shared logits_out_ buffer caused false 1.0 similarity)"
+  ]
+}

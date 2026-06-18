@@ -1,5 +1,7 @@
 #include "unified_engine.h"
+#include "gemv_q2_kernels.h"
 #include "gemv_q4_kernel.h"
+#include "large_pages.hpp"
 #include <immintrin.h>
 #include <cmath>
 #include <cstring>
@@ -8,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -106,6 +109,39 @@ inline bool use_q4_32_preq_fused(const EngineConfig& cfg) {
     return fused_gemv_enabled() && cfg.weight_format == 0 && cfg.group_size == 32;
 }
 
+static bool preq2_gemv_enabled() {
+    const char* v = std::getenv("ASDSL_PREQ2");
+    if (!v || v[0] == '\0') {
+        return true;  // match phi4_cpu_run / parity_manifest default
+    }
+    return v[0] != '0';
+}
+
+static bool c01_gemv_enabled() {
+    const char* v = std::getenv("ASDSL_C01");
+    return v && v[0] != '0';
+}
+
+static int lm_head_group_size(const EngineConfig& cfg) {
+    return cfg.lm_head_group_size > 0 ? cfg.lm_head_group_size : cfg.group_size;
+}
+
+static void fused_preq_gemv(
+    const asdsl::Preq2Weights& p2,
+    const uint8_t* preq_blocks,
+    const float* x,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size) {
+    const bool use_p2 = preq2_gemv_enabled() && p2.meta && p2.quant;
+    if (use_p2) {
+        gemv_preq2_fused_avx2(p2.meta, p2.quant, x, y, out_features, in_features, group_size);
+    } else {
+        gemv_q4_32_preq_fused_avx2(preq_blocks, x, y, out_features, in_features, group_size);
+    }
+}
+
 // Returns the active pool for the current call stack.
 // Inside UnifiedEngine methods, tl_active_pool is always set to pool_
 // by the ScopedActivePool guard placed at each public entry point.
@@ -138,6 +174,36 @@ static inline float hmax256_ps(__m256 v) {
 // Forward declaration (defined below in swiglu_inplace area)
 inline __m256 fast_exp_avx2(__m256 x);
 
+static inline float cvtsh_ss(uint16_t h) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h))));
+}
+
+static void load_embed_row_f32(const asdsl::EngineWeights& weights, int token_id, int hidden_size, float* dst) {
+    if (weights.embed_fp16 && weights.token_embd_f16) {
+        const uint16_t* row = weights.token_embd_f16 + static_cast<size_t>(token_id) * hidden_size;
+        int j = 0;
+        for (; j + 8 <= hidden_size; j += 8) {
+            const __m128i h8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + j));
+            const __m256 f8 = _mm256_cvtph_ps(h8);
+            _mm256_storeu_ps(dst + j, f8);
+        }
+        for (; j < hidden_size; ++j) {
+            dst[j] = cvtsh_ss(row[j]);
+        }
+        return;
+    }
+    const float* row = weights.token_embd + static_cast<size_t>(token_id) * hidden_size;
+    std::memcpy(dst, row, static_cast<size_t>(hidden_size) * sizeof(float));
+}
+
+static inline float output_proj_elem_f32(const asdsl::EngineWeights& weights, int row, int col, int cols) {
+    const size_t idx = static_cast<size_t>(row) * cols + col;
+    if (weights.output_proj_fp16 && weights.output_proj_f16) {
+        return cvtsh_ss(weights.output_proj_f16[idx]);
+    }
+    return weights.output_proj[idx];
+}
+
 static int argmax_f32_avx2(const float* logits, int n) {
     if (n <= 0) return 0;
     int best_i = 0;
@@ -165,6 +231,7 @@ static int argmax_f32_avx2(const float* logits, int n) {
     }
     return best_i;
 }
+
 
 UnifiedEngine::UnifiedEngine(const EngineConfig& config, const EngineWeights& weights)
     : config_(config), weights_(weights) {
@@ -216,11 +283,43 @@ UnifiedEngine::UnifiedEngine(const EngineConfig& config, const EngineWeights& we
 
     hidden_q8_.resize(config_.hidden_size, 0);
     hidden_scales_.resize(config_.hidden_size / config_.group_size, 0.0f);
+    hidden_q8_g128_.resize(config_.hidden_size, 0);
+    hidden_scales_g128_.resize(config_.hidden_size / 128, 0.0f);
     gate_q8_.resize(config_.intermediate_size, 0);
     gate_scales_.resize(config_.intermediate_size / config_.group_size, 0.0f);
+    gate_q8_g128_.resize(config_.intermediate_size, 0);
+    gate_scales_g128_.resize(config_.intermediate_size / 128, 0.0f);
+
+    const int lm_gs = config_.lm_head_group_size > 0 ? config_.lm_head_group_size : config_.group_size;
+
+    // ── lm_head preq2 from disk cache (skip fp16 quantize) ─────────────────────
+    if (weights_.lm_head_preq2_meta_in && weights_.lm_head_preq2_quant_in
+        && weights_.lm_head_preq2_meta_size > 0 && weights_.lm_head_preq2_quant_size > 0
+        && lm_gs == 32 && preq2_gemv_enabled()) {
+        const int cols = config_.hidden_size;
+        const int rows = config_.vocab_size;
+        const int n_groups = cols / 32;
+        constexpr int meta_b = 4;
+        constexpr int quant_group = 64;
+        constexpr int row_band = 4;
+        const size_t expect_meta = static_cast<size_t>(rows) * n_groups * meta_b;
+        const int n_bands = (rows + row_band - 1) / row_band;
+        const size_t expect_quant = static_cast<size_t>(n_bands) * n_groups * quant_group;
+        if (weights_.lm_head_preq2_meta_size == expect_meta
+            && weights_.lm_head_preq2_quant_size == expect_quant) {
+            lm_head_preq2_meta_.assign(
+                weights_.lm_head_preq2_meta_in,
+                weights_.lm_head_preq2_meta_in + weights_.lm_head_preq2_meta_size);
+            lm_head_preq2_quant_.assign(
+                weights_.lm_head_preq2_quant_in,
+                weights_.lm_head_preq2_quant_in + weights_.lm_head_preq2_quant_size);
+            lm_head_preq2_ready_ = true;
+        }
+    }
 
     // ── lm_head Q4_32 quantization (group_size=32) ──────────────────────────────
-    if (weights_.output_proj && config_.group_size == 32) {
+    if (!lm_head_preq2_ready_
+        && (weights_.output_proj || weights_.output_proj_f16) && lm_gs == 32) {
         const int cols       = config_.hidden_size;
         const int rows       = config_.vocab_size;
         const int group_size = 32;
@@ -231,7 +330,17 @@ UnifiedEngine::UnifiedEngine(const EngineConfig& config, const EngineWeights& we
         lm_head_q4_blocks_.resize(total_bytes);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            const float* src_row = weights_.output_proj + static_cast<size_t>(r) * cols;
+            std::vector<float> row_fp32;
+            const float* src_row;
+            if (weights_.output_proj_fp16) {
+                row_fp32.resize(static_cast<size_t>(cols));
+                for (int c = 0; c < cols; ++c) {
+                    row_fp32[static_cast<size_t>(c)] = output_proj_elem_f32(weights_, r, c, cols);
+                }
+                src_row = row_fp32.data();
+            } else {
+                src_row = weights_.output_proj + static_cast<size_t>(r) * cols;
+            }
             uint8_t*     dst_row = lm_head_q4_blocks_.data() + static_cast<size_t>(r) * row_bytes;
             for (int g = 0; g < n_groups; ++g) {
                 const float* xg  = src_row + g * group_size;
@@ -262,11 +371,46 @@ UnifiedEngine::UnifiedEngine(const EngineConfig& config, const EngineWeights& we
             }
         }
         lm_head_q4_quantized_ = true;
+
+        if (preq2_gemv_enabled()) {
+            constexpr int meta_b = 4;
+            constexpr int quant_group = 64;
+            constexpr int row_band = 4;
+            const size_t meta_bytes = static_cast<size_t>(rows) * n_groups * meta_b;
+            const int n_bands = (rows + row_band - 1) / row_band;
+            const size_t quant_bytes = static_cast<size_t>(n_bands) * n_groups * quant_group;
+            lm_head_preq2_meta_.resize(meta_bytes);
+            lm_head_preq2_quant_.resize(quant_bytes);
+            #pragma omp parallel for schedule(static)
+            for (int r = 0; r < rows; ++r) {
+                const uint8_t* src_row = lm_head_q4_blocks_.data() + static_cast<size_t>(r) * row_bytes;
+                uint8_t* meta_row = lm_head_preq2_meta_.data() + static_cast<size_t>(r) * n_groups * meta_b;
+                for (int g = 0; g < n_groups; ++g) {
+                    const uint8_t* blk = src_row + g * block_size;
+                    std::memcpy(meta_row + g * meta_b, blk, meta_b);
+                    const int band = r / row_band;
+                    const int slot = r % row_band;
+                    uint8_t* qdst = lm_head_preq2_quant_.data()
+                        + (static_cast<size_t>(band) * n_groups + g) * quant_group + slot * 16;
+                    std::memcpy(qdst, blk + 4, 16);
+                }
+            }
+            lm_head_preq2_ready_ = true;
+        }
+    }
+
+    if (lm_head_preq2_ready_) {
+        lm_head_q4_blocks_.clear();
+        lm_head_q4_blocks_.shrink_to_fit();
+        lm_head_q4_quantized_ = false;
+        weights_.output_proj = nullptr;
+        weights_.output_proj_f16 = nullptr;
+        weights_.output_proj_fp16 = false;
     }
 
     // ── lm_head Q4_128 quantization (group_size=128) ──────────────────────────
     // This cuts lm_head bandwidth from 2.06 GB/token (FP32) to 0.265 GB/token.
-    if (weights_.output_proj && config_.group_size == 128) {
+    if ((weights_.output_proj || weights_.output_proj_f16) && lm_gs == 128) {
         const int cols       = config_.hidden_size;   // 5120
         const int rows       = config_.vocab_size;    // 100352
         const int gs         = 128;
@@ -277,7 +421,17 @@ UnifiedEngine::UnifiedEngine(const EngineConfig& config, const EngineWeights& we
         lm_head_q4_blocks_.resize(total_bytes);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            const float* src_row = weights_.output_proj + static_cast<size_t>(r) * cols;
+            std::vector<float> row_fp32;
+            const float* src_row;
+            if (weights_.output_proj_fp16) {
+                row_fp32.resize(static_cast<size_t>(cols));
+                for (int c = 0; c < cols; ++c) {
+                    row_fp32[static_cast<size_t>(c)] = output_proj_elem_f32(weights_, r, c, cols);
+                }
+                src_row = row_fp32.data();
+            } else {
+                src_row = weights_.output_proj + static_cast<size_t>(r) * cols;
+            }
             uint8_t*     dst_row = lm_head_q4_blocks_.data() + static_cast<size_t>(r) * row_bytes;
             for (int g = 0; g < n_groups; ++g) {
                 const float* xg  = src_row + g * gs;
@@ -770,8 +924,7 @@ void UnifiedEngine::compute_attention_flash_q8(float* out, const float* q, int l
     const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
     const int BLOCK_K = 64;
 
-    #pragma omp parallel for schedule(static)
-    for (int h = 0; h < config_.num_heads; ++h) {
+    auto run_head = [&](int h) {
         const int kv_h = h / groups;
         const float* qh = q + h * config_.head_dim;
         float* num = num_buf_.data() + h * config_.head_dim;
@@ -859,6 +1012,17 @@ void UnifiedEngine::compute_attention_flash_q8(float* out, const float* q, int l
         for (int i = 0; i < config_.head_dim; ++i) {
             out_h[i] = num[i] * inv_l;
         }
+    };
+
+    if (persistent_pool_enabled() && tl_active_pool != nullptr) {
+        pool_.parallel_for(0, config_.num_heads, 1, [&](int h) {
+            run_head(h);
+        });
+    } else {
+        #pragma omp parallel for schedule(static)
+        for (int h = 0; h < config_.num_heads; ++h) {
+            run_head(h);
+        }
     }
 }
 
@@ -906,26 +1070,22 @@ static void gemv_q8_q8_omp(const int8_t* W_q8, const float* W_scales, const int8
 }
 
 static void gemv_f32_f32_omp(const float* W, const float* x, float* y, int rows, int cols) {
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < rows; ++i) {
+    auto process_row = [&](int i) {
         const float* w_row = W + (size_t)i * cols;
         __m256 acc0 = _mm256_setzero_ps();
         __m256 acc1 = _mm256_setzero_ps();
         __m256 acc2 = _mm256_setzero_ps();
         __m256 acc3 = _mm256_setzero_ps();
         int j = 0;
-        // Unrolled 4× AVX2 FMA: 32 floats per iteration
         for (; j + 32 <= cols; j += 32) {
             acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j),      _mm256_loadu_ps(x + j),      acc0);
             acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j + 8),  _mm256_loadu_ps(x + j + 8),  acc1);
             acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j + 16), _mm256_loadu_ps(x + j + 16), acc2);
             acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j + 24), _mm256_loadu_ps(x + j + 24), acc3);
         }
-        // Tail: remaining 8-float chunks
         for (; j + 8 <= cols; j += 8) {
             acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + j), _mm256_loadu_ps(x + j), acc0);
         }
-        // Horizontal sum of all accumulators
         acc0 = _mm256_add_ps(acc0, acc1);
         acc2 = _mm256_add_ps(acc2, acc3);
         acc0 = _mm256_add_ps(acc0, acc2);
@@ -935,9 +1095,20 @@ static void gemv_f32_f32_omp(const float* W, const float* x, float* y, int rows,
         lo = _mm_hadd_ps(lo, lo);
         lo = _mm_hadd_ps(lo, lo);
         float sum = _mm_cvtss_f32(lo);
-        // Scalar tail
         for (; j < cols; ++j) sum += w_row[j] * x[j];
         y[i] = sum;
+    };
+
+    if (persistent_pool_enabled() && tl_active_pool != nullptr) {
+        asdsl::ThreadPool& pool = asdsl::ThreadPool::get_instance();
+        const int n_threads = std::max(1, pool.thread_count() + 1);
+        const int grain = std::max(1, (rows + n_threads - 1) / n_threads);
+        pool.parallel_for(0, rows, grain, [&](int i) { process_row(i); });
+    } else {
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < rows; ++i) {
+            process_row(i);
+        }
     }
 }
 
@@ -961,11 +1132,15 @@ void UnifiedEngine::forward_batch(const int32_t* tokens, int num_tokens, int sta
 
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < num_tokens; ++i) {
-        const float* emb_row = weights_.token_embd + tokens[i] * config_.hidden_size;
-        std::memcpy(b_hidden + static_cast<size_t>(i) * config_.hidden_size, emb_row, config_.hidden_size * sizeof(float));
+        load_embed_row_f32(
+            weights_, tokens[i], config_.hidden_size,
+            b_hidden + static_cast<size_t>(i) * config_.hidden_size);
     }
 
     for (int l = 0; l < config_.num_layers; ++l) {
+        if (draft_skip_layers_ && config_.skip_layer[l]) {
+            continue;
+        }
         const LayerWeights& lw = weights_.layers.at(l);
 
         std::memcpy(b_residual, b_hidden, static_cast<size_t>(num_tokens) * config_.hidden_size * sizeof(float));
@@ -1051,6 +1226,8 @@ void UnifiedEngine::forward_batch(const int32_t* tokens, int num_tokens, int sta
         }
     }
 
+    kv_seq_len_ = std::max(kv_seq_len_, start_pos + num_tokens);
+
     if (out_logits) {
         if (all_logits) {
             for (int i = 0; i < num_tokens; ++i) {
@@ -1083,6 +1260,68 @@ void UnifiedEngine::forward_batch(const int32_t* tokens, int num_tokens, int sta
     }
 }
 
+void UnifiedEngine::zero_kv_from(int from_pos) {
+    if (from_pos < 0) {
+        from_pos = 0;
+    }
+    if (from_pos >= config_.max_seq_len) {
+        return;
+    }
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int layer = 0; layer < config_.num_layers; ++layer) {
+        for (int pos = from_pos; pos < config_.max_seq_len; ++pos) {
+            for (int h = 0; h < config_.num_kv_heads; ++h) {
+                const size_t kb = kv_base(layer, pos, h);
+                const size_t sb = scale_base(layer, pos, h);
+                std::fill(k_cache_q8_.begin() + kb, k_cache_q8_.begin() + kb + config_.head_dim, static_cast<int8_t>(0));
+                std::fill(v_cache_q8_.begin() + kb, v_cache_q8_.begin() + kb + config_.head_dim, static_cast<int8_t>(0));
+                std::fill(k_cache_scales_.begin() + sb, k_cache_scales_.begin() + sb + blocks_per_head_, 1.0f);
+                std::fill(v_cache_scales_.begin() + sb, v_cache_scales_.begin() + sb + blocks_per_head_, 1.0f);
+            }
+        }
+    }
+}
+
+void UnifiedEngine::snapshot_kv() {
+    kv_snapshot_stack_.push_back(kv_seq_len_);
+}
+
+void UnifiedEngine::restore_kv() {
+    if (kv_snapshot_stack_.empty()) {
+        return;
+    }
+    const int len = kv_snapshot_stack_.back();
+    kv_snapshot_stack_.pop_back();
+    truncate_kv(len);
+}
+
+void UnifiedEngine::truncate_kv(int new_len) {
+    if (new_len < 0) {
+        new_len = 0;
+    }
+    if (new_len > config_.max_seq_len) {
+        new_len = config_.max_seq_len;
+    }
+    zero_kv_from(new_len);
+    kv_seq_len_ = new_len;
+}
+
+void UnifiedEngine::set_skip_mask(const bool* mask, int n) {
+    const int lim = std::min(n, 64);
+    for (int i = 0; i < lim; ++i) {
+        config_.skip_layer[i] = mask[i];
+    }
+    for (int i = lim; i < 64; ++i) {
+        config_.skip_layer[i] = false;
+    }
+}
+
+void UnifiedEngine::clear_skip_mask() {
+    for (int i = 0; i < 64; ++i) {
+        config_.skip_layer[i] = false;
+    }
+}
+
 void UnifiedEngine::reset_session() {
     if (!k_cache_q8_.empty()) {
         std::fill(k_cache_q8_.begin(), k_cache_q8_.end(), 0);
@@ -1090,6 +1329,11 @@ void UnifiedEngine::reset_session() {
         std::fill(k_cache_scales_.begin(), k_cache_scales_.end(), 1.0f);
         std::fill(v_cache_scales_.begin(), v_cache_scales_.end(), 1.0f);
     }
+    kv_seq_len_ = 0;
+    kv_snapshot_stack_.clear();
+    clear_skip_mask();
+    draft_skip_layers_ = false;
+    draft_q2_gemv_ = false;
 }
 
 void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
@@ -1108,8 +1352,7 @@ void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
     if (pos < 0 || pos >= config_.max_seq_len) {
         throw std::out_of_range("forward_token: pos out of kv-cache range");
     }
-    const float* emb_row = weights_.token_embd + token_id * config_.hidden_size;
-    std::memcpy(hidden_.data(), emb_row, config_.hidden_size * sizeof(float));
+    load_embed_row_f32(weights_, token_id, config_.hidden_size, hidden_.data());
     // std::cout << "[DB] emb[0]=" << hidden_[0] << " ";
     // std::cout << "[DB] emb ";
 
@@ -1119,6 +1362,9 @@ void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
     const bool fused_preq = use_q4_32_preq_fused(config_);
 
     for (int l = 0; l < config_.num_layers; ++l) {
+        if (draft_skip_layers_ && config_.skip_layer[l]) {
+            continue;
+        }
         const LayerWeights& lw = weights_.layers.at(l);
 #ifdef ASDSL_PROFILE
         std::chrono::high_resolution_clock::time_point _ft_t;
@@ -1138,17 +1384,32 @@ void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
 #ifdef ASDSL_PROFILE
         g_forward_prof.rmsnorm_quantize += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - _ft_t);
 #endif
-        if (do_prof && fused_preq) {
-            rtp.prep_fused_ms += ms_since(t_act);
+        if (do_prof) {
+            if (fused_preq) {
+                rtp.prep_fused_ms += ms_since(t_act);
+            } else {
+                rtp.activation_q8_ms += ms_since(t_act);
+            }
+            t_act = Clock::now();
         }
 
         // QKV
         Clock::time_point t_gemv = do_prof ? Clock::now() : Clock::time_point{};
-        if (lw.qkv_q4km) {
+        if (draft_q2_gemv_ && lw.has_q2 && lw.q2_qkv_proj && lw.q2_qkv_scales && lw.q2_qkv_biases) {
+            gemv_q2_packed_impl(lw.q2_qkv_proj, hidden_.data(), lw.q2_qkv_scales, lw.q2_qkv_biases,
+                qkv_out_.data(), qkv_total, config_.hidden_size, config_.group_size);
+        } else if (lw.qkv_q4km) {
             gemv_q4km_q8_avx2(lw.qkv_proj, hidden_.data(), qkv_out_.data(),
                 qkv_total, config_.hidden_size);
+        } else if (c03_gemv_enabled() && lw.qkv_g128 && lw.qkv_proj_g128) {
+            quantize_activation_avx2(
+                hidden_.data(), hidden_q8_g128_.data(), hidden_scales_g128_.data(),
+                config_.hidden_size, 128);
+            gemv_q4_128_preq_avx2(
+                lw.qkv_proj_g128, hidden_q8_g128_.data(), hidden_scales_g128_.data(),
+                qkv_out_.data(), qkv_total, config_.hidden_size, 128);
         } else if (fused_preq) {
-            gemv_q4_32_preq_fused_avx2(lw.qkv_proj, hidden_.data(), qkv_out_.data(),
+            fused_preq_gemv(lw.preq2_qkv, lw.qkv_proj, hidden_.data(), qkv_out_.data(),
                 qkv_total, config_.hidden_size, config_.group_size);
         } else if (config_.weight_format == 1) {
             gemv_q4_s256_preq_avx2(lw.qkv_proj, hidden_q8_.data(), hidden_scales_.data(), qkv_out_.data(),
@@ -1203,18 +1464,28 @@ void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
         if (do_prof) {
             rtp.other_ms += ms_since(t_other);
             if (!fused_preq) {
-                rtp.activation_q8_ms += ms_since(t_act) + ms_since(t_qatt);
+                rtp.activation_q8_ms += ms_since(t_qatt);
             }
             t_act = Clock::now();
         }
 
         // O proj
         t_gemv = do_prof ? Clock::now() : Clock::time_point{};
-        if (lw.o_q4km) {
+        if (draft_q2_gemv_ && lw.has_q2 && lw.q2_o_proj && lw.q2_o_scales && lw.q2_o_biases) {
+            gemv_q2_packed_impl(lw.q2_o_proj, att_out_.data(), lw.q2_o_scales, lw.q2_o_biases,
+                hidden_.data(), config_.hidden_size, q_dim, config_.group_size);
+        } else if (lw.o_q4km) {
             gemv_q4km_q8_avx2(lw.o_proj, att_out_.data(), hidden_.data(),
                 config_.hidden_size, q_dim);
+        } else if (c03_gemv_enabled() && lw.o_g128 && lw.o_proj_g128) {
+            quantize_activation_avx2(
+                att_out_.data(), hidden_q8_g128_.data(), hidden_scales_g128_.data(),
+                q_dim, 128);
+            gemv_q4_128_preq_avx2(
+                lw.o_proj_g128, hidden_q8_g128_.data(), hidden_scales_g128_.data(),
+                hidden_.data(), config_.hidden_size, q_dim, 128);
         } else if (fused_preq) {
-            gemv_q4_32_preq_fused_avx2(lw.o_proj, att_out_.data(), hidden_.data(),
+            fused_preq_gemv(lw.preq2_o, lw.o_proj, att_out_.data(), hidden_.data(),
                 config_.hidden_size, q_dim, config_.group_size);
         } else if (config_.weight_format == 1) {
             gemv_q4_s256_preq_avx2(lw.o_proj, hidden_q8_.data(), hidden_scales_.data(), hidden_.data(),
@@ -1252,12 +1523,29 @@ void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
 
         // Gate/Up
         t_gemv = do_prof ? Clock::now() : Clock::time_point{};
-        if (lw.gate_up_q4km) {
+        if (draft_q2_gemv_ && lw.has_q2 && lw.q2_gate_up_proj && lw.q2_gate_up_scales && lw.q2_gate_up_biases) {
+            gemv_q2_packed_impl(lw.q2_gate_up_proj, hidden_.data(), lw.q2_gate_up_scales, lw.q2_gate_up_biases,
+                gu_out_.data(), 2 * config_.intermediate_size, config_.hidden_size, config_.group_size);
+        } else if (lw.gate_up_q4km) {
             gemv_q4km_q8_avx2(lw.gate_up_proj, hidden_.data(), gu_out_.data(),
                 2 * config_.intermediate_size, config_.hidden_size);
+        } else if (c01_gemv_enabled() && lw.gate_up_g128 && lw.gate_up_proj_g128) {
+            quantize_activation_avx2(
+                hidden_.data(), hidden_q8_g128_.data(), hidden_scales_g128_.data(),
+                config_.hidden_size, 128);
+            gemv_q4_128_preq_avx2(
+                lw.gate_up_proj_g128, hidden_q8_g128_.data(), hidden_scales_g128_.data(),
+                gu_out_.data(), 2 * config_.intermediate_size, config_.hidden_size, 128);
         } else if (fused_preq) {
-            gemv_q4_32_preq_fused_avx2(lw.gate_up_proj, hidden_.data(), gu_out_.data(),
+            fused_preq_gemv(lw.preq2_gate_up, lw.gate_up_proj, hidden_.data(), gu_out_.data(),
                 2 * config_.intermediate_size, config_.hidden_size, config_.group_size);
+        } else if (lw.gate_up_g128 && lw.gate_up_proj_g128) {
+            quantize_activation_avx2(
+                hidden_.data(), hidden_q8_g128_.data(), hidden_scales_g128_.data(),
+                config_.hidden_size, 128);
+            gemv_q4_128_preq_avx2(
+                lw.gate_up_proj_g128, hidden_q8_g128_.data(), hidden_scales_g128_.data(),
+                gu_out_.data(), 2 * config_.intermediate_size, config_.hidden_size, 128);
         } else if (config_.weight_format == 1) {
             gemv_q4_s256_preq_avx2(lw.gate_up_proj, hidden_q8_.data(), hidden_scales_.data(), gu_out_.data(),
                             2 * config_.intermediate_size, config_.hidden_size, config_.group_size);
@@ -1295,12 +1583,29 @@ void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
 
         // Down proj
         t_gemv = do_prof ? Clock::now() : Clock::time_point{};
-        if (lw.down_q4km) {
+        if (draft_q2_gemv_ && lw.has_q2 && lw.q2_down_proj && lw.q2_down_scales && lw.q2_down_biases) {
+            gemv_q2_packed_impl(lw.q2_down_proj, gu_out_.data(), lw.q2_down_scales, lw.q2_down_biases,
+                hidden_.data(), config_.hidden_size, config_.intermediate_size, config_.group_size);
+        } else if (lw.down_q4km) {
             gemv_q4km_q8_avx2(lw.down_proj, gu_out_.data(), hidden_.data(),
                 config_.hidden_size, config_.intermediate_size);
+        } else if (c01_gemv_enabled() && lw.down_g128 && lw.down_proj_g128) {
+            quantize_activation_avx2(
+                gu_out_.data(), gate_q8_g128_.data(), gate_scales_g128_.data(),
+                config_.intermediate_size, 128);
+            gemv_q4_128_preq_avx2(
+                lw.down_proj_g128, gate_q8_g128_.data(), gate_scales_g128_.data(),
+                hidden_.data(), config_.hidden_size, config_.intermediate_size, 128);
         } else if (fused_preq) {
-            gemv_q4_32_preq_fused_avx2(lw.down_proj, gu_out_.data(), hidden_.data(),
+            fused_preq_gemv(lw.preq2_down, lw.down_proj, gu_out_.data(), hidden_.data(),
                 config_.hidden_size, config_.intermediate_size, config_.group_size);
+        } else if (lw.down_g128 && lw.down_proj_g128) {
+            quantize_activation_avx2(
+                gu_out_.data(), gate_q8_g128_.data(), gate_scales_g128_.data(),
+                config_.intermediate_size, 128);
+            gemv_q4_128_preq_avx2(
+                lw.down_proj_g128, gate_q8_g128_.data(), gate_scales_g128_.data(),
+                hidden_.data(), config_.hidden_size, config_.intermediate_size, 128);
         } else if (config_.weight_format == 1) {
             gemv_q4_s256_preq_avx2(lw.down_proj, gate_q8_.data(), gate_scales_.data(), hidden_.data(),
                             config_.hidden_size, config_.intermediate_size, config_.group_size);
@@ -1318,28 +1623,37 @@ void UnifiedEngine::forward_token(int token_id, int pos, float* out_logits) {
         vec_add_inplace(hidden_.data(), residual_.data(), config_.hidden_size);
     }
 
+    kv_seq_len_ = std::max(kv_seq_len_, pos + 1);
+
     if (out_logits) {
         Clock::time_point t_lm = do_prof ? Clock::now() : Clock::time_point{};
-        if (lm_head_q4_quantized_) {
-            if (fused_preq) {
+        if (lm_head_preq2_ready_ || lm_head_q4_quantized_) {
+            const int lm_gs = lm_head_group_size(config_);
+            const bool lm_fused_g32 = fused_preq && lm_gs == 32;
+            if (lm_fused_g32) {
                 rmsnorm_f32(hidden_.data(), hidden_.data(), weights_.output_norm,
                     config_.hidden_size, config_.rms_norm_eps);
-                gemv_q4_32_preq_fused_avx2(lm_head_q4_blocks_.data(), hidden_.data(), out_logits,
-                    config_.vocab_size, config_.hidden_size, config_.group_size);
+                if (preq2_gemv_enabled() && lm_head_preq2_ready_) {
+                    gemv_preq2_fused_avx2(
+                        lm_head_preq2_meta_.data(), lm_head_preq2_quant_.data(),
+                        hidden_.data(), out_logits,
+                        config_.vocab_size, config_.hidden_size, lm_gs);
+                } else {
+                    gemv_q4_32_preq_fused_avx2(lm_head_q4_blocks_.data(), hidden_.data(), out_logits,
+                        config_.vocab_size, config_.hidden_size, lm_gs);
+                }
             } else {
                 rmsnorm_quantize_f32(hidden_.data(), weights_.output_norm, hidden_q8_.data(), hidden_scales_.data(),
-                    config_.hidden_size, config_.group_size, config_.rms_norm_eps);
-                if (config_.weight_format == 1 || config_.group_size == 128) {
-                    if (config_.weight_format == 1) {
-                        gemv_q4_s256_preq_avx2(lm_head_q4_blocks_.data(), hidden_q8_.data(), hidden_scales_.data(),
-                            out_logits, config_.vocab_size, config_.hidden_size, config_.group_size);
-                    } else {
-                        gemv_q4_128_preq_avx2(lm_head_q4_blocks_.data(), hidden_q8_.data(), hidden_scales_.data(),
-                            out_logits, config_.vocab_size, config_.hidden_size, config_.group_size);
-                    }
+                    config_.hidden_size, lm_gs, config_.rms_norm_eps);
+                if (config_.weight_format == 1) {
+                    gemv_q4_s256_preq_avx2(lm_head_q4_blocks_.data(), hidden_q8_.data(), hidden_scales_.data(),
+                        out_logits, config_.vocab_size, config_.hidden_size, lm_gs);
+                } else if (lm_gs == 128) {
+                    gemv_q4_128_preq_avx2(lm_head_q4_blocks_.data(), hidden_q8_.data(), hidden_scales_.data(),
+                        out_logits, config_.vocab_size, config_.hidden_size, 128);
                 } else {
                     gemv_q4_32_preq_avx2(lm_head_q4_blocks_.data(), hidden_q8_.data(), hidden_scales_.data(),
-                        out_logits, config_.vocab_size, config_.hidden_size, config_.group_size);
+                        out_logits, config_.vocab_size, config_.hidden_size, lm_gs);
                 }
             }
         } else {
@@ -1400,12 +1714,18 @@ void UnifiedEngine::forward_token_fp32_lmhead(int token_id, int pos,
     }
 }
 
-std::vector<int32_t> UnifiedEngine::generate(const std::vector<int32_t>& prompt, int max_tokens) {
+std::vector<int32_t> UnifiedEngine::generate(
+    const std::vector<int32_t>& prompt,
+    int max_tokens,
+    const std::vector<int32_t>& stop_tokens) {
     std::vector<int32_t> output = prompt;
     int current_pos = 0;
 
     if (!prompt.empty()) {
-        forward_batch(prompt.data(), (int)prompt.size(), 0, logits_.data());
+        const int prompt_n = (int)prompt.size();
+        for (int i = 0; i < prompt_n; ++i) {
+            forward_token(prompt[i], i, (i == prompt_n - 1) ? logits_.data() : nullptr);
+        }
         current_pos += (int)prompt.size();
     }
 
@@ -1418,7 +1738,14 @@ std::vector<int32_t> UnifiedEngine::generate(const std::vector<int32_t>& prompt,
         int best_token = argmax_f32_avx2(logits_.data(), config_.vocab_size);
 
         output.push_back(best_token);
-        if (best_token == 199999 || best_token == 200020) { // Naive Phi-4 EOS
+        bool is_stop = false;
+        for (int32_t s : stop_tokens) {
+            if (best_token == s) {
+                is_stop = true;
+                break;
+            }
+        }
+        if (is_stop) {
             break;
         }
 
@@ -1437,83 +1764,432 @@ std::vector<int32_t> UnifiedEngine::generate(const std::vector<int32_t>& prompt,
 }
 
 
-void UnifiedEngine::forward_token_draft(int token_id, int pos, float* out_logits) {
-    // Run the full 32-layer forward pass for the draft.
-    //
-    // The original implementation skipped layers 4-27 (running only 8/32 layers),
-    // which caused ~7% speculative acceptance rate — far below the ~22% break-even
-    // for draft_k=1 (see RESULTS.md Leviathan analysis).
-    //
-    // With all layers, the draft produces logits identical to forward_token() for
-    // greedy decoding, achieving ~100% acceptance. The net speedup comes from
-    // forward_batch(draft_k) amortising weight reads across k tokens in one pass
-    // vs k sequential forward_token calls: at batch=4, GEMM weight bandwidth is
-    // reused 4× giving T_batch(4) ≈ T_seq, so total cost ≈ 5×T_seq for 4 tokens.
-    forward_token(token_id, pos, out_logits);
+
+void UnifiedEngine::forward_verify_serial(const int32_t* tokens, int n, int start_pos, float* out_logits) {
+    for (int i = 0; i < n; ++i) {
+        forward_token(tokens[i], start_pos + i, out_logits ? out_logits + static_cast<size_t>(i) * config_.vocab_size : nullptr);
+    }
 }
+
+void UnifiedEngine::forward_verify_batch(const int32_t* tokens, int n, int start_pos, float* out_logits) {
+    if (n <= 0) {
+        return;
+    }
+    if (n == 1) {
+        forward_token(tokens[0], start_pos, out_logits);
+        return;
+    }
+    // Batched legacy GEMM does not dispatch preq2 fused weights; serial verify matches
+    // forward_token numerics (required for lossless PLD under ASDSL_PREQ2=1).
+    if (preq2_gemv_enabled() && use_q4_32_preq_fused(config_)) {
+        forward_verify_serial(tokens, n, start_pos, out_logits);
+        return;
+    }
+    forward_batch(tokens, n, start_pos, out_logits, true);
+}
+void UnifiedEngine::forward_token_draft(int token_id, int pos, float* out_logits) {
+    draft_skip_layers_ = true;
+    forward_token(token_id, pos, out_logits);
+    draft_skip_layers_ = false;
+}
+
+void UnifiedEngine::forward_token_draft_q2(int token_id, int pos, float* out_logits) {
+    draft_skip_layers_ = true;
+    draft_q2_gemv_ = true;
+    forward_token(token_id, pos, out_logits);
+    draft_q2_gemv_ = false;
+    draft_skip_layers_ = false;
+}
+
+namespace {
+inline bool is_phi_eos_token(int32_t token) {
+    return token == 199999 || token == 200020;
+}
+} // namespace
 
 std::vector<int32_t> UnifiedEngine::generate_swift(const std::vector<int32_t>& prompt, int max_tokens, int draft_k) {
     std::vector<int32_t> output = prompt;
     int current_pos = 0;
 
     if (!prompt.empty()) {
-        forward_batch(prompt.data(), (int)prompt.size(), 0, logits_.data(), false);
-        current_pos += (int)prompt.size();
+        const int prompt_n = (int)prompt.size();
+        for (int i = 0; i < prompt_n; ++i) {
+            forward_token(prompt[i], i, (i == prompt_n - 1) ? logits_.data() : nullptr);
+        }
+        current_pos = prompt_n;
     }
 
-    int best_token = argmax_f32_avx2(logits_.data(), config_.vocab_size);
-    output.push_back(best_token);
+    const int prompt_len = static_cast<int>(prompt.size());
+    std::vector<float> verify_logits(static_cast<size_t>(draft_k + 1) * config_.vocab_size);
 
-    std::vector<float> verify_logits(draft_k * config_.vocab_size);
-    int accepted_total = 0;
-    int drafted_total = 0;
-
-    while (output.size() < prompt.size() + max_tokens) {
-        if (best_token == 199999 || best_token == 200020) break;
-
-        std::vector<int32_t> draft_tokens;
-        draft_tokens.push_back(best_token); // The first token to feed to the draft layer
-        
-        int draft_pos = current_pos;
-        for (int k = 0; k < draft_k; ++k) {
-            forward_token_draft(draft_tokens.back(), draft_pos, logits_.data());
-            
-            int draft_t = argmax_f32_avx2(logits_.data(), config_.vocab_size);
-            draft_tokens.push_back(draft_t);
-            draft_pos++;
+    while (static_cast<int>(output.size()) - prompt_len < max_tokens) {
+        const int32_t current_token = static_cast<int32_t>(
+            argmax_f32_avx2(logits_.data(), config_.vocab_size));
+        if (is_phi_eos_token(current_token)) {
+            break;
         }
-        drafted_total += draft_k;
 
-        forward_batch(draft_tokens.data(), draft_k, current_pos, verify_logits.data(), true);
+        const int draft_start_pos = current_pos;
 
-        int accepted = 0;
-        int next_token_from_target = -1;
-
+        snapshot_kv();
+        std::vector<int32_t> draft_tokens;
+        draft_tokens.reserve(static_cast<size_t>(draft_k));
+        int32_t draft_tok = current_token;
         for (int k = 0; k < draft_k; ++k) {
-            int target_t = argmax_f32_avx2(verify_logits.data() + k * config_.vocab_size, config_.vocab_size);
-            
-            next_token_from_target = target_t;
-            
-            if (target_t == draft_tokens[k + 1]) {
-                accepted++;
-                output.push_back(target_t);
-                if (target_t == 199999 || target_t == 200020) break;
-            } else {
-                output.push_back(target_t);
+            forward_token_draft(draft_tok, draft_start_pos + k, logits_.data());
+            const int32_t next_draft = static_cast<int32_t>(
+                argmax_f32_avx2(logits_.data(), config_.vocab_size));
+            draft_tokens.push_back(next_draft);
+            draft_tok = next_draft;
+            if (is_phi_eos_token(next_draft)) {
                 break;
             }
         }
-        
-        accepted_total += accepted;
-        current_pos += accepted + 1; // 1 step further (if accepted=0, +1 for target token)
-        best_token = output.back();
-        
-        if (best_token == 199999 || best_token == 200020) break;
-        if (output.size() >= prompt.size() + max_tokens) break;
+        restore_kv();
+
+        const int L = static_cast<int>(draft_tokens.size());
+        std::vector<int32_t> verify_tokens;
+        verify_tokens.reserve(static_cast<size_t>(std::max(L, 1)));
+        if (L == 0) {
+            verify_tokens.push_back(current_token);
+        } else {
+            verify_tokens.push_back(current_token);
+            for (int i = 0; i < L - 1; ++i) {
+                verify_tokens.push_back(draft_tokens[static_cast<size_t>(i)]);
+            }
+        }
+        const int n_verify = static_cast<int>(verify_tokens.size());
+        forward_verify_serial(
+            verify_tokens.data(), n_verify, draft_start_pos, verify_logits.data());
+
+        output.push_back(current_token);
+
+        int accepted = 0;
+        int32_t correction = -1;
+        for (int k_idx = 0; k_idx < L; ++k_idx) {
+            const int32_t ref_tok = static_cast<int32_t>(argmax_f32_avx2(
+                verify_logits.data() + static_cast<size_t>(k_idx) * config_.vocab_size,
+                config_.vocab_size));
+            if (ref_tok == draft_tokens[static_cast<size_t>(k_idx)]) {
+                accepted++;
+            } else {
+                correction = ref_tok;
+                break;
+            }
+        }
+
+        bool stop = is_phi_eos_token(current_token);
+        for (int i = 0; i < accepted; ++i) {
+            output.push_back(draft_tokens[static_cast<size_t>(i)]);
+            if (is_phi_eos_token(draft_tokens[static_cast<size_t>(i)])) {
+                stop = true;
+                break;
+            }
+        }
+        if (stop) {
+            current_pos = draft_start_pos + 1 + accepted;
+            truncate_kv(current_pos);
+            break;
+        }
+
+        if (correction >= 0) {
+            const int n_keep = 1 + accepted;
+            current_pos = draft_start_pos + n_keep;
+            truncate_kv(current_pos);
+            forward_token(correction, current_pos, logits_.data());
+            current_pos++;
+            output.push_back(correction);
+            if (is_phi_eos_token(correction)) {
+                break;
+            }
+        } else if (L > 0 && accepted == L) {
+            current_pos = draft_start_pos + n_verify;
+            truncate_kv(current_pos);
+            forward_token(draft_tokens.back(), current_pos, logits_.data());
+            current_pos++;
+            if (is_phi_eos_token(draft_tokens.back())) {
+                break;
+            }
+        } else if (L == 0) {
+            forward_token(current_token, draft_start_pos, logits_.data());
+            current_pos = draft_start_pos + 1;
+        }
+
+        if (static_cast<int>(output.size()) - prompt_len >= max_tokens) {
+            break;
+        }
     }
-    
+
     return output;
 }
+
+
+std::vector<int32_t> UnifiedEngine::generate_ahsd(
+    const std::vector<int32_t>& prompt, int max_tokens, int draft_k, AhsdStats* stats_out) {
+    AhsdStats local_stats;
+    std::vector<int32_t> output = prompt;
+    int current_pos = 0;
+
+    if (!prompt.empty()) {
+        const int prompt_n = (int)prompt.size();
+        for (int i = 0; i < prompt_n; ++i) {
+            forward_token(prompt[i], i, (i == prompt_n - 1) ? logits_.data() : nullptr);
+        }
+        current_pos = prompt_n;
+    }
+
+    const int prompt_len = static_cast<int>(prompt.size());
+    std::vector<float> verify_logits(static_cast<size_t>(draft_k + 1) * config_.vocab_size);
+
+    while (static_cast<int>(output.size()) - prompt_len < max_tokens) {
+        const int32_t current_token = static_cast<int32_t>(
+            argmax_f32_avx2(logits_.data(), config_.vocab_size));
+        if (is_phi_eos_token(current_token)) {
+            break;
+        }
+
+        const int draft_start_pos = current_pos;
+
+        const auto t_draft0 = Clock::now();
+        snapshot_kv();
+        std::vector<int32_t> draft_tokens;
+        draft_tokens.reserve(static_cast<size_t>(draft_k));
+        int32_t draft_tok = current_token;
+        for (int k = 0; k < draft_k; ++k) {
+            forward_token_draft(draft_tok, draft_start_pos + k, logits_.data());
+            const int32_t next_draft = static_cast<int32_t>(
+                argmax_f32_avx2(logits_.data(), config_.vocab_size));
+            draft_tokens.push_back(next_draft);
+            draft_tok = next_draft;
+            if (is_phi_eos_token(next_draft)) {
+                break;
+            }
+        }
+        restore_kv();
+        local_stats.draft_ms += ms_since(t_draft0);
+        local_stats.draft_tokens += static_cast<int>(draft_tokens.size());
+        local_stats.speculative_cycles++;
+
+        const int L = static_cast<int>(draft_tokens.size());
+        std::vector<int32_t> verify_tokens;
+        verify_tokens.reserve(static_cast<size_t>(std::max(L, 1)));
+        if (L == 0) {
+            verify_tokens.push_back(current_token);
+        } else {
+            verify_tokens.push_back(current_token);
+            for (int i = 0; i < L - 1; ++i) {
+                verify_tokens.push_back(draft_tokens[static_cast<size_t>(i)]);
+            }
+        }
+        const int n_verify = static_cast<int>(verify_tokens.size());
+
+        const auto t_verify0 = Clock::now();
+        forward_verify_serial(
+            verify_tokens.data(), n_verify, draft_start_pos, verify_logits.data());
+        local_stats.verify_ms += ms_since(t_verify0);
+
+        output.push_back(current_token);
+
+        int accepted = 0;
+        int32_t correction = -1;
+        for (int k_idx = 0; k_idx < L; ++k_idx) {
+            const int32_t ref_tok = static_cast<int32_t>(argmax_f32_avx2(
+                verify_logits.data() + static_cast<size_t>(k_idx) * config_.vocab_size,
+                config_.vocab_size));
+            if (ref_tok == draft_tokens[static_cast<size_t>(k_idx)]) {
+                accepted++;
+            } else {
+                correction = ref_tok;
+                break;
+            }
+        }
+        local_stats.accepted_tokens += accepted;
+
+        bool stop = is_phi_eos_token(current_token);
+        for (int i = 0; i < accepted; ++i) {
+            output.push_back(draft_tokens[static_cast<size_t>(i)]);
+            if (is_phi_eos_token(draft_tokens[static_cast<size_t>(i)])) {
+                stop = true;
+                break;
+            }
+        }
+        if (stop) {
+            current_pos = draft_start_pos + 1 + accepted;
+            truncate_kv(current_pos);
+            break;
+        }
+
+        if (correction >= 0) {
+            const int n_keep = 1 + accepted;
+            current_pos = draft_start_pos + n_keep;
+            truncate_kv(current_pos);
+            forward_token(correction, current_pos, logits_.data());
+            current_pos++;
+            output.push_back(correction);
+            if (is_phi_eos_token(correction)) {
+                break;
+            }
+        } else if (L > 0 && accepted == L) {
+            current_pos = draft_start_pos + n_verify;
+            truncate_kv(current_pos);
+            forward_token(draft_tokens.back(), current_pos, logits_.data());
+            current_pos++;
+            if (is_phi_eos_token(draft_tokens.back())) {
+                break;
+            }
+        } else if (L == 0) {
+            forward_token(current_token, draft_start_pos, logits_.data());
+            current_pos = draft_start_pos + 1;
+        }
+
+        if (static_cast<int>(output.size()) - prompt_len >= max_tokens) {
+            break;
+        }
+    }
+
+    if (local_stats.draft_tokens > 0) {
+        local_stats.acceptance_rate = static_cast<double>(local_stats.accepted_tokens)
+            / static_cast<double>(local_stats.draft_tokens);
+    }
+    if (stats_out) {
+        *stats_out = local_stats;
+    }
+    return output;
+}
+
+std::vector<int32_t> UnifiedEngine::generate_sdqs(
+    const std::vector<int32_t>& prompt, int max_tokens, int draft_k, AhsdStats* stats_out) {
+    AhsdStats local_stats;
+    std::vector<int32_t> output = prompt;
+    int current_pos = 0;
+
+    if (!prompt.empty()) {
+        const int prompt_n = (int)prompt.size();
+        for (int i = 0; i < prompt_n; ++i) {
+            forward_token(prompt[i], i, (i == prompt_n - 1) ? logits_.data() : nullptr);
+        }
+        current_pos = prompt_n;
+    }
+
+    const int prompt_len = static_cast<int>(prompt.size());
+    std::vector<float> verify_logits(static_cast<size_t>(draft_k + 1) * config_.vocab_size);
+
+    while (static_cast<int>(output.size()) - prompt_len < max_tokens) {
+        const int32_t current_token = static_cast<int32_t>(
+            argmax_f32_avx2(logits_.data(), config_.vocab_size));
+        if (is_phi_eos_token(current_token)) {
+            break;
+        }
+
+        const int draft_start_pos = current_pos;
+        std::vector<int32_t> draft_tokens;
+        draft_tokens.reserve(static_cast<size_t>(draft_k));
+
+        const auto t_draft0 = Clock::now();
+        snapshot_kv();
+        int32_t draft_tok = current_token;
+        for (int k = 0; k < draft_k; ++k) {
+            forward_token_draft_q2(draft_tok, draft_start_pos + k, logits_.data());
+            const int32_t next_draft = static_cast<int32_t>(
+                argmax_f32_avx2(logits_.data(), config_.vocab_size));
+            draft_tokens.push_back(next_draft);
+            draft_tok = next_draft;
+            if (is_phi_eos_token(next_draft)) {
+                break;
+            }
+        }
+        restore_kv();
+        local_stats.draft_ms += ms_since(t_draft0);
+        local_stats.draft_tokens += static_cast<int>(draft_tokens.size());
+        local_stats.speculative_cycles++;
+
+        const int L = static_cast<int>(draft_tokens.size());
+        std::vector<int32_t> verify_tokens;
+        verify_tokens.reserve(static_cast<size_t>(std::max(L, 1)));
+        if (L == 0) {
+            verify_tokens.push_back(current_token);
+        } else {
+            verify_tokens.push_back(current_token);
+            for (int i = 0; i < L - 1; ++i) {
+                verify_tokens.push_back(draft_tokens[static_cast<size_t>(i)]);
+            }
+        }
+        const int n_verify = static_cast<int>(verify_tokens.size());
+
+        const auto t_verify0 = Clock::now();
+        forward_verify_serial(
+            verify_tokens.data(), n_verify, draft_start_pos, verify_logits.data());
+        local_stats.verify_ms += ms_since(t_verify0);
+
+        output.push_back(current_token);
+
+        int accepted = 0;
+        int32_t correction = -1;
+        for (int k_idx = 0; k_idx < L; ++k_idx) {
+            const int32_t ref_tok = static_cast<int32_t>(argmax_f32_avx2(
+                verify_logits.data() + static_cast<size_t>(k_idx) * config_.vocab_size,
+                config_.vocab_size));
+            if (ref_tok == draft_tokens[static_cast<size_t>(k_idx)]) {
+                accepted++;
+            } else {
+                correction = ref_tok;
+                break;
+            }
+        }
+        local_stats.accepted_tokens += accepted;
+
+        bool stop = is_phi_eos_token(current_token);
+        for (int i = 0; i < accepted; ++i) {
+            output.push_back(draft_tokens[static_cast<size_t>(i)]);
+            if (is_phi_eos_token(draft_tokens[static_cast<size_t>(i)])) {
+                stop = true;
+                break;
+            }
+        }
+        if (stop) {
+            current_pos = draft_start_pos + 1 + accepted;
+            truncate_kv(current_pos);
+            break;
+        }
+
+        if (correction >= 0) {
+            const int n_keep = 1 + accepted;
+            current_pos = draft_start_pos + n_keep;
+            truncate_kv(current_pos);
+            forward_token(correction, current_pos, logits_.data());
+            current_pos++;
+            output.push_back(correction);
+            if (is_phi_eos_token(correction)) {
+                break;
+            }
+        } else if (L > 0 && accepted == L) {
+            current_pos = draft_start_pos + n_verify;
+            truncate_kv(current_pos);
+            forward_token(draft_tokens.back(), current_pos, logits_.data());
+            current_pos++;
+            if (is_phi_eos_token(draft_tokens.back())) {
+                break;
+            }
+        } else if (L == 0) {
+            forward_token(current_token, draft_start_pos, logits_.data());
+            current_pos = draft_start_pos + 1;
+        }
+
+        if (static_cast<int>(output.size()) - prompt_len >= max_tokens) {
+            break;
+        }
+    }
+
+    if (local_stats.draft_tokens > 0) {
+        local_stats.acceptance_rate = static_cast<double>(local_stats.accepted_tokens)
+            / static_cast<double>(local_stats.draft_tokens);
+    }
+    if (stats_out) {
+        *stats_out = local_stats;
+    }
+    return output;
+}
+
 
 } // namespace asdsl
 
@@ -1537,6 +2213,7 @@ py::class_<EngineConfig> register_config(py::module_& m) {
         .def_readwrite("vocab_size", &asdsl::EngineConfig::vocab_size)
         .def_readwrite("rms_norm_eps", &asdsl::EngineConfig::rms_norm_eps)
         .def_readwrite("group_size", &asdsl::EngineConfig::group_size)
+        .def_readwrite("lm_head_group_size", &asdsl::EngineConfig::lm_head_group_size)
         .def_readwrite("max_seq_len", &asdsl::EngineConfig::max_seq_len)
         .def_readwrite("rotary_dim", &asdsl::EngineConfig::rotary_dim)
         .def_readwrite("weight_format", &asdsl::EngineConfig::weight_format);
@@ -1561,19 +2238,62 @@ class UnifiedEnginePy {
         return arr.data();
     }
 
+    static void bind_embedding(py::array arr, asdsl::EngineWeights& weights, std::vector<py::array>& keep_alive) {
+        keep_alive.push_back(arr);
+        const auto req = arr.request();
+        const std::string dtype = py::str(arr.attr("dtype"));
+        if (dtype == "float16" || dtype == "<f2") {
+            weights.token_embd_f16 = static_cast<const uint16_t*>(req.ptr);
+            weights.embed_fp16 = true;
+            weights.token_embd = nullptr;
+            return;
+        }
+        weights.token_embd = static_cast<const float*>(req.ptr);
+        weights.embed_fp16 = false;
+        weights.token_embd_f16 = nullptr;
+    }
+
+    static void bind_output_proj(py::array arr, asdsl::EngineWeights& weights, std::vector<py::array>& keep_alive) {
+        keep_alive.push_back(arr);
+        const auto req = arr.request();
+        const std::string dtype = py::str(arr.attr("dtype"));
+        if (dtype == "float16" || dtype == "<f2") {
+            weights.output_proj_f16 = static_cast<const uint16_t*>(req.ptr);
+            weights.output_proj_fp16 = true;
+            weights.output_proj = nullptr;
+            return;
+        }
+        weights.output_proj = static_cast<const float*>(req.ptr);
+        weights.output_proj_fp16 = false;
+        weights.output_proj_f16 = nullptr;
+    }
+
 public:
     UnifiedEnginePy(
         EngineConfig config,
-        py::array_t<float> token_embd,
+        py::array token_embd,
         py::array_t<float> output_norm,
-        py::array_t<float> output_proj,
+        py::object output_proj,
         py::array_t<float> cos_table,
         py::array_t<float> sin_table,
-        py::dict layers_dict
+        py::dict layers_dict,
+        py::object lm_head_preq2_meta = py::none(),
+        py::object lm_head_preq2_quant = py::none()
     ) {
-        weights_.token_embd = get_ptr(token_embd);
+        bind_embedding(token_embd, weights_, keep_alive_);
         weights_.output_norm = get_ptr(output_norm);
-        weights_.output_proj = get_ptr(output_proj);
+        if (!lm_head_preq2_meta.is_none() && !lm_head_preq2_quant.is_none()) {
+            auto meta_arr = lm_head_preq2_meta.cast<py::array_t<uint8_t>>();
+            auto quant_arr = lm_head_preq2_quant.cast<py::array_t<uint8_t>>();
+            weights_.lm_head_preq2_meta_in = get_ptr(meta_arr);
+            weights_.lm_head_preq2_quant_in = get_ptr(quant_arr);
+            weights_.lm_head_preq2_meta_size = static_cast<size_t>(meta_arr.size());
+            weights_.lm_head_preq2_quant_size = static_cast<size_t>(quant_arr.size());
+            weights_.lm_head_preq2_from_cache = true;
+        }
+        if (!output_proj.is_none()) {
+            bind_output_proj(output_proj.cast<py::array>(), weights_, keep_alive_);
+        }
         weights_.cos_table = get_ptr(cos_table);
         weights_.sin_table = get_ptr(sin_table);
 
@@ -1606,7 +2326,28 @@ public:
             
             auto down_proj = l_dict["down_proj"].cast<py::array_t<uint8_t>>();
             lw.down_proj = get_ptr(down_proj);
-            
+
+            if (l_dict.contains("gate_up_proj_g128")) {
+                auto gu128 = l_dict["gate_up_proj_g128"].cast<py::array_t<uint8_t>>();
+                lw.gate_up_proj_g128 = get_ptr(gu128);
+                lw.gate_up_g128 = true;
+            }
+            if (l_dict.contains("down_proj_g128")) {
+                auto dn128 = l_dict["down_proj_g128"].cast<py::array_t<uint8_t>>();
+                lw.down_proj_g128 = get_ptr(dn128);
+                lw.down_g128 = true;
+            }
+            if (l_dict.contains("qkv_proj_g128")) {
+                auto qkv128 = l_dict["qkv_proj_g128"].cast<py::array_t<uint8_t>>();
+                lw.qkv_proj_g128 = get_ptr(qkv128);
+                lw.qkv_g128 = true;
+            }
+            if (l_dict.contains("o_proj_g128")) {
+                auto o128 = l_dict["o_proj_g128"].cast<py::array_t<uint8_t>>();
+                lw.o_proj_g128 = get_ptr(o128);
+                lw.o_g128 = true;
+            }
+
             if (l_dict.contains("fatrelu_threshold")) {
                 lw.fatrelu_threshold = l_dict["fatrelu_threshold"].cast<float>();
             }
@@ -1625,6 +2366,75 @@ public:
             if (l_dict.contains("qkv_q5km")) {
                 lw.qkv_q5km = l_dict["qkv_q5km"].cast<bool>();
             }
+
+            auto bind_preq2 = [&](const char* prefix, asdsl::Preq2Weights& dst) {
+                const py::str meta_key = py::str(std::string(prefix) + "_meta");
+                const py::str quant_key = py::str(std::string(prefix) + "_quant");
+                if (l_dict.contains(meta_key)) {
+                    auto arr = l_dict[meta_key].cast<py::array_t<uint8_t>>();
+                    dst.meta = get_ptr(arr);
+                }
+                if (l_dict.contains(quant_key)) {
+                    auto arr = l_dict[quant_key].cast<py::array_t<uint8_t>>();
+                    dst.quant = get_ptr(arr);
+                }
+            };
+            bind_preq2("qkv_proj", lw.preq2_qkv);
+            bind_preq2("o_proj", lw.preq2_o);
+            bind_preq2("gate_up_proj", lw.preq2_gate_up);
+            bind_preq2("down_proj", lw.preq2_down);
+
+            if (l_dict.contains("q2_qkv_proj")) {
+                auto arr = l_dict["q2_qkv_proj"].cast<py::array_t<uint8_t>>();
+                lw.q2_qkv_proj = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_o_proj")) {
+                auto arr = l_dict["q2_o_proj"].cast<py::array_t<uint8_t>>();
+                lw.q2_o_proj = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_gate_up_proj")) {
+                auto arr = l_dict["q2_gate_up_proj"].cast<py::array_t<uint8_t>>();
+                lw.q2_gate_up_proj = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_down_proj")) {
+                auto arr = l_dict["q2_down_proj"].cast<py::array_t<uint8_t>>();
+                lw.q2_down_proj = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_qkv_scales")) {
+                auto arr = l_dict["q2_qkv_scales"].cast<py::array_t<float>>();
+                lw.q2_qkv_scales = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_qkv_biases")) {
+                auto arr = l_dict["q2_qkv_biases"].cast<py::array_t<float>>();
+                lw.q2_qkv_biases = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_o_scales")) {
+                auto arr = l_dict["q2_o_scales"].cast<py::array_t<float>>();
+                lw.q2_o_scales = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_o_biases")) {
+                auto arr = l_dict["q2_o_biases"].cast<py::array_t<float>>();
+                lw.q2_o_biases = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_gate_up_scales")) {
+                auto arr = l_dict["q2_gate_up_scales"].cast<py::array_t<float>>();
+                lw.q2_gate_up_scales = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_gate_up_biases")) {
+                auto arr = l_dict["q2_gate_up_biases"].cast<py::array_t<float>>();
+                lw.q2_gate_up_biases = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_down_scales")) {
+                auto arr = l_dict["q2_down_scales"].cast<py::array_t<float>>();
+                lw.q2_down_scales = get_ptr(arr);
+            }
+            if (l_dict.contains("q2_down_biases")) {
+                auto arr = l_dict["q2_down_biases"].cast<py::array_t<float>>();
+                lw.q2_down_biases = get_ptr(arr);
+            }
+            if (l_dict.contains("has_q2")) {
+                lw.has_q2 = l_dict["has_q2"].cast<bool>();
+            }
             if (l_dict.contains("down_q6km")) {
                 lw.down_q6km = l_dict["down_q6km"].cast<bool>();
             }
@@ -1642,6 +2452,14 @@ public:
         return engine_->generate(prompt, max_tokens);
     }
 
+    std::vector<int32_t> generate_with_stops(
+            std::vector<int32_t> prompt,
+            int max_tokens,
+            std::vector<int32_t> stop_tokens) {
+        py::gil_scoped_release release;
+        return engine_->generate(prompt, max_tokens, stop_tokens);
+    }
+
     std::vector<int32_t> generate_swift(std::vector<int32_t> prompt, int max_tokens, int draft_k) {
         py::gil_scoped_release release;
         return engine_->generate_swift(prompt, max_tokens, draft_k);
@@ -1651,6 +2469,19 @@ public:
         engine_->reset_session();
     }
 
+    py::tuple export_lm_head_preq2() {
+        if (!engine_->lm_head_preq2_ready()) {
+            throw std::runtime_error("export_lm_head_preq2: lm_head preq2 not ready");
+        }
+        const auto& meta = engine_->lm_head_preq2_meta();
+        const auto& quant = engine_->lm_head_preq2_quant();
+        py::array_t<uint8_t> meta_arr(static_cast<py::ssize_t>(meta.size()));
+        py::array_t<uint8_t> quant_arr(static_cast<py::ssize_t>(quant.size()));
+        std::memcpy(meta_arr.mutable_data(), meta.data(), meta.size());
+        std::memcpy(quant_arr.mutable_data(), quant.data(), quant.size());
+        return py::make_tuple(meta_arr, quant_arr);
+    }
+
     py::array_t<float> forward_token(int token, int pos) {
         float* ptr = static_cast<float*>(logits_out_.request().ptr);
         {
@@ -1658,6 +2489,11 @@ public:
             engine_->forward_token(token, pos, ptr);
         }
         return logits_out_;
+    }
+
+    void forward_token_prefill(int token, int pos) {
+        py::gil_scoped_release release;
+        engine_->forward_token(token, pos, nullptr);
     }
 
     int forward_token_argmax(int token, int pos) {
@@ -1696,6 +2532,114 @@ public:
         }
         return result;
     }
+
+    std::vector<int32_t> generate_ahsd(std::vector<int32_t> prompt, int max_tokens, int draft_k) {
+        py::gil_scoped_release release;
+        return engine_->generate_ahsd(prompt, max_tokens, draft_k, nullptr);
+    }
+
+    py::dict generate_ahsd_stats(std::vector<int32_t> prompt, int max_tokens, int draft_k) {
+        asdsl::UnifiedEngine::AhsdStats stats;
+        std::vector<int32_t> tokens;
+        {
+            py::gil_scoped_release release;
+            tokens = engine_->generate_ahsd(prompt, max_tokens, draft_k, &stats);
+        }
+        py::dict out;
+        out["tokens"] = tokens;
+        out["acceptance_rate"] = stats.acceptance_rate;
+        out["draft_tokens"] = stats.draft_tokens;
+        out["accepted_tokens"] = stats.accepted_tokens;
+        out["speculative_cycles"] = stats.speculative_cycles;
+        out["draft_ms"] = stats.draft_ms;
+        out["verify_ms"] = stats.verify_ms;
+        return out;
+    }
+
+    std::vector<int32_t> generate_sdqs(std::vector<int32_t> prompt, int max_tokens, int draft_k) {
+        py::gil_scoped_release release;
+        return engine_->generate_sdqs(prompt, max_tokens, draft_k, nullptr);
+    }
+
+    py::dict generate_sdqs_stats(std::vector<int32_t> prompt, int max_tokens, int draft_k) {
+        asdsl::UnifiedEngine::AhsdStats stats;
+        std::vector<int32_t> tokens;
+        {
+            py::gil_scoped_release release;
+            tokens = engine_->generate_sdqs(prompt, max_tokens, draft_k, &stats);
+        }
+        py::dict out;
+        out["tokens"] = tokens;
+        out["acceptance_rate"] = stats.acceptance_rate;
+        out["draft_tokens"] = stats.draft_tokens;
+        out["accepted_tokens"] = stats.accepted_tokens;
+        out["speculative_cycles"] = stats.speculative_cycles;
+        out["draft_ms"] = stats.draft_ms;
+        out["verify_ms"] = stats.verify_ms;
+        return out;
+    }
+
+    py::array_t<float> forward_token_draft(int token, int pos) {
+        float* ptr = static_cast<float*>(logits_out_.request().ptr);
+        {
+            py::gil_scoped_release release;
+            engine_->forward_token_draft(token, pos, ptr);
+        }
+        return logits_out_;
+    }
+
+    py::array_t<float> forward_batch_all_logits(std::vector<int32_t> prompt, int start_pos) {
+        const int n = static_cast<int>(prompt.size());
+        py::array_t<float> result(static_cast<py::ssize_t>(n) * engine_->config_.vocab_size);
+        float* ptr = static_cast<float*>(result.request().ptr);
+        {
+            py::gil_scoped_release release;
+            engine_->forward_verify_batch(prompt.data(), n, start_pos, ptr);
+        }
+        return result;
+    }
+
+    py::array_t<float> forward_verify_serial_all_logits(std::vector<int32_t> prompt, int start_pos) {
+        const int n = static_cast<int>(prompt.size());
+        py::array_t<float> result(static_cast<py::ssize_t>(n) * engine_->config_.vocab_size);
+        float* ptr = static_cast<float*>(result.request().ptr);
+        {
+            py::gil_scoped_release release;
+            engine_->forward_verify_serial(prompt.data(), n, start_pos, ptr);
+        }
+        return result;
+    }
+
+    py::array_t<float> forward_verify_batch_raw_all_logits(std::vector<int32_t> prompt, int start_pos) {
+        const int n = static_cast<int>(prompt.size());
+        py::array_t<float> result(static_cast<py::ssize_t>(n) * engine_->config_.vocab_size);
+        float* ptr = static_cast<float*>(result.request().ptr);
+        {
+            py::gil_scoped_release release;
+            if (n <= 1) {
+                engine_->forward_token(prompt[0], start_pos, ptr);
+            } else {
+                engine_->forward_batch(prompt.data(), n, start_pos, ptr, true);
+            }
+        }
+        return result;
+    }
+
+    int get_kv_seq_len() const { return engine_->get_kv_seq_len(); }
+
+    void snapshot_kv() { engine_->snapshot_kv(); }
+
+    void restore_kv() { engine_->restore_kv(); }
+
+    void truncate_kv(int new_len) { engine_->truncate_kv(new_len); }
+
+    void set_skip_mask(py::array_t<bool> mask) {
+        auto req = mask.request();
+        engine_->set_skip_mask(static_cast<const bool*>(req.ptr), static_cast<int>(req.size));
+    }
+
+    void clear_skip_mask() { engine_->clear_skip_mask(); }
+
 };
 
 }
@@ -1718,27 +2662,53 @@ PYBIND11_MODULE(_native_unified, m) {
     py::class_<asdsl::UnifiedEnginePy>(m, "UnifiedEngine")
         .def(py::init<
             asdsl::EngineConfig,
+            py::array,
+            py::array_t<float>,
+            py::object,
             py::array_t<float>,
             py::array_t<float>,
-            py::array_t<float>,
-            py::array_t<float>,
-            py::array_t<float>,
-            py::dict
-        >(), 
+            py::dict,
+            py::object,
+            py::object
+        >(),
         py::arg("config"),
         py::arg("token_embd"),
         py::arg("output_norm"),
         py::arg("output_proj"),
         py::arg("cos_table"),
         py::arg("sin_table"),
-        py::arg("layers_dict"))
+        py::arg("layers_dict"),
+        py::arg("lm_head_preq2_meta") = py::none(),
+        py::arg("lm_head_preq2_quant") = py::none())
+        .def("export_lm_head_preq2", &asdsl::UnifiedEnginePy::export_lm_head_preq2,
+             "Copy lm_head preq2 meta+quant blobs for disk cache.")
         .def("generate", &asdsl::UnifiedEnginePy::generate)
+        .def("generate_with_stops", &asdsl::UnifiedEnginePy::generate_with_stops,
+             py::arg("prompt"), py::arg("max_tokens"), py::arg("stop_tokens"))
         .def("generate_swift", &asdsl::UnifiedEnginePy::generate_swift)
         .def("forward_token", &asdsl::UnifiedEnginePy::forward_token)
+        .def("forward_token_prefill", &asdsl::UnifiedEnginePy::forward_token_prefill,
+             "Forward one token updating KV; skip lm_head (prefill body).")
         .def("forward_token_argmax", &asdsl::UnifiedEnginePy::forward_token_argmax,
              "Single decode step; returns argmax token id (reuses internal logits buffer).")
         .def("forward_token_fp32_lmhead", &asdsl::UnifiedEnginePy::forward_token_fp32_lmhead,
              py::arg("token"), py::arg("pos"), py::arg("lm_head_fp32"))
         .def("forward_batch", &asdsl::UnifiedEnginePy::forward_batch)
+        .def("generate_ahsd", &asdsl::UnifiedEnginePy::generate_ahsd)
+        .def("generate_ahsd_stats", &asdsl::UnifiedEnginePy::generate_ahsd_stats)
+        .def("generate_sdqs", &asdsl::UnifiedEnginePy::generate_sdqs)
+        .def("generate_sdqs_stats", &asdsl::UnifiedEnginePy::generate_sdqs_stats)
+        .def("forward_token_draft", &asdsl::UnifiedEnginePy::forward_token_draft)
+        .def("forward_batch_all_logits", &asdsl::UnifiedEnginePy::forward_batch_all_logits)
+        .def("forward_verify_serial_all_logits", &asdsl::UnifiedEnginePy::forward_verify_serial_all_logits,
+             "Per-token verify oracle (lossless under preq2).")
+        .def("forward_verify_batch_raw_all_logits", &asdsl::UnifiedEnginePy::forward_verify_batch_raw_all_logits,
+             "Batched GEMM verify (may diverge from forward_token when preq2 is on).")
+        .def("get_kv_seq_len", &asdsl::UnifiedEnginePy::get_kv_seq_len)
+        .def("snapshot_kv", &asdsl::UnifiedEnginePy::snapshot_kv)
+        .def("restore_kv", &asdsl::UnifiedEnginePy::restore_kv)
+        .def("truncate_kv", &asdsl::UnifiedEnginePy::truncate_kv)
+        .def("set_skip_mask", &asdsl::UnifiedEnginePy::set_skip_mask)
+        .def("clear_skip_mask", &asdsl::UnifiedEnginePy::clear_skip_mask)
         .def("reset_session", &asdsl::UnifiedEnginePy::reset_session);
 }

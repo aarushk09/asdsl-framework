@@ -15,6 +15,12 @@ __pycache__/
 *.dylib
 *.pyd
 !asdsl/kernels/*.pyi
+*.pyd.bak
+*.bak
+
+# Experimental / stale native build copies (local only)
+asdsl/kernels/_native_engine_new*.pyd
+asdsl/kernels/_native_engine_new2*.pyd
 
 # Distribution / packaging
 .Python
@@ -47,6 +53,7 @@ ENV/
 .vscode/
 .kilo/
 .kilocode/
+.cursor/
 *.swp
 *.swo
 *~
@@ -83,3 +90,8 @@ contextlatest.txt
 # Local benchmark scratch at repo root
 benchmark_*.png
 test_asb.exe
+test_kernel.exe
+
+# Benchmark session scratch (canonical results are dated JSON + doc_run_summary)
+benchmarks/results/*_runner_log*.txt
+benchmarks/results/greedy_trajectory_update.log

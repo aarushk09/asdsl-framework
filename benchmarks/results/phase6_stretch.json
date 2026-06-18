@@ -1,0 +1,89 @@
+{
+  "phase": 6,
+  "timestamp_utc": "2026-06-13T18:14:55.308164+00:00",
+  "invalid_baseline": true,
+  "invalid_baseline_reason": "C0_baseline 2.17 tok/s used cold repack subprocess; use parity_benchmark C0 (~9.88) or C0-fast (~10.42) for fair E2E comparison",
+  "max_new_tokens": 128,
+  "chunk_div_autotuned": 6,
+  "baseline_tok_s": 2.17,
+  "profiles": [
+    {
+      "label": "C0_baseline",
+      "ok": true,
+      "decode_tok_s": 2.17,
+      "wall_s": 200.92,
+      "threads": 12,
+      "env": {},
+      "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+      "tail": ""
+    },
+    {
+      "label": "large_pages",
+      "ok": true,
+      "decode_tok_s": 3.16,
+      "wall_s": 137.49,
+      "threads": 12,
+      "env": {
+        "ASDSL_LARGE_PAGES": "1"
+      },
+      "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+      "tail": "",
+      "delta_pct_vs_baseline": 45.62
+    },
+    {
+      "label": "chunk_div",
+      "ok": true,
+      "decode_tok_s": 8.88,
+      "wall_s": 105.7,
+      "threads": 12,
+      "env": {
+        "ASDSL_GEMV_CHUNK_DIV": "6"
+      },
+      "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+      "tail": "",
+      "delta_pct_vs_baseline": 309.22
+    },
+    {
+      "label": "large_pages+chunk_div",
+      "ok": true,
+      "decode_tok_s": 9.26,
+      "wall_s": 101.43,
+      "threads": 12,
+      "env": {
+        "ASDSL_LARGE_PAGES": "1",
+        "ASDSL_GEMV_CHUNK_DIV": "6"
+      },
+      "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=physical, chunked=1)",
+      "tail": "",
+      "delta_pct_vs_baseline": 326.73
+    },
+    {
+      "label": "smt_16t",
+      "ok": true,
+      "decode_tok_s": 10.5,
+      "wall_s": 102.66,
+      "threads": 16,
+      "env": {
+        "ASDSL_AFFINITY": "smt"
+      },
+      "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=smt, chunked=1)",
+      "tail": "",
+      "delta_pct_vs_baseline": 383.87
+    }
+  ],
+  "winners_ge_1pct": [
+    "large_pages",
+    "chunk_div",
+    "large_pages+chunk_div",
+    "smt_16t"
+  ],
+  "gates": {
+    "target_c0_tok_s": 16.0,
+    "baseline_meets_target": false,
+    "any_flag_ge_1pct": true
+  },
+  "deferred": {
+    "clang_cl_libomp": "WONTFIX v1 — manual A/B; rebuild with clang-cl + libomp if pursuing v2",
+    "lm_head_screening": "WONTFIX v1 — time-boxed spike deferred; see PHASE_WALKTHROUGH Phase 7"
+  }
+}

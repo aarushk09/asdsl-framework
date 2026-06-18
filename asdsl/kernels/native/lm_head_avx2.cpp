@@ -8,6 +8,10 @@
 #include <immintrin.h>
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
+
+#include "engine_flags.hpp"
+#include "thread_pool.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -33,10 +37,7 @@ void lm_head_gemv_f16_impl(
     int M,
     int K
 ) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int m = 0; m < M; ++m) {
+    auto process_row = [&](int m) {
         const uint16_t* row = w_f16 + static_cast<size_t>(m) * K;
         __m256 acc0 = _mm256_setzero_ps();
         __m256 acc1 = _mm256_setzero_ps();
@@ -61,7 +62,25 @@ void lm_head_gemv_f16_impl(
             sum += wf * x[k];
         }
         y[m] = sum;
+    };
+
+#ifdef _OPENMP
+    if (asdsl::persistent_pool_enabled() && asdsl::tl_active_pool != nullptr) {
+        asdsl::ThreadPool& pool = asdsl::ThreadPool::get_instance();
+        const int n_threads = std::max(1, pool.thread_count() + 1);
+        const int grain = std::max(1, (M + n_threads - 1) / n_threads);
+        pool.parallel_for(0, M, grain, [&](int m) { process_row(m); });
+    } else {
+        #pragma omp parallel for schedule(static)
+        for (int m = 0; m < M; ++m) {
+            process_row(m);
+        }
     }
+#else
+    for (int m = 0; m < M; ++m) {
+        process_row(m);
+    }
+#endif
 }
 
 py::array_t<float> py_lm_head_gemv_f16(

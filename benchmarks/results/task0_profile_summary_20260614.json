@@ -1,0 +1,33 @@
+{
+  "date": "2026-06-14",
+  "baseline_reference_gate_up_ms": 39.29,
+  "pool_on": {
+    "flags": {
+      "ASDSL_PERSISTENT_POOL": "1",
+      "ASDSL_CPP_GENERATE": "1"
+    },
+    "gate_up_gemv_ms": 33.3679,
+    "down_gemv_ms": 24.5285,
+    "qkv_gemv_ms": 11.7043,
+    "o_gemv_ms": 9.8046,
+    "lm_head_ms": 12.336,
+    "other_ms": 2.898,
+    "total_ms": 94.9699,
+    "decode_tok_s": 9.20
+  },
+  "pool_off": {
+    "flags": {
+      "ASDSL_PERSISTENT_POOL": "off",
+      "ASDSL_CPP_GENERATE": "off"
+    },
+    "gate_up_gemv_ms": 33.0847,
+    "down_gemv_ms": 17.3957,
+    "qkv_gemv_ms": 10.5172,
+    "o_gemv_ms": 6.3541,
+    "lm_head_ms": 12.446,
+    "other_ms": 32.9805,
+    "total_ms": 113.414,
+    "decode_tok_s": 10.26
+  },
+  "interpretation": "CASE B for gate_up_gemv (pool on ≈ pool off ~33 ms, both below 39.3 baseline). Total ms improved with pool+cpp mainly via other bucket (Python decode overhead eliminated). Proceed to Task 1 per plan."
+}

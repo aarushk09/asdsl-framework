@@ -1,0 +1,209 @@
+{
+  "timestamp_utc": "2026-06-05T22:34:54.820000+00:00",
+  "metric": "logit_cosine_full_vs_single_layer_skip",
+  "threshold": 0.97,
+  "skip_first": 8,
+  "skip_last": 8,
+  "prefix_len": 30,
+  "probe_positions": [
+    27,
+    28,
+    29
+  ],
+  "layers_above_threshold": 29,
+  "middle_band_skip_candidates": 16,
+  "layers": [
+    {
+      "layer": 0,
+      "cosine_sim": 0.886966,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 1,
+      "cosine_sim": 0.999928,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 2,
+      "cosine_sim": 0.999936,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 3,
+      "cosine_sim": 0.999896,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 4,
+      "cosine_sim": 0.999888,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 5,
+      "cosine_sim": 0.999017,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 6,
+      "cosine_sim": 0.999782,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 7,
+      "cosine_sim": 0.999648,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 8,
+      "cosine_sim": 0.999884,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 9,
+      "cosine_sim": 0.999905,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 10,
+      "cosine_sim": 0.999303,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 11,
+      "cosine_sim": 0.999848,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 12,
+      "cosine_sim": 0.999511,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 13,
+      "cosine_sim": 0.999519,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 14,
+      "cosine_sim": 0.999812,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 15,
+      "cosine_sim": 0.999643,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 16,
+      "cosine_sim": 0.999625,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 17,
+      "cosine_sim": 0.9968,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 18,
+      "cosine_sim": 0.999064,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 19,
+      "cosine_sim": 0.999466,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 20,
+      "cosine_sim": 0.986656,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 21,
+      "cosine_sim": 0.994296,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 22,
+      "cosine_sim": 0.999358,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 23,
+      "cosine_sim": 0.998318,
+      "skip_candidate": true,
+      "in_middle_band": true
+    },
+    {
+      "layer": 24,
+      "cosine_sim": 0.997912,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 25,
+      "cosine_sim": 0.984554,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 26,
+      "cosine_sim": 0.996476,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 27,
+      "cosine_sim": 0.994694,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 28,
+      "cosine_sim": 0.998254,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 29,
+      "cosine_sim": 0.987586,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 30,
+      "cosine_sim": 0.487171,
+      "skip_candidate": false,
+      "in_middle_band": false
+    },
+    {
+      "layer": 31,
+      "cosine_sim": 0.619046,
+      "skip_candidate": false,
+      "in_middle_band": false
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "timestamp_utc": "2026-06-11T23:02:02.955164+00:00",
+  "phase": 4,
+  "C0": {
+    "config": "C0",
+    "group_size_body": 32,
+    "lm_head_gs": 32,
+    "body_bytes": 2013265920,
+    "lm_head_bytes": 384122880,
+    "total_bytes": 2397388800,
+    "total_gb": 2.3973888
+  },
+  "C0.1": {
+    "config": "C0.1",
+    "group_size_body": 32,
+    "lm_head_gs": 128,
+    "body_bytes": 1749024768,
+    "lm_head_bytes": 316901376,
+    "total_bytes": 2065926144,
+    "total_gb": 2.065926144,
+    "reduction_vs_c0_pct": 13.83
+  },
+  "target_reduction_pct": 12.0,
+  "gate_reduction_met": true
+}

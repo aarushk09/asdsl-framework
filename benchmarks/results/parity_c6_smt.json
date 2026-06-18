@@ -1,0 +1,56 @@
+{
+  "timestamp_utc": "2026-06-13T22:39:05.516287+00:00",
+  "manifest": "benchmarks\\results\\parity_manifest.json",
+  "threads": 12,
+  "n_runs": 5,
+  "gguf_sha256": "fb8897a6038bb0bf04194d111a07a79f58e54f7e5d781b712140b73a5ff056cc",
+  "native_extensions": {
+    "ok": true,
+    "asdsl.kernels._native_unified": true,
+    "asdsl.kernels._native_gemv": true
+  },
+  "session_asdsl": {
+    "thermal": {
+      "initial_sleep_s": 60,
+      "max_temp_c": 65,
+      "temp_c": null,
+      "throttled": false,
+      "waited_s": 0,
+      "baseline_dot_ms": 7.3998000007122755,
+      "proceeded": true
+    },
+    "configs": {
+      "C6-smt": {
+        "decode_2_N": {
+          "runs": [
+            9.99,
+            8.69,
+            10.72,
+            9.92,
+            10.63
+          ],
+          "mean": 9.99,
+          "std": 0.726,
+          "min": 8.69,
+          "max": 10.72
+        },
+        "full_1_N": {
+          "runs": [
+            9.99,
+            8.69,
+            10.72,
+            9.92,
+            10.63
+          ],
+          "mean": 9.99,
+          "std": 0.726,
+          "min": 8.69,
+          "max": 10.72
+        },
+        "high_variance_warning": [
+          "ASDSL std 0.726 > 0.2"
+        ]
+      }
+    }
+  }
+}

@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -121,6 +123,83 @@ inline void configure_openmp_for_pcores() {
 
 inline int detected_pcore_count() {
     return static_cast<int>(get_pcore_masks().size());
+}
+
+/** One affinity mask per physical core (lowest logical bit per core package). */
+inline std::vector<DWORD_PTR> detect_physical_core_masks() {
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) {
+        return {};
+    }
+
+    std::vector<uint8_t> buf(len);
+    auto* base = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) {
+        return {};
+    }
+
+    std::vector<std::pair<uint8_t, DWORD_PTR>> cores;
+    uint8_t* ptr = buf.data();
+    uint8_t* end = buf.data() + len;
+    while (ptr < end) {
+        auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(ptr);
+        if (info->Relationship == RelationProcessorCore && info->Processor.GroupCount > 0) {
+            const GROUP_AFFINITY& ga = info->Processor.GroupMask[0];
+            if (ga.Group == 0 && ga.Mask != 0) {
+                cores.push_back({info->Processor.EfficiencyClass,
+                                 lowest_set_bit_mask(ga.Mask)});
+            }
+        }
+        ptr += info->Size;
+    }
+
+    // P-cores (higher EfficiencyClass) first, then E-cores — matches plan thread order.
+    std::sort(cores.begin(), cores.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.first != b.first) {
+                      return a.first > b.first;
+                  }
+                  return a.second < b.second;
+              });
+
+    std::vector<DWORD_PTR> masks;
+    masks.reserve(cores.size());
+    for (const auto& c : cores) {
+        if (c.second != 0) {
+            masks.push_back(c.second);
+        }
+    }
+    return masks;
+}
+
+inline const std::vector<DWORD_PTR>& get_physical_core_masks() {
+    static std::vector<DWORD_PTR> masks = detect_physical_core_masks();
+    return masks;
+}
+
+inline void bind_omp_thread_to_physical_core(int thread_index) {
+    const auto& masks = get_physical_core_masks();
+    if (masks.empty()) {
+        return;
+    }
+    const size_t idx = static_cast<size_t>(thread_index) % masks.size();
+    const DWORD_PTR mask = masks[idx];
+    if (mask != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+    }
+}
+
+inline void bind_omp_thread_physical_if_enabled() {
+    static int mode = -1;
+    if (mode < 0) {
+        const char* v = std::getenv("ASDSL_AFFINITY");
+        mode = (v && (v[0] == 'p' || v[0] == 'P')) ? 1 : 0;
+    }
+    if (!mode) {
+        return;
+    }
+    bind_omp_thread_to_physical_core(omp_get_thread_num());
 }
 
 }  // namespace asdsl_omp_pinning

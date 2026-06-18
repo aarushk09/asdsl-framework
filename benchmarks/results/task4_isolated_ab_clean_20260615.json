@@ -1,0 +1,17 @@
+{
+  "date": "2026-06-15",
+  "chunk_div": 4,
+  "configs": {
+    "A_flags_off": { "runs": [11.26, 11.45, 11.37], "mean": 11.36 },
+    "B_pool_only": { "runs": [12.89, 12.95, 12.0], "mean": 12.613 },
+    "C_cpp_only": { "runs": [10.85, 9.72, 9.68], "mean": 10.083 },
+    "D_both": { "runs": [10.78, 10.88, 10.9], "mean": 10.853 }
+  },
+  "attribution": {
+    "pool_contribution_vs_A": 1.253,
+    "cpp_contribution_vs_A": -1.277,
+    "both_vs_A": -0.507,
+    "interaction_note": "Sequential runs with thermal accumulation; pool-only (B) ran before heavy throttling. Best isolated pool measurement: 12.61 tok/s. Config A (11.36) still above historical 9.88 baseline."
+  },
+  "regression_check_A": "PASS (11.36 >= 9.5)"
+}

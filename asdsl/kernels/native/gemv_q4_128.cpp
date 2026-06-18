@@ -10,6 +10,15 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <algorithm>
+
+#include "engine_flags.hpp"
+#include "gemv_chunked.hpp"
+#include "thread_pool.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #ifdef _MSC_VER
 #  include <intrin.h>
 #  define ASDSL_FORCEINLINE __forceinline
@@ -139,8 +148,7 @@ void gemv_q4_128_preq_avx2(
 
     // ── Main 8-row parallel loop ─────────────────────────────────────────────
     const int n8 = out_features / 8;
-    #pragma omp parallel for schedule(static)
-    for (int r8 = 0; r8 < n8; r8++) {
+    auto process_r8 = [&](int r8) {
         const int r0 = r8 * 8;
         const uint8_t* rb0 = blocks + static_cast<size_t>(r0    ) * row_stride;
         const uint8_t* rb1 = blocks + static_cast<size_t>(r0 + 1) * row_stride;
@@ -217,7 +225,32 @@ void gemv_q4_128_preq_avx2(
         y[r0+5] = hsum256_q4128(acc5) - c5;
         y[r0+6] = hsum256_q4128(acc6) - c6;
         y[r0+7] = hsum256_q4128(acc7) - c7;
+    };
+
+#ifdef _OPENMP
+    if (asdsl::persistent_pool_enabled() && asdsl::tl_active_pool != nullptr) {
+        asdsl::ThreadPool& pool = asdsl::ThreadPool::get_instance();
+        const int n_threads = std::max(1, pool.thread_count() + 1);
+        const int chunk_size = asdsl_chunked::compute_chunk_size(n8, 1, n_threads);
+        const int n_chunks = (n8 + chunk_size - 1) / chunk_size;
+        pool.parallel_for(0, n_chunks, 1, [&](int chunk) {
+            const int r8_begin = chunk * chunk_size;
+            const int r8_end = std::min(r8_begin + chunk_size, n8);
+            for (int r8 = r8_begin; r8 < r8_end; ++r8) {
+                process_r8(r8);
+            }
+        });
+    } else {
+        #pragma omp parallel for schedule(static)
+        for (int r8 = 0; r8 < n8; r8++) {
+            process_r8(r8);
+        }
     }
+#else
+    for (int r8 = 0; r8 < n8; r8++) {
+        process_r8(r8);
+    }
+#endif
 
     // Tail rows
     for (int row = n8 * 8; row < out_features; row++) one_row(row);

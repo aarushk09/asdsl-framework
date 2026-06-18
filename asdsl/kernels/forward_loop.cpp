@@ -1334,6 +1334,89 @@ static py::dict stream_triad_f32_py(int array_mb, int runs, int warmup_runs) {
     return out;
 }
 
+
+
+/** Dual-buffer STREAM Triad: two independent float arrays in parallel OpenMP sections. */
+static py::dict stream_triad_dual_f32_py(int size_a_mb, int size_b_mb, int runs, int warmup_runs) {
+    if (size_a_mb < 256 || size_b_mb < 256) {
+        throw std::runtime_error("size_a_mb and size_b_mb must be >= 256 to exceed CPU caches");
+    }
+    if (runs < 1 || warmup_runs < 0) {
+        throw std::runtime_error("runs >= 1 and warmup_runs >= 0 required");
+    }
+
+    const size_t na = (static_cast<size_t>(size_a_mb) * 1024ull * 1024ull) / sizeof(float);
+    const size_t nb = (static_cast<size_t>(size_b_mb) * 1024ull * 1024ull) / sizeof(float);
+    if (na == 0 || nb == 0) {
+        throw std::runtime_error("buffer sizes too small for float32");
+    }
+
+    std::vector<float> a_a(na), b_a(na), c_a(na);
+    std::vector<float> a_b(nb), b_b(nb), c_b(nb);
+    const float scalar = 3.0f;
+    asdsl_omp_pinning::configure_openmp_for_pcores();
+
+    auto run_dual = [&]() {
+#pragma omp parallel sections
+        {
+#pragma omp section
+            {
+#pragma omp parallel
+                {
+                    asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
+#pragma omp for schedule(static)
+                    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(na); ++i) {
+                        a_a[static_cast<size_t>(i)] =
+                            b_a[static_cast<size_t>(i)] + scalar * c_a[static_cast<size_t>(i)];
+                    }
+                }
+            }
+#pragma omp section
+            {
+#pragma omp parallel
+                {
+                    asdsl_omp_pinning::bind_omp_thread_to_pcore_if_enabled();
+#pragma omp for schedule(static)
+                    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(nb); ++i) {
+                        a_b[static_cast<size_t>(i)] =
+                            b_b[static_cast<size_t>(i)] + scalar * c_b[static_cast<size_t>(i)];
+                    }
+                }
+            }
+        }
+    };
+
+    for (int w = 0; w < warmup_runs; ++w) {
+        run_dual();
+    }
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < runs; ++r) {
+        run_dual();
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+    if (elapsed <= 0.0) {
+        throw std::runtime_error("dual STREAM timing produced non-positive elapsed time");
+    }
+
+    const double bytes_a = static_cast<double>(na) * static_cast<double>(sizeof(float));
+    const double bytes_b = static_cast<double>(nb) * static_cast<double>(sizeof(float));
+    const double bandwidth_gb_s = (3.0 * (bytes_a + bytes_b) * static_cast<double>(runs)) / elapsed / 1e9;
+
+    py::dict out;
+    out["bandwidth_gb_s"] = bandwidth_gb_s;
+    out["elapsed_sec"] = elapsed;
+    out["runs"] = runs;
+    out["warmup_runs"] = warmup_runs;
+    out["array_a_bytes"] = static_cast<int64_t>(bytes_a);
+    out["array_b_bytes"] = static_cast<int64_t>(bytes_b);
+    out["dtype"] = "float32";
+    out["omp_max_threads"] = omp_get_max_threads();
+    return out;
+}
+
+
 /** Multi-threaded STREAM Triad on int8 arrays (a = b + scalar * c) for DRAM bandwidth probing. */
 static py::dict stream_triad_int8_py(int array_mb, int runs, int warmup_runs) {
     if (array_mb < 256) {
@@ -1456,6 +1539,11 @@ PYBIND11_MODULE(_native_forward, m) {
         py::arg("runs"),
         py::arg("warmup_runs") = 2,
         "OpenMP-parallel STREAM Triad on float32 arrays (vectorized; preferred DRAM roofline probe).");
+    m.def(
+        "stream_triad_dual_f32",
+        &stream_triad_dual_f32_py,
+        py::arg("size_a_mb"), py::arg("size_b_mb"), py::arg("runs") = 3, py::arg("warmup_runs") = 1,
+        "Dual float32 STREAM triad with OpenMP parallel sections");
     m.def(
         "stream_triad_int8",
         &stream_triad_int8_py,

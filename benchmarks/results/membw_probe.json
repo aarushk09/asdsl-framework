@@ -1,0 +1,23 @@
+{
+  "timestamp_utc": "2026-06-10T23:22:49.360099+00:00",
+  "array_mb": 2048,
+  "placements": {
+    "4P_only": {
+      "threads": 4,
+      "bandwidth_gb_s": 124.84
+    },
+    "8E_only": {
+      "threads": 8,
+      "bandwidth_gb_s": 118.98
+    },
+    "4P_plus_8E": {
+      "threads": 12,
+      "bandwidth_gb_s": 122.95
+    },
+    "16_logical": {
+      "threads": 16,
+      "bandwidth_gb_s": 166.43
+    }
+  },
+  "bw_ceiling_gb_s": 166.43
+}

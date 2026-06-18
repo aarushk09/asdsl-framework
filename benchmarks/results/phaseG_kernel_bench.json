@@ -1,0 +1,121 @@
+{
+  "phase": "G",
+  "threads": 12,
+  "env": {
+    "ASDSL_GEMV_UNROLL": "4",
+    "ASDSL_PREQ_PREFETCH_GROUPS": "8",
+    "ASDSL_PREQ2": "1",
+    "ASDSL_AFFINITY": "physical",
+    "ASDSL_CHUNKED_GEMV": "1"
+  },
+  "projections": {
+    "gate_up": {
+      "shape": {
+        "out_features": 16384,
+        "in_features": 3072,
+        "group_size": 32
+      },
+      "bytes_per_call": 31538560,
+      "kernels": {
+        "gemv_q4_32_preq_4row_avx2": {
+          "ms": 36.367,
+          "gb_s": 0.87
+        },
+        "gemv_q4_32_preq_8row_avx2": {
+          "ms": 34.558,
+          "gb_s": 0.91
+        },
+        "gemv_q4_32_preq_fused_avx2": {
+          "ms": 36.359,
+          "gb_s": 0.87
+        },
+        "gemv_preq2_fused_avx2": {
+          "ms": 1.912,
+          "gb_s": 16.5
+        }
+      },
+      "speedup_vs_4row": 1.0
+    },
+    "down_proj": {
+      "shape": {
+        "out_features": 3072,
+        "in_features": 8192,
+        "group_size": 32
+      },
+      "bytes_per_call": 15782912,
+      "kernels": {
+        "gemv_q4_32_preq_4row_avx2": {
+          "ms": 18.222,
+          "gb_s": 0.87
+        },
+        "gemv_q4_32_preq_8row_avx2": {
+          "ms": 17.471,
+          "gb_s": 0.9
+        },
+        "gemv_q4_32_preq_fused_avx2": {
+          "ms": 18.286,
+          "gb_s": 0.86
+        },
+        "gemv_preq2_fused_avx2": {
+          "ms": 1.362,
+          "gb_s": 11.59
+        }
+      },
+      "speedup_vs_4row": 0.997
+    },
+    "o_proj": {
+      "shape": {
+        "out_features": 3072,
+        "in_features": 3072,
+        "group_size": 32
+      },
+      "bytes_per_call": 5926272,
+      "kernels": {
+        "gemv_q4_32_preq_4row_avx2": {
+          "ms": 6.786,
+          "gb_s": 0.87
+        },
+        "gemv_q4_32_preq_8row_avx2": {
+          "ms": 6.535,
+          "gb_s": 0.91
+        },
+        "gemv_q4_32_preq_fused_avx2": {
+          "ms": 6.787,
+          "gb_s": 0.87
+        },
+        "gemv_preq2_fused_avx2": {
+          "ms": 0.666,
+          "gb_s": 8.89
+        }
+      },
+      "speedup_vs_4row": 1.0
+    },
+    "lm_head": {
+      "shape": {
+        "out_features": 200064,
+        "in_features": 3072,
+        "group_size": 32
+      },
+      "bytes_per_call": 384938880,
+      "kernels": {
+        "gemv_q4_32_preq_4row_avx2": {
+          "ms": 456.259,
+          "gb_s": 0.84
+        },
+        "gemv_q4_32_preq_8row_avx2": {
+          "ms": 437.786,
+          "gb_s": 0.88
+        },
+        "gemv_q4_32_preq_fused_avx2": {
+          "ms": 453.702,
+          "gb_s": 0.85
+        },
+        "gemv_preq2_fused_avx2": {
+          "ms": 15.818,
+          "gb_s": 24.34
+        }
+      },
+      "speedup_vs_4row": 1.006
+    }
+  }
+}

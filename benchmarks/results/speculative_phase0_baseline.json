@@ -1,0 +1,37 @@
+{
+  "timestamp_utc": "2026-06-05T18:00:00+00:00",
+  "phase": "0",
+  "prompt": "The",
+  "max_new_tokens": 64,
+  "threads": 12,
+  "note": "Instrumentation landed; full E2E profiles require phi4_cpu_run subprocess runs",
+  "unit_validation": {
+    "test_unified_kv_snapshot": "pass",
+    "test_unified_kv_truncate": "pass",
+    "test_skip_mask_forward": "pass",
+    "test_swift_kv_correctness": "pass",
+    "test_ahsd_lossless": "pass (5 prompts x fast_decode_tokens)",
+    "test_speculative.py": "pass",
+    "benchmarks/test_q2_correctness.py": "pass (unpacked + packed smoke)"
+  },
+  "profiles": {
+    "C0_AR": {
+      "status": "pending",
+      "command": "python benchmarks/speculative_baseline.py --phase 0 --no-ahsd"
+    },
+    "QCSD": {
+      "status": "pending",
+      "command": "python experiments/phi4_cpu_run.py --qcsd --draft-k 3",
+      "note": "Python path; lossless test implemented but slow (>10 min/prompt)"
+    },
+    "SWIFT_CPP": {
+      "status": "validated",
+      "note": "test_swift_kv_correctness.py passes vs greedy AR"
+    },
+    "AHSD": {
+      "status": "validated",
+      "note": "test_ahsd_lossless.py passes vs greedy AR"
+    }
+  },
+  "telemetry_format": "acceptance_rate=X draft_tokens=N verify_ms=X draft_ms=X speculative_cycles=N"
+}

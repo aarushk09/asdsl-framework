@@ -1,0 +1,42 @@
+{
+  "session": "2026-06-15-doc-run",
+  "description": "Unified documentation benchmark session (user idle run)",
+  "parity_5run": {
+    "C0_phase8": {
+      "mean_tok_s": 11.014,
+      "runs": [11.11, 10.92, 11.1, 10.92, 11.02],
+      "artifact": "doc_run_parity_C0_20260615.json"
+    },
+    "C03_phase8": {
+      "mean_tok_s": 15.694,
+      "runs": [15.98, 15.48, 15.8, 15.92, 15.29],
+      "artifact": "doc_run_parity_C03_20260615.json"
+    }
+  },
+  "side_by_side": {
+    "C0_phase8": {
+      "asdsl_grand_mean": 9.713,
+      "llama_grand_mean": 14.789,
+      "pct_of_llama": 65.7,
+      "artifact": "side_by_side_C0_phase8_20260615.json",
+      "log": "side_by_side_C0_phase8_log_20260615.txt"
+    },
+    "C03_phase8": {
+      "asdsl_grand_mean": 13.641,
+      "llama_grand_mean": 14.7,
+      "pct_of_llama": 92.8,
+      "artifact": "side_by_side_C03_phase8_20260615.json",
+      "log": "side_by_side_C03_phase8_log_20260615.txt",
+      "wikitext_ppl_asdsl": 80.55,
+      "wikitext_ppl_llama": null
+    }
+  },
+  "ppl_sliding_window": {
+    "C0": { "perplexity": 2.73, "note": "valid run from prior session; doc_run post-side-by-side C0 PPL was garbage (thermal)" },
+    "C03": { "perplexity": 3.56, "ratio_vs_C0": 1.304, "artifact": "doc_ppl_C03_20260615.txt" }
+  },
+  "correctness": {
+    "preq2": "3/3 pass",
+    "generate_stream_prefill": "1/1 pass"
+  }
+}

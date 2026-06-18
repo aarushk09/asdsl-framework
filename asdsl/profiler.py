@@ -28,6 +28,25 @@ class StreamTriadResult:
     pin_openmp_pcores: bool | None = None
 
 
+@dataclass(frozen=True)
+class DualStreamTriadResult:
+    """Concurrent dual-array STREAM triad (Q4 + Q2 draft footprint probe)."""
+
+    bandwidth_a_gb_s: float
+    bandwidth_b_gb_s: float
+    combined_bandwidth_gb_s: float
+    retention_a_pct: float
+    retention_b_pct: float
+    elapsed_sec: float
+    runs: int
+    warmup_runs: int
+    array_a_bytes: int
+    array_b_bytes: int
+    single_stream_a_gb_s: float
+    single_stream_b_gb_s: float
+    implementation: str = "native_openmp"
+
+
 @dataclass
 class HardwareProfile:
     memory_bandwidth_gbps: float
@@ -201,6 +220,77 @@ def measure_stream_triad_bandwidth(
         array_bytes=array_bytes,
         dtype="float32",
         implementation=impl,
+    )
+
+
+def measure_dual_stream_bandwidth(
+    size_a_mb: int = 2400,
+    size_b_mb: int = 750,
+    runs: int = 8,
+    warmup_runs: int = 2,
+) -> DualStreamTriadResult:
+    """Measure concurrent DRAM bandwidth on two independent float32 arrays.
+
+    Calls ``stream_triad_dual_f32`` in ``_native_forward`` when built; raises
+    ``RuntimeError`` if the symbol is missing.
+    """
+    if size_a_mb < 64 or size_b_mb < 64:
+        raise ValueError("size_a_mb and size_b_mb must be >= 64")
+    if runs < 1:
+        raise ValueError("runs must be >= 1")
+    if warmup_runs < 0:
+        raise ValueError("warmup_runs must be >= 0")
+
+    try:
+        from asdsl.kernels import _native_forward as native_forward
+    except ImportError as exc:
+        raise RuntimeError(
+            "asdsl.kernels._native_forward is not importable; rebuild native extensions"
+        ) from exc
+
+    if not hasattr(native_forward, "stream_triad_dual_f32"):
+        raise RuntimeError(
+            "_native_forward was built without stream_triad_dual_f32; "
+            "rebuild: python setup.py build_ext --inplace"
+        )
+
+    raw = native_forward.stream_triad_dual_f32(
+        int(size_a_mb), int(size_b_mb), int(runs), int(warmup_runs)
+    )
+    combined = float(raw["bandwidth_gb_s"])
+    elapsed = float(raw["elapsed_sec"])
+    runs_i = int(raw["runs"])
+    array_a_bytes = int(raw["array_a_bytes"])
+    array_b_bytes = int(raw["array_b_bytes"])
+
+    single_a = measure_stream_triad_bandwidth(
+        array_mb=min(size_a_mb, 512), runs=runs_i, warmup_runs=warmup_runs
+    )
+    single_b = measure_stream_triad_bandwidth(
+        array_mb=min(size_b_mb, 512), runs=runs_i, warmup_runs=warmup_runs
+    )
+    # Per-stream effective bandwidth from combined elapsed (parallel sections).
+    bytes_a = 3.0 * array_a_bytes * runs_i
+    bytes_b = 3.0 * array_b_bytes * runs_i
+    bw_a = bytes_a / elapsed / 1e9 if elapsed > 0 else 0.0
+    bw_b = bytes_b / elapsed / 1e9 if elapsed > 0 else 0.0
+    ret_a = 100.0 * bw_a / max(single_a.bandwidth_gb_s, 1e-6)
+    ret_b = 100.0 * bw_b / max(single_b.bandwidth_gb_s, 1e-6)
+
+    return DualStreamTriadResult(
+        bandwidth_a_gb_s=float(bw_a),
+        bandwidth_b_gb_s=float(bw_b),
+        combined_bandwidth_gb_s=float(combined),
+        retention_a_pct=float(ret_a),
+        retention_b_pct=float(ret_b),
+        elapsed_sec=elapsed,
+        runs=runs_i,
+        warmup_runs=int(raw["warmup_runs"]),
+        array_a_bytes=array_a_bytes,
+        array_b_bytes=array_b_bytes,
+        single_stream_a_gb_s=float(single_a.bandwidth_gb_s),
+        single_stream_b_gb_s=float(single_b.bandwidth_gb_s),
+        implementation="native_openmp",
     )
 
 

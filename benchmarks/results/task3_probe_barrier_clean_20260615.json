@@ -1,0 +1,11 @@
+{
+  "date": "2026-06-15",
+  "experiments": {
+    "A_OMP_WAIT_POLICY_ACTIVE": { "runs": [12.53, 12.19, 12.45], "mean": 12.39 },
+    "B_VCOMP_DISABLE_IDLE_plus_ACTIVE": { "runs": [11.96, 12.5, 10.99], "mean": 11.817 },
+    "C_baseline": { "runs": [12.44, 12.55, 12.67], "mean": 12.553 }
+  },
+  "winner": "C_baseline",
+  "probe_env_adopted": false,
+  "note": "No experiment beat baseline by >=0.3 tok/s; OMP_WAIT_POLICY not added to standard env"
+}

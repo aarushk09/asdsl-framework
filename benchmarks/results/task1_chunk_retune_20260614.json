@@ -1,0 +1,24 @@
+{
+  "date": "2026-06-15",
+  "autotune_microbench_best_div": 3,
+  "autotune_microbench_best_gb_s": 26.37,
+  "e2e_parity_with_pool_cpp": {
+    "div_4": {
+      "runs": [12.26, 11.8, 12.11],
+      "mean_tok_s": 12.057,
+      "std": 0.195
+    },
+    "div_6": {
+      "runs": [10.44, 10.96, 13.93],
+      "mean_tok_s": 11.777,
+      "std": 1.52
+    },
+    "div_3": {
+      "runs": [11.84, 10.06, 9.73],
+      "mean_tok_s": 10.543,
+      "std": 0.927
+    }
+  },
+  "selected_div_for_session": 4,
+  "note": "E2E winner div=4 despite microbench winner div=3; high thermal variance on div=6 run 3 spike to 13.93"
+}

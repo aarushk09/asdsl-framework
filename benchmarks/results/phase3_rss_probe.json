@@ -1,0 +1,18 @@
+{
+  "timestamp_utc": "2026-06-13T23:24:18.183729+00:00",
+  "phase": 3,
+  "env": {
+    "ASDSL_AFFINITY": "physical",
+    "ASDSL_CHUNKED_GEMV": "1",
+    "ASDSL_PREQ2": "1",
+    "OMP_NUM_THREADS": "12"
+  },
+  "rss_mb": {
+    "before_load": 401.17578125,
+    "after_engine_init": 5425.75390625,
+    "after_32_decode_tokens": 5430.00390625
+  },
+  "engine_init_s": 127.39481570001226,
+  "gate_rss_le_3gb": false,
+  "gate_init_le_5s": false
+}

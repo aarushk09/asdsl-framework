@@ -29,6 +29,7 @@
 #include <pybind11/numpy.h>
 
 #include "gemv_q4_kernel.h"
+#include "omp_pcore_pinning.hpp"
 
 #include <immintrin.h>
 #include <cstdint>
@@ -856,7 +857,7 @@ static bool check_avx512_support() {
 #endif
 }
 
-static bool check_vnni_support() {
+static bool check_avx512_vnni_support() {
 #if defined(_MSC_VER)
     int info[4];
     __cpuidex(info, 7, 0);
@@ -870,6 +871,27 @@ static bool check_vnni_support() {
 #else
     return false;
 #endif
+}
+
+/** AVX-VNNI (VEX VPDPBUSD): CPUID leaf 7 subleaf 1, EAX bit 4. */
+static bool check_avx_vnni_support() {
+#if defined(_MSC_VER)
+    int info[4];
+    __cpuidex(info, 7, 1);
+    return (info[0] & (1 << 4)) != 0;
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int eax, ebx, ecx, edx;
+    if (__get_cpuid_count(7, 1, &eax, &ebx, &ecx, &edx)) {
+        return (eax & (1 << 4)) != 0;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+static bool check_vnni_support() {
+    return check_avx_vnni_support() || check_avx512_vnni_support();
 }
 
 /* ===================================================================
@@ -1380,6 +1402,23 @@ Modifies Y_batch in-place (adds to it — caller should zero before calling).
     ASDSL_DEF_PREQ_FP32("gemv_q4_32_preq_g4fused_4row_avx2", gemv_q4_32_preq_g4fused_4row_avx2);
 #undef ASDSL_DEF_PREQ_FP32
 
+    m.def("gemv_preq2_fused_avx2",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> meta,
+           py::array_t<uint8_t, py::array::c_style | py::array::forcecast> quant,
+           py::array_t<float, py::array::c_style | py::array::forcecast> x,
+           py::array_t<float, py::array::c_style | py::array::forcecast> y,
+           int out_features, int in_features, int group_size) {
+            py::gil_scoped_release release;
+            gemv_preq2_fused_avx2(
+                static_cast<const uint8_t*>(meta.request().ptr),
+                static_cast<const uint8_t*>(quant.request().ptr),
+                static_cast<const float*>(x.request().ptr),
+                static_cast<float*>(y.request().ptr),
+                out_features, in_features, group_size);
+        },
+        py::arg("meta"), py::arg("quant"), py::arg("x_fp32"), py::arg("y"),
+        py::arg("out_features"), py::arg("in_features"), py::arg("group_size") = 32);
+
     m.def("gemv_q4_128_preq_avx2",
         [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> blocks,
            py::array_t<int8_t, py::array::c_style | py::array::forcecast> x_q8,
@@ -1403,6 +1442,16 @@ Modifies Y_batch in-place (adds to it — caller should zero before calling).
     m.def("get_q8_call_count", []() { return q8_call_count.load(std::memory_order_relaxed); },
         "Return the number of times gemv_q4_q8_avx2 has been called.");
 
+    m.def("get_preq_classic_accum_calls",
+        []() { return asdsl_preq::preq_classic_accum_call_count(); },
+        "Preq classic single-group accumulate calls since last reset.");
+    m.def("get_preq_xloaded_accum_calls",
+        []() { return asdsl_preq::preq_xloaded_accum_call_count(); },
+        "Preq xloaded single-group accumulate calls since last reset.");
+    m.def("reset_preq_accum_call_counts",
+        []() { asdsl_preq::preq_reset_accum_call_counts(); },
+        "Reset preq accumulate path diagnostic counters.");
+
     m.def("check_fma", &check_fma_support,
         "Runtime check: does this CPU support FMA3?");
 
@@ -1410,7 +1459,37 @@ Modifies Y_batch in-place (adds to it — caller should zero before calling).
         "Runtime check: does this CPU support AVX-512F?");
 
     m.def("check_vnni", &check_vnni_support,
-        "Runtime check: does this CPU support AVX-512 VNNI?");
+        "Runtime check: AVX-VNNI or AVX-512 VNNI available.");
+
+    m.def("check_avx_vnni", &check_avx_vnni_support,
+        "Runtime check: AVX-VNNI (VEX VPDPBUSD) on this CPU.");
+
+    m.def("check_avx512_vnni", &check_avx512_vnni_support,
+        "Runtime check: AVX-512 VNNI on this CPU.");
+
+    m.def("get_cpu_topology", []() {
+        py::dict d;
+#ifdef _WIN32
+        const auto& masks = asdsl_omp_pinning::get_physical_core_masks();
+        py::list ids;
+        for (DWORD_PTR m : masks) {
+            unsigned long idx = 0;
+            if (_BitScanForward64(&idx, static_cast<DWORD64>(m))) {
+                ids.append(static_cast<int>(idx));
+            }
+        }
+        d["physical_logical_ids"] = ids;
+        d["physical_core_count"] = static_cast<int>(masks.size());
+        d["pcore_count"] = asdsl_omp_pinning::detected_pcore_count();
+#else
+        d["physical_logical_ids"] = py::list();
+        d["physical_core_count"] = 0;
+        d["pcore_count"] = 0;
+#endif
+        d["avx_vnni"] = check_avx_vnni_support();
+        d["avx512_vnni"] = check_avx512_vnni_support();
+        return d;
+    }, "CPU topology: one logical ID per physical core (Windows).");
 
 #ifdef _OPENMP
     m.def("get_num_threads", []() { return asdsl::ThreadPool::get_instance().thread_count(); },

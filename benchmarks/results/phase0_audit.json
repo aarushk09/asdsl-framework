@@ -1,0 +1,65 @@
+{
+  "timestamp_utc": "2026-06-11T19:52:20.319874+00:00",
+  "phase": 0,
+  "cpu_topology": {
+    "physical_logical_ids": [
+      0,
+      2,
+      4,
+      6,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "physical_core_count": 12,
+    "pcore_count": 8,
+    "avx_vnni": true,
+    "avx512_vnni": false
+  },
+  "avx2": true,
+  "fma": true,
+  "avx_vnni": true,
+  "vnni_any": true,
+  "stream_triad_gb_s": 32.691653296858455,
+  "stream_triad_impl": "native_openmp",
+  "bytes_per_token": {
+    "weight_bytes": 2410000000,
+    "kv_bytes": 8388608,
+    "total_bytes": 2418388608,
+    "total_gb": 2.418388608
+  },
+  "bytes_per_token_estimated_gb": {
+    "body_preq": 2.01,
+    "lm_head_q4_32": 0.3841,
+    "total": 2.3941
+  },
+  "membw_probe": {
+    "timestamp_utc": "2026-06-10T23:22:49.360099+00:00",
+    "array_mb": 2048,
+    "placements": {
+      "4P_only": {
+        "threads": 4,
+        "bandwidth_gb_s": 124.84
+      },
+      "8E_only": {
+        "threads": 8,
+        "bandwidth_gb_s": 118.98
+      },
+      "4P_plus_8E": {
+        "threads": 12,
+        "bandwidth_gb_s": 122.95
+      },
+      "16_logical": {
+        "threads": 16,
+        "bandwidth_gb_s": 166.43
+      }
+    },
+    "bw_ceiling_gb_s": 166.43
+  },
+  "bw_ceiling_gb_s": 166.43
+}

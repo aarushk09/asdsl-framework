@@ -1,0 +1,187 @@
+PS C:\Users\aarus\projects\asdsl-framework> $env:PYTHONPATH = "c:\Users\aarus\projects\asdsl-framework" ; python benchmarks/compare_llama_cpp.py --runs 5 --max-new-tokens 100 --cooldown 30 --with-ppl
+
+========================================================================
+FAIRNESS PROTOCOL
+========================================================================
+  ASDSL config     : C0
+  ASDSL threads    : 12 (OMP/MKL/OpenBLAS synced)
+  llama.cpp threads: 12 (-t and llama-bench -p)
+  Same GGUF weights: False
+  GGUF path        : C:\Users\aarus\projects\asdsl-framework\models\llama_cpp\phi4-mm-Q4_K_M.gguf
+  • threads: ASDSL and llama both use 12
+  • decode: greedy, temperature=0, ignore-eos on both stacks
+  • metric: ASDSL decode_2_N (tokens 2-N) vs llama cli footer (all tokens)
+  • weight_caveat: C0 uses HF asymmetric preq; llama uses Q4_K_M GGUF — speed comparison is canonical stacks, not identical bytes. Use --weight-parity for same tensors.
+========================================================================
+
+=== ASDSL session (C0, 12 threads) ===
+Thermal guard: initial sleep 60s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+
+=== ASDSL prompt: gravity ===
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 1/5
+    decode_2_N=9.58 full_1_N=9.58
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 2/5
+    decode_2_N=8.37 full_1_N=8.37
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 3/5
+    decode_2_N=9.29 full_1_N=9.29
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 4/5
+    decode_2_N=10.04 full_1_N=10.04
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 5/5
+    decode_2_N=10.35 full_1_N=10.35
+
+=== ASDSL prompt: quantization_typos ===
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 1/5
+    decode_2_N=10.14 full_1_N=10.14
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 2/5
+    decode_2_N=10.18 full_1_N=10.18
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 3/5
+    decode_2_N=10.14 full_1_N=10.14
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 4/5
+    decode_2_N=10.06 full_1_N=10.06
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 5/5
+    decode_2_N=10.29 full_1_N=10.29
+
+=== ASDSL prompt: gravity_one_sentence ===
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 1/5
+    decode_2_N=10.16 full_1_N=10.16
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 2/5
+    decode_2_N=10.24 full_1_N=10.24
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 3/5
+    decode_2_N=10.24 full_1_N=10.24
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 4/5
+    decode_2_N=10.12 full_1_N=10.12
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 5/5
+    decode_2_N=10.03 full_1_N=10.03
+
+=== llama.cpp session (12 threads) ===
+
+=== Idle 120s before llama session ===
+Thermal guard: initial sleep 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+
+=== llama.cpp prompt: gravity ===
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 1/5
+    footer=15.4 threads=12
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 2/5
+    footer=15.2 threads=12
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 3/5
+    footer=14.8 threads=12
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 4/5
+    footer=12.9 threads=12
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 5/5
+    footer=15.3 threads=12
+
+=== llama.cpp prompt: quantization_typos ===
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 1/5
+    footer=14.6 threads=12
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 2/5
+    footer=15.0 threads=12
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 3/5
+    footer=14.1 threads=12
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 4/5
+    footer=15.0 threads=12
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 5/5
+    footer=15.2 threads=12
+
+=== llama.cpp prompt: gravity_one_sentence ===
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 1/5
+    footer=15.8 threads=12
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 2/5
+    footer=15.0 threads=12
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 3/5
+    footer=15.6 threads=12
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: compute throttle detected — waiting 30s ...
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 4/5
+    footer=14.2 threads=12
+Thermal guard: temp=None°C throttled=False — proceeding
+  run 5/5
+    footer=15.8 threads=12
+
+=== PPL: ASDSL (WikiText-2 slice) ===
+Token indices sequence length is longer than the specified maximum sequence length for this model (287070 > 131072). Running this sequence through the model will result in indexing errors
+  Restored 128 projection weights from cache (phi4_cpu_93be19dc6067ee9e3cc123def61d586f.safetensors, mmap CPU) — skipping shard read/quantize
+  Weight restore: 0.1s
+  Warm-cache: skipped (restored 128 projections from safetensors cache)
+  Preq cache restored: 128 projections (phi4_preq_93be19dc6067ee9e3cc123def61d586f_q4_32.safetensors, mmap, 1.57s)
+  preq2 repack: 128 tensors (80.0s)
+  Freed packed Q4 weights (1611 MB) for unified-only path
+  Inference: UnifiedEngine C++ forward (preq2+VNNI, affinity=smt, chunked=1)
+  Pre-computed RoPE tables: 2048 x 48 (partial rotary dim=96)
+  Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ...
+  Freed packed Q4 weights (0 MB) for unified-only path
+  lm_head preq2 cache restored: meta=75024KB quant=293MB (0.30s)
+{
+  "ok": true,
+  "ppl": 29.86051702299117,
+  "avg_nll": 3.3965371068637276,
+  "num_tokens": 1536,
+  "tok_per_sec": 10.409131369290586,
+  "elapsed_sec": 147.56274520000443
+}
+
+=== PPL: llama.cpp ===
+{
+  "ok": false,
+  "ppl": null,
+  "raw_tail": "error while handling argument \"-f\": error: failed to open file 'wikitext'\n\n\nusage:\n-f,    --file FNAME                     a file containing the prompt (default: none)\n\n\nto show complete usage, run with -h\n"
+}
+
+========================================================================
+SIDE-BY-SIDE SUMMARY (trimmed mean = drop min/max of 5 runs)
+========================================================================
+  gravity                 ASDSL 9.637 tok/s  llama 15.1 tok/s  (63.8% of llama)
+  quantization_typos      ASDSL 10.153 tok/s  llama 14.867 tok/s  (68.3% of llama)
+  gravity_one_sentence    ASDSL 10.173 tok/s  llama 15.467 tok/s  (65.8% of llama)
+
+  GRAND MEAN  ASDSL 9.988  llama 15.145  (65.9% of llama)
+
+  PPL  ASDSL 29.86051702299117  llama None
+  llama-bench tg128: None tok/s
+========================================================================
+
+Wrote C:\Users\aarus\projects\asdsl-framework\benchmarks\results\side_by_side_comparison.json

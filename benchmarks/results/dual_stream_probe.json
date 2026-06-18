@@ -1,0 +1,20 @@
+{
+  "timestamp_utc": "2026-06-05T19:00:33.857101+00:00",
+  "size_a_mb": 256,
+  "size_b_mb": 256,
+  "runs": 4,
+  "single_stream_a_gb_s": 33.14706834136312,
+  "dual_stream": {
+    "bandwidth_a_gb_s": 6.006654915257271,
+    "bandwidth_b_gb_s": 6.006654915257271,
+    "combined_bandwidth_gb_s": 12.013309830514542,
+    "retention_a_pct": 24.842222131472948,
+    "retention_b_pct": 20.908725934271544,
+    "elapsed_sec": 0.5362761
+  },
+  "gate_a2": {
+    "combined_min_gb_s": 35.0,
+    "retention_min_pct": 80.0,
+    "pass": false
+  }
+}

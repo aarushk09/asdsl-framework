@@ -315,18 +315,90 @@ public:
         }
     }
 
+    // One logical CPU id per physical core (P-cores first, then E-cores).
+    // Matches ASDSL_AFFINITY=physical / C0 @ 12 threads.
+    static std::vector<int> get_physical_core_logical_ids() {
+        std::vector<int> ids;
+#if defined(_WIN32)
+        DWORD buffer_size = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &buffer_size);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            int n = (int)std::thread::hardware_concurrency();
+            for (int i = 0; i < n; ++i) ids.push_back(i);
+            return ids;
+        }
+        std::vector<char> buf(buffer_size);
+        GetLogicalProcessorInformationEx(RelationProcessorCore,
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf.data(), &buffer_size);
+
+        struct CoreEntry {
+            uint8_t eff;
+            DWORD_PTR mask;
+        };
+        std::vector<CoreEntry> cores;
+        DWORD off = 0;
+        while (off < buffer_size) {
+            auto* info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + off);
+            if (info->Relationship == RelationProcessorCore && info->Processor.GroupCount > 0) {
+                const GROUP_AFFINITY& ga = info->Processor.GroupMask[0];
+                if (ga.Group == 0 && ga.Mask != 0) {
+                    DWORD_PTR m = ga.Mask;
+                    m = m & (~m + 1);
+                    cores.push_back({info->Processor.EfficiencyClass, m});
+                }
+            }
+            off += info->Size;
+        }
+        std::sort(cores.begin(), cores.end(),
+                  [](const CoreEntry& a, const CoreEntry& b) {
+                      if (a.eff != b.eff) return a.eff > b.eff;
+                      return a.mask < b.mask;
+                  });
+        for (const auto& c : cores) {
+            unsigned long bit = 0;
+            if (_BitScanForward64(&bit, c.mask)) {
+                ids.push_back(static_cast<int>(bit));
+            }
+        }
+#else
+        int n = (int)std::thread::hardware_concurrency();
+        for (int i = 0; i < n; ++i) ids.push_back(i);
+#endif
+        if (ids.empty()) {
+            int n = (int)std::thread::hardware_concurrency();
+            for (int i = 0; i < n; ++i) ids.push_back(i);
+        }
+        return ids;
+    }
+
     // Zero-worker constructor: no background threads are created.
-    // All parallel_for calls fall through to serial execution on the master thread
-    // (or are never called when replaced with #pragma omp parallel for).
-    // Use this when parallelism is handled externally (e.g. OpenMP).
+    // n_workers == -1: auto physical cores (honours OMP_NUM_THREADS; master participates).
+    // n_workers > 0: spawn exactly that many workers (capped to detected cores).
     explicit ThreadPool(int n_workers) {
         persistent_job.job_id = 0;
-        if (n_workers <= 0) return;  // zero-worker mode: no threads created
-        auto pcore_ids = get_pcore_logical_ids();
-        n_workers = std::min(n_workers, (int)pcore_ids.size());
+        if (n_workers == 0) return;
+
+        std::vector<int> core_ids;
+        if (n_workers < 0) {
+            core_ids = get_physical_core_logical_ids();
+            int target = static_cast<int>(core_ids.size());
+            if (const char* omp = std::getenv("OMP_NUM_THREADS")) {
+                const int env_t = std::atoi(omp);
+                if (env_t > 0) target = std::min(target, env_t);
+            }
+            // Master thread participates in parallel_for; background workers = target - 1.
+            n_workers = (target > 1) ? (target - 1) : 0;
+        } else {
+            core_ids = get_physical_core_logical_ids();
+            n_workers = std::min(n_workers, static_cast<int>(core_ids.size()));
+        }
+
+        if (n_workers <= 0) return;
+
+        core_ids.resize(static_cast<size_t>(n_workers));
         for (int i = 0; i < n_workers; ++i) {
             workers.emplace_back(&ThreadPool::worker_loop, this, i);
-            pin_thread_to_core(workers.back(), pcore_ids[i]);
+            pin_thread_to_core(workers.back(), core_ids[static_cast<size_t>(i)]);
         }
     }
 

@@ -1,0 +1,88 @@
+{
+  "timestamp_utc": "2026-06-15T20:19:40.252279+00:00",
+  "manifest": "benchmarks\\results\\parity_manifest.json",
+  "config_ids_requested": [
+    "C0"
+  ],
+  "threads": 12,
+  "n_runs": 5,
+  "gguf_sha256": "fb8897a6038bb0bf04194d111a07a79f58e54f7e5d781b712140b73a5ff056cc",
+  "kernel_preflight": {
+    "ok": true,
+    "threads": 12,
+    "reference_ms": 3.389,
+    "measured_ms": 0.958,
+    "measured_gb_s": 32.93,
+    "tolerance_pct": 15.0,
+    "allowed_ms_max": 3.897,
+    "faster_than_reference": true
+  },
+  "native_extensions": {
+    "ok": true,
+    "asdsl.kernels._native_unified": true,
+    "asdsl.kernels._native_gemv": true
+  },
+  "session_asdsl": {
+    "thermal": {
+      "initial_sleep_s": 60,
+      "max_temp_c": 65,
+      "temp_c": null,
+      "throttled": false,
+      "waited_s": 0,
+      "baseline_dot_ms": 8.762299956288189,
+      "proceeded": true
+    },
+    "configs": {
+      "C0": {
+        "label": "HF preq gs=32 (quality default)",
+        "effective_env": {
+          "ASDSL_AFFINITY": "physical",
+          "ASDSL_CHUNKED_GEMV": "1",
+          "ASDSL_CPP_GENERATE": "1",
+          "ASDSL_FUSED_GEMV": "1",
+          "ASDSL_GEMV_CHUNK_DIV": "4",
+          "ASDSL_GEMV_UNROLL": "4",
+          "ASDSL_GROUP_SIZE": "32",
+          "ASDSL_IGNORE_EOS": "1",
+          "ASDSL_LARGE_PAGES": "0",
+          "ASDSL_PERSISTENT_POOL": "1",
+          "ASDSL_PREQ2": "1",
+          "ASDSL_PREQ_G4FUSED": "0",
+          "ASDSL_PREQ_PREFETCH_GROUPS": "0",
+          "ASDSL_USE_PLD": "0",
+          "ASDSL_USE_UNIFIED": "1",
+          "MKL_NUM_THREADS": "12",
+          "OMP_NUM_THREADS": "12",
+          "OPENBLAS_NUM_THREADS": "12"
+        },
+        "decode_2_N": {
+          "runs": [
+            11.11,
+            10.92,
+            11.1,
+            10.92,
+            11.02
+          ],
+          "mean": 11.014,
+          "std": 0.083,
+          "min": 10.92,
+          "max": 11.11
+        },
+        "full_1_N": {
+          "runs": [
+            11.11,
+            10.92,
+            11.1,
+            10.92,
+            11.02
+          ],
+          "mean": 11.014,
+          "std": 0.083,
+          "min": 10.92,
+          "max": 11.11
+        },
+        "high_variance_warning": []
+      }
+    }
+  }
+}

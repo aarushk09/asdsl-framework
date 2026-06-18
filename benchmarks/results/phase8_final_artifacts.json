@@ -1,0 +1,31 @@
+{
+  "session": "2026-06-15",
+  "description": "Phase 8 threading optimization — canonical artifact index (doc run)",
+  "summary": "benchmarks/results/doc_run_summary_20260615.json",
+  "files": [
+    {"path": "benchmarks/results/doc_run_summary_20260615.json", "task": "final", "description": "Official doc-run session summary"},
+    {"path": "benchmarks/results/doc_run_parity_C0_20260615.json", "task": 6, "description": "C0 + Phase 8 official 5-run parity: 11.01 tok/s"},
+    {"path": "benchmarks/results/doc_run_parity_C03_20260615.json", "task": 6, "description": "C0.3 + Phase 8 official 5-run parity: 15.69 tok/s"},
+    {"path": "benchmarks/results/side_by_side_C0_phase8_20260615.json", "task": 7, "description": "C0 side-by-side vs llama: 65.7%"},
+    {"path": "benchmarks/results/side_by_side_C03_phase8_20260615.json", "task": 7, "description": "C0.3 side-by-side vs llama: 92.8%"},
+    {"path": "benchmarks/results/task0_profile_summary_20260614.json", "task": 0, "description": "Engine profile pool on/off"},
+    {"path": "benchmarks/results/profile_pool_on_20260614.txt", "task": 0},
+    {"path": "benchmarks/results/profile_pool_off_20260614.txt", "task": 0},
+    {"path": "benchmarks/results/task1_chunk_retune_20260614.json", "task": 1, "description": "chunk_div E2E sweep; winner div=4"},
+    {"path": "benchmarks/results/phase6_chunk_cache.json", "task": 1, "description": "Microbench autotune under pool"},
+    {"path": "benchmarks/results/task2_remaining_omp_20260615.json", "task": 2, "description": "OMP port parity rerun"},
+    {"path": "benchmarks/results/task3_probe_barrier_clean_20260615.json", "task": 3, "description": "OMP_WAIT_POLICY probe (no winner)"},
+    {"path": "benchmarks/results/task4_isolated_ab_clean_20260615.json", "task": 4, "description": "Isolated A/B: pool +1.25 tok/s"},
+    {"path": "benchmarks/results/task5_ppl_summary_20260615.json", "task": 5, "description": "Sliding-window PPL gate"},
+    {"path": "benchmarks/results/task5_c03_parity_20260615.json", "task": 5, "description": "C0.3 3-run parity pre-doc-run"},
+    {"path": "benchmarks/results/doc_ppl_C0_20260615.txt", "task": 5},
+    {"path": "benchmarks/results/doc_ppl_C03_20260615.txt", "task": 5},
+    {"path": "benchmarks/results/side_by_side_comparison.json", "task": "historical", "description": "Pre-Phase-8 side-by-side (2026-06-14): 65.9%"},
+    {"path": "benchmarks/results/engine_profile_run.txt", "task": "profile", "description": "E2E forensic prefill profile"},
+    {"path": "benchmarks/results/engine_profile_decode2.txt", "task": "profile", "description": "E2E forensic decode profile"},
+    {"path": "benchmarks/results/engine_profile_pcore8.txt", "task": "profile", "description": "P-core ablation profile"},
+    {"path": "benchmarks/results/probe_barrier_20260614.txt", "task": 3, "description": "Probe decision (experiments skipped)"},
+    {"path": "benchmarks/E2E_BOTTLENECK_RESEARCH.md", "task": "research"},
+    {"path": "benchmarks/PHASE8_THREADING_WALKTHROUGH.md", "task": "docs"}
+  ]
+}

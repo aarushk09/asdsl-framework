@@ -81,6 +81,31 @@ void quantize_activation_avx2(
     int in_features,
     int group_size);
 
+/** preq2: sidecar meta + 64B interleaved quant bands (bit-identical vs preq). */
+void gemv_preq2_fused_avx2(
+    const uint8_t* meta,
+    const uint8_t* quant,
+    const float* x_fp32,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size);
+void gemv_preq2_avx2(
+    const uint8_t* meta,
+    const uint8_t* quant,
+    const int8_t* x_q8,
+    const float* x_scales,
+    float* y,
+    int out_features,
+    int in_features,
+    int group_size);
+
+namespace asdsl_preq {
+uint64_t preq_classic_accum_call_count();
+uint64_t preq_xloaded_accum_call_count();
+void preq_reset_accum_call_counts();
+}  // namespace asdsl_preq
+
 /** Q4_128 symmetric preq GEMV (66-byte blocks, group_size=128). */
 void gemv_q4_128_preq_avx2(
     const uint8_t* blocks,

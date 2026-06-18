@@ -1,0 +1,23 @@
+{
+  "date": "2026-06-15",
+  "task1_baseline_mean_div4": 12.057,
+  "pass_criterion_delta": 0.3,
+  "first_run_concurrent_with_greedy": {
+    "runs": [6.81, 8.96, 7.01],
+    "mean": 7.593,
+    "note": "Invalid — greedy trajectory test ran concurrently"
+  },
+  "rerun_after_rebuild": {
+    "runs": [12.43, 13.08, 12.8],
+    "mean": 12.77,
+    "std": 0.27
+  },
+  "delta_vs_task1": 0.713,
+  "gate_pass": true,
+  "code_changes": [
+    "lm_head_avx2.cpp pool dispatch",
+    "gemv_q4_128.cpp pool dispatch",
+    "unified_engine.cpp gemv_f32_f32_omp pool dispatch",
+    "tl_active_pool guard on all pool branches (correctness for direct kernel calls)"
+  ]
+}

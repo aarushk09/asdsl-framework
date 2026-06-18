@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asdsl"
-version = "0.1.0"
+version = "1.0.0"
 description = "Asynchronous Salience-Driven Speculative Lookup Framework for CPU inference of Small Language Models"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -17,7 +17,7 @@ keywords = [
     "lookup-table", "small-language-models", "phi-3", "edge-ai",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
@@ -74,5 +74,8 @@ warn_return_any = true
 warn_unused_configs = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "benchmarks"]
+markers = [
+    "slow: tests requiring weight cache or long decode (deselect with -m 'not slow')",
+]
 addopts = "-v --tb=short"

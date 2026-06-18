@@ -1,0 +1,8 @@
+{
+  "avx2": true,
+  "fma": true,
+  "avx512": false,
+  "vnni": false,
+  "openmp": true,
+  "cpu_name": "13th Gen Intel(R) Core(TM) i7-1360P"
+}

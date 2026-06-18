@@ -10,8 +10,7 @@
  * direct compatibility with WeightStore._quant_u8.
  */
 
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
+#include "gemv_q2_kernels.h"
 
 #include <immintrin.h>
 #include <cstdint>
@@ -30,7 +29,12 @@
 #include <omp.h>
 #endif
 
+#ifdef ASDSL_GEMV_Q2_PYEXT
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+
 namespace py = pybind11;
+#endif
 
 static inline float hsum256_ps(__m256 v) {
     __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -47,7 +51,7 @@ static inline float hsum256_ps(__m256 v) {
  * Core Kernel: 2-bit GEMV (unpacked uint8, 1 byte per value)
  * =================================================================== */
 
-static void gemv_q2_unpacked_impl(
+void gemv_q2_unpacked_impl(
     const uint8_t* __restrict w,
     const float*   __restrict x,
     const float*   __restrict scales,
@@ -121,7 +125,7 @@ static void gemv_q2_unpacked_impl(
  * ideal for QCSD draft tokens where bandwidth is the bottleneck.
  * =================================================================== */
 
-static void gemv_q2_packed_impl(
+void gemv_q2_packed_impl(
     const uint8_t* __restrict w_packed,
     const float*   __restrict x,
     const float*   __restrict scales,
@@ -261,6 +265,7 @@ static bool check_fma_support() {
  * pybind11 Bindings
  * =================================================================== */
 
+#ifdef ASDSL_GEMV_Q2_PYEXT
 static py::array_t<float> py_gemv_q2_unpacked(
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast> w,
     py::array_t<float,   py::array::c_style | py::array::forcecast> x,
@@ -400,3 +405,4 @@ PYBIND11_MODULE(_native_gemv_q2, m) {
     m.attr("has_openmp") = false;
 #endif
 }
+#endif // ASDSL_GEMV_Q2_PYEXT

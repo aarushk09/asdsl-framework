@@ -1,0 +1,552 @@
+{
+  "timestamp_utc": "2026-06-15T22:10:11.073106+00:00",
+  "hardware_note": {
+    "cpu": "Intel Core i7-1360P (Raptor Lake, 4P+8E)",
+    "ram_gb": 16,
+    "ddr": "DDR4-3200",
+    "os": "Windows 10",
+    "power_plan": "High performance (recommended)"
+  },
+  "fairness_protocol": {
+    "fair_mode": true,
+    "weight_parity": false,
+    "asdsl_config": "C0.3",
+    "asdsl_threads": 12,
+    "llama_threads": 12,
+    "same_gguf_weights": false,
+    "decode": "greedy, temperature=0, ignore-eos",
+    "notes": [
+      "threads: ASDSL and llama both use 12",
+      "decode: greedy, temperature=0, ignore-eos on both stacks",
+      "metric: ASDSL decode_2_N (tokens 2-N) vs llama cli footer (all tokens)"
+    ]
+  },
+  "asdsl_config": "C0.3",
+  "asdsl_effective_env": {
+    "ASDSL_AFFINITY": "physical",
+    "ASDSL_C01": "1",
+    "ASDSL_C03": "1",
+    "ASDSL_CHUNKED_GEMV": "1",
+    "ASDSL_CPP_GENERATE": "1",
+    "ASDSL_DOWN_GS": "128",
+    "ASDSL_FUSED_GEMV": "1",
+    "ASDSL_GATEUP_GS": "128",
+    "ASDSL_GEMV_CHUNK_DIV": "4",
+    "ASDSL_GEMV_UNROLL": "4",
+    "ASDSL_GROUP_SIZE": "32",
+    "ASDSL_IGNORE_EOS": "1",
+    "ASDSL_LARGE_PAGES": "0",
+    "ASDSL_LMHEAD_GS": "128",
+    "ASDSL_PERSISTENT_POOL": "1",
+    "ASDSL_PREQ2": "1",
+    "ASDSL_PREQ_G4FUSED": "0",
+    "ASDSL_PREQ_PREFETCH_GROUPS": "0",
+    "ASDSL_USE_PLD": "0",
+    "ASDSL_USE_UNIFIED": "1",
+    "MKL_NUM_THREADS": "12",
+    "NUMEXPR_NUM_THREADS": "12",
+    "OMP_NUM_THREADS": "12",
+    "OPENBLAS_NUM_THREADS": "12"
+  },
+  "llama_threads": 12,
+  "n_runs_per_prompt": 5,
+  "max_new_tokens": 100,
+  "prompts": [
+    {
+      "id": "gravity",
+      "user": "Explain gravity in simple terms.",
+      "system": "You are a helpful assistant."
+    },
+    {
+      "id": "quantization_typos",
+      "user": "Explain quantizatssion in llmss in simple terms.",
+      "system": "You are a helpful assistant."
+    },
+    {
+      "id": "gravity_one_sentence",
+      "user": "Explain gravity in one sentence.",
+      "system": "You are a helpful assistant."
+    }
+  ],
+  "native_extensions": {
+    "ok": true,
+    "asdsl.kernels._native_unified": true,
+    "asdsl.kernels._native_gemv": true
+  },
+  "kernel_preflight": {
+    "ok": true,
+    "threads": 12,
+    "reference_ms": 3.389,
+    "measured_ms": 0.81,
+    "measured_gb_s": 38.96,
+    "tolerance_pct": 15.0,
+    "allowed_ms_max": 3.897,
+    "faster_than_reference": true
+  },
+  "session_asdsl": {
+    "thermal": {
+      "initial_sleep_s": 60,
+      "max_temp_c": 65,
+      "temp_c": null,
+      "throttled": false,
+      "waited_s": 0,
+      "baseline_dot_ms": 8.9783999719657,
+      "proceeded": true
+    },
+    "prompts": {
+      "gravity": {
+        "prompt": {
+          "id": "gravity",
+          "user": "Explain gravity in simple terms.",
+          "system": "You are a helpful assistant."
+        },
+        "decode_2_N": {
+          "runs": [
+            13.53,
+            13.71,
+            14.19,
+            13.24,
+            13.49
+          ],
+          "mean": 13.632,
+          "std": 0.317,
+          "min": 13.24,
+          "max": 14.19,
+          "trimmed_mean": 13.577
+        },
+        "full_1_N": {
+          "runs": [
+            13.53,
+            13.71,
+            14.19,
+            13.24,
+            13.49
+          ],
+          "mean": 13.632,
+          "std": 0.317,
+          "min": 13.24,
+          "max": 14.19,
+          "trimmed_mean": 13.577
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "decode_2_N": 13.53,
+            "full_1_N": 13.53,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity can be thought of as a force that attracts objects towards one another. The most familiar example of gravity on earth occurs because of the e"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 13.71,
+            "full_1_N": 13.71,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity can be thought of as a force that attracts objects towards one another. The most familiar example of gravity on earth occurs because of the e"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 14.19,
+            "full_1_N": 14.19,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity can be thought of as a force that attracts objects towards one another. The most familiar example of gravity on earth occurs because of the e"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 13.24,
+            "full_1_N": 13.24,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity can be thought of as a force that attracts objects towards one another. The most familiar example of gravity on earth occurs because of the e"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 13.49,
+            "full_1_N": 13.49,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity can be thought of as a force that attracts objects towards one another. The most familiar example of gravity on earth occurs because of the e"
+          }
+        ]
+      },
+      "quantization_typos": {
+        "prompt": {
+          "id": "quantization_typos",
+          "user": "Explain quantizatssion in llmss in simple terms.",
+          "system": "You are a helpful assistant."
+        },
+        "decode_2_N": {
+          "runs": [
+            13.72,
+            13.16,
+            13.4,
+            13.52,
+            12.95
+          ],
+          "mean": 13.35,
+          "std": 0.27,
+          "min": 12.95,
+          "max": 13.72,
+          "trimmed_mean": 13.36
+        },
+        "full_1_N": {
+          "runs": [
+            13.72,
+            13.16,
+            13.4,
+            13.52,
+            12.95
+          ],
+          "mean": 13.35,
+          "std": 0.27,
+          "min": 12.95,
+          "max": 13.72,
+          "trimmed_mean": 13.36
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "decode_2_N": 13.72,
+            "full_1_N": 13.72,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Quantization in machine learning refers to a process that converts a discrete value from a discrete signal into a discrete value. It essentially mean"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 13.16,
+            "full_1_N": 13.16,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Quantization in machine learning refers to a process that converts a discrete value from a discrete signal into a discrete value. It essentially mean"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 13.4,
+            "full_1_N": 13.4,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Quantization in machine learning refers to a process that converts a discrete value from a discrete signal into a discrete value. It essentially mean"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 13.52,
+            "full_1_N": 13.52,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Quantization in machine learning refers to a process that converts a discrete value from a discrete signal into a discrete value. It essentially mean"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 12.95,
+            "full_1_N": 12.95,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Quantization in machine learning refers to a process that converts a discrete value from a discrete signal into a discrete value. It essentially mean"
+          }
+        ]
+      },
+      "gravity_one_sentence": {
+        "prompt": {
+          "id": "gravity_one_sentence",
+          "user": "Explain gravity in one sentence.",
+          "system": "You are a helpful assistant."
+        },
+        "decode_2_N": {
+          "runs": [
+            13.89,
+            14.45,
+            13.69,
+            13.61,
+            14.38
+          ],
+          "mean": 14.004,
+          "std": 0.348,
+          "min": 13.61,
+          "max": 14.45,
+          "trimmed_mean": 13.987
+        },
+        "full_1_N": {
+          "runs": [
+            13.89,
+            14.45,
+            13.69,
+            13.61,
+            14.38
+          ],
+          "mean": 14.004,
+          "std": 0.348,
+          "min": 13.61,
+          "max": 14.45,
+          "trimmed_mean": 13.987
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "decode_2_N": 13.89,
+            "full_1_N": 13.89,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity, a force by which a massive body strikes one or more other bodies to form a gravitational attraction, has a pull on mass that makes objects f"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 14.45,
+            "full_1_N": 14.45,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity, a force by which a massive body strikes one or more other bodies to form a gravitational attraction, has a pull on mass that makes objects f"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 13.69,
+            "full_1_N": 13.69,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity, a force by which a massive body strikes one or more other bodies to form a gravitational attraction, has a pull on mass that makes objects f"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 13.61,
+            "full_1_N": 13.61,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity, a force by which a massive body strikes one or more other bodies to form a gravitational attraction, has a pull on mass that makes objects f"
+          },
+          {
+            "ok": true,
+            "decode_2_N": 14.38,
+            "full_1_N": 14.38,
+            "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI+C0.1-g128(gate_up/down), lm_head_gs=128, affinity=physical, chunked=1)",
+            "response_preview": "Building UnifiedEngine (preq2+VNNI Q4_32, 128 preq2 tensors, C++ forward) ... Freed packed Q4 weights (0 MB) for unified-only path Gravity, a force by which a massive body strikes one or more other bodies to form a gravitational attraction, has a pull on mass that makes objects f"
+          }
+        ]
+      }
+    }
+  },
+  "session_llama": {
+    "thermal": {
+      "initial_sleep_s": 30,
+      "max_temp_c": 65,
+      "temp_c": null,
+      "throttled": false,
+      "waited_s": 0,
+      "proceeded": true
+    },
+    "prompts": {
+      "gravity": {
+        "prompt": {
+          "id": "gravity",
+          "user": "Explain gravity in simple terms.",
+          "system": "You are a helpful assistant."
+        },
+        "cli_footer": {
+          "runs": [
+            14.7,
+            14.9,
+            14.9,
+            14.8,
+            14.6
+          ],
+          "mean": 14.78,
+          "std": 0.117,
+          "min": 14.6,
+          "max": 14.9,
+          "trimmed_mean": 14.8
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.7,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 4.8 t/s | Generation: 14.7 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.9,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 4.8 t/s | Generation: 14.9 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.9,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 4.4 t/s | Generation: 14.9 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.8,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 9.0 t/s | Generation: 14.8 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.6,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": " everything with mass toward each other. The stronger the mass of an object, the stronger its pull. That's why you feel heavier when you go to the beach and the tide comes in. It's a fundamental force that shapes the universe. [ Prompt: 3.8 t/s | Generation: 14.6 t/s ] Exiting..."
+          }
+        ]
+      },
+      "quantization_typos": {
+        "prompt": {
+          "id": "quantization_typos",
+          "user": "Explain quantizatssion in llmss in simple terms.",
+          "system": "You are a helpful assistant."
+        },
+        "cli_footer": {
+          "runs": [
+            14.7,
+            13.8,
+            14.9,
+            14.9,
+            14.0
+          ],
+          "mean": 14.46,
+          "std": 0.467,
+          "min": 13.8,
+          "max": 14.9,
+          "trimmed_mean": 14.533
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.7,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 7.0 t/s | Generation: 14.7 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 13.8,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 6.1 t/s | Generation: 13.8 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.9,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 6.3 t/s | Generation: 14.9 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.9,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 7.3 t/s | Generation: 14.9 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.0,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "egrees Celsius. If you wanted to simplify this, you could round it to the nearest whole number, like 0, 1, 2, 3, and so on. That's essentially what quantization does to data in machine learning. It reduces the precision of the [ Prompt: 6.8 t/s | Generation: 14.0 t/s ] Exiting..."
+          }
+        ]
+      },
+      "gravity_one_sentence": {
+        "prompt": {
+          "id": "gravity_one_sentence",
+          "user": "Explain gravity in one sentence.",
+          "system": "You are a helpful assistant."
+        },
+        "cli_footer": {
+          "runs": [
+            14.1,
+            15.2,
+            15.0,
+            15.6,
+            14.0
+          ],
+          "mean": 14.78,
+          "std": 0.627,
+          "min": 14.0,
+          "max": 15.6,
+          "trimmed_mean": 14.767
+        },
+        "runs_detail": [
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.1,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "elpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 12.6 t/s | Generation: 14.1 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 15.2,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 4.4 t/s | Generation: 15.2 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 15.0,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 5.7 t/s | Generation: 15.0 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 15.6,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 5.5 t/s | Generation: 15.6 t/s ] Exiting..."
+          },
+          {
+            "ok": true,
+            "cli_footer_tok_s": 14.0,
+            "threads_reported": 12,
+            "thread_mismatch": false,
+            "response_preview": "helpful assistant.<|end|><|user|>Explain gravity in one sentence.<|end|><|assistant|> Gravity is a fundamental force that attracts two bodies with mass toward each other's center, causing them to accelerate towards each other. [ Prompt: 5.9 t/s | Generation: 14.0 t/s ] Exiting..."
+          }
+        ]
+      }
+    },
+    "llama_bench_tg128": {
+      "ok": true,
+      "tg128_tok_s": null,
+      "raw_tail": "         36.92 \u00c2\u00b1 0.77 |\n| phi3 3B Q4_K - Medium          |   2.31 GiB |     3.84 B | CPU        |      12 |             tg1 |         11.81 \u00c2\u00b1 1.18 |\n\nbuild: b0df4c0cf (9297)\nload_backend: loaded RPC backend from C:\\Users\\aarus\\projects\\asdsl-framework\\tools\\llama.cpp\\ggml-rpc.dll\nload_backend: loaded CPU backend from C:\\Users\\aarus\\projects\\asdsl-framework\\tools\\llama.cpp\\ggml-cpu-alderlake.dll\n"
+    },
+    "thread_mismatch_runs": 0
+  },
+  "llama_bench_tg128": {
+    "ok": true,
+    "tg128_tok_s": null,
+    "raw_tail": "         36.92 \u00c2\u00b1 0.77 |\n| phi3 3B Q4_K - Medium          |   2.31 GiB |     3.84 B | CPU        |      12 |             tg1 |         11.81 \u00c2\u00b1 1.18 |\n\nbuild: b0df4c0cf (9297)\nload_backend: loaded RPC backend from C:\\Users\\aarus\\projects\\asdsl-framework\\tools\\llama.cpp\\ggml-rpc.dll\nload_backend: loaded CPU backend from C:\\Users\\aarus\\projects\\asdsl-framework\\tools\\llama.cpp\\ggml-cpu-alderlake.dll\n"
+  },
+  "comparison": {
+    "per_prompt": [
+      {
+        "prompt_id": "gravity",
+        "asdsl_decode_2_N_trimmed_mean": 13.577,
+        "llama_footer_trimmed_mean": 14.8,
+        "asdsl_pct_of_llama": 91.7
+      },
+      {
+        "prompt_id": "quantization_typos",
+        "asdsl_decode_2_N_trimmed_mean": 13.36,
+        "llama_footer_trimmed_mean": 14.533,
+        "asdsl_pct_of_llama": 91.9
+      },
+      {
+        "prompt_id": "gravity_one_sentence",
+        "asdsl_decode_2_N_trimmed_mean": 13.987,
+        "llama_footer_trimmed_mean": 14.767,
+        "asdsl_pct_of_llama": 94.7
+      }
+    ],
+    "asdsl_grand_mean_decode_2_N": 13.641,
+    "llama_grand_mean_footer": 14.7,
+    "asdsl_pct_of_llama_grand_mean": 92.8
+  },
+  "ppl": {
+    "asdsl": {
+      "ok": true,
+      "ppl": 80.55229243903491,
+      "avg_nll": 4.3889065690446385,
+      "num_tokens": 1536,
+      "tok_per_sec": 15.3905795579128,
+      "elapsed_sec": 99.80130990000907
+    },
+    "llama": {
+      "ok": false,
+      "ppl": null,
+      "raw_tail": "error while handling argument \"-f\": error: failed to open file 'wikitext'\n\n\nusage:\n-f,    --file FNAME                     a file containing the prompt (default: none)\n\n\nto show complete usage, run with -h\n"
+    }
+  }
+}

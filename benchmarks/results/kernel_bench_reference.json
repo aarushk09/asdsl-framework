@@ -1,0 +1,17 @@
+{
+  "description": "Frozen gate_up preq2 reference for parity pre-flight (±15% ms tolerance). Regenerate via kernel_bench_compare.py on healthy machine.",
+  "source": "benchmarks/results/phaseG_kernel_bench.json",
+  "env": {
+    "ASDSL_PREQ2": "1",
+    "ASDSL_CHUNKED_GEMV": "1",
+    "ASDSL_AFFINITY": "physical",
+    "OMP_NUM_THREADS": "12",
+    "ASDSL_GEMV_CHUNK_DIV": "4"
+  },
+  "gate_up_preq2": {
+    "ms": 3.389,
+    "gb_s": 9.31,
+    "tolerance_pct": 15.0,
+    "check": "fail_only_if_slower_than_reference"
+  }
+}

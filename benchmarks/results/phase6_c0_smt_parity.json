@@ -1,0 +1,20 @@
+{
+  "label": "C0 + smt + GEMV_CHUNK_DIV=6 + 16 threads (shell overrides)",
+  "timestamp_utc": "2026-06-13T22:15:47.742355+00:00",
+  "env": {
+    "ASDSL_AFFINITY": "smt",
+    "ASDSL_GEMV_CHUNK_DIV": "6",
+    "OMP_NUM_THREADS": "16"
+  },
+  "inference_mode": "UnifiedEngine C++ forward (preq2+VNNI, affinity=smt, chunked=1)",
+  "decode_2_N": {
+    "runs": [10.16, 9.43, 10.86, 10.72, 10.91],
+    "mean": 10.416,
+    "std": 0.561,
+    "min": 9.43,
+    "max": 10.91
+  },
+  "vs_c0_baseline_9_88_pct": 5.4,
+  "gate_13_9_met": false,
+  "gate_16_0_met": false
+}

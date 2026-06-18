@@ -1,0 +1,36 @@
+{
+  "date": "2026-06-05",
+  "phase": "G",
+  "step": 1,
+  "hardware": "Intel i7-1360P class, 12 OMP threads, Windows",
+  "model": "Phi-4-multimodal-instruct Q4_32 preq UnifiedEngine",
+  "config": {
+    "ASDSL_USE_UNIFIED": "1",
+    "ASDSL_FUSED_GEMV": "1",
+    "ASDSL_AFFINITY": "legacy",
+    "ASDSL_PREQ_PREFETCH_GROUPS": "0",
+    "ASDSL_ENGINE_PROFILE": "1",
+    "OMP_NUM_THREADS": "12"
+  },
+  "prompt": "The",
+  "max_new_tokens": 128,
+  "profile_decode_token": 3,
+  "ms_per_decode_token_32_layers": {
+    "gate_up_gemv": 49.21,
+    "down_gemv": 23.28,
+    "qkv_gemv": 16.11,
+    "o_gemv": 9.60,
+    "prep_fused": 0.87,
+    "lm_head": 21.73,
+    "other": 0.88,
+    "total": 121.68
+  },
+  "dominant_section": "gate_up_gemv",
+  "gate_up_fraction_of_gemv": 0.52,
+  "gate_up_fraction_of_total": 0.40,
+  "notes": [
+    "gate_up GEMV is the largest single section (~40% of decode token time, ~52% of GEMV time)",
+    "Fused preq path confirmed: activation_q8_ms=0 (quant inside GEMV)",
+    "Profile captured on warm run after weight cache load"
+  ]
+}
